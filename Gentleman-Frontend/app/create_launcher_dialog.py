@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLineEdit, QMessageBox, QPushButton, QVBoxLayout
+from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget
 
 class CreateLauncherDialog(QDialog):
     def __init__(self, base_dir: Path, menu_root: Path, parent=None):
@@ -13,6 +13,8 @@ class CreateLauncherDialog(QDialog):
         self.setMinimumWidth(620)
         self.name_edit = QLineEdit()
         self.folder_combo = QComboBox()
+        self.new_folder_label = QLabel('New folder name:')
+        self.new_folder_edit = QLineEdit()
         self.type_combo = QComboBox()
         self.emulator_edit = QLineEdit()
         self.core_edit = QLineEdit()
@@ -23,17 +25,25 @@ class CreateLauncherDialog(QDialog):
         self.recursive_check.setChecked(True)
         self.type_combo.addItems(['Standalone Emulator', 'RetroArch', 'Custom Command'])
         self.type_combo.currentTextChanged.connect(self._on_type_changed)
+        self.folder_combo.currentIndexChanged.connect(self._on_folder_changed)
         self._load_folders()
         form = QFormLayout()
         form.addRow('Launcher name:', self.name_edit)
         form.addRow('Save in menu folder:', self.folder_combo)
+        form.addRow(self.new_folder_label, self.new_folder_edit)
         form.addRow('Type:', self.type_combo)
         emulator_row = QHBoxLayout(); emulator_row.addWidget(self.emulator_edit)
         emulator_browse = QPushButton('Browse'); emulator_browse.clicked.connect(self._browse_emulator); emulator_row.addWidget(emulator_browse)
         form.addRow('Emulator:', emulator_row)
-        core_row = QHBoxLayout(); core_row.addWidget(self.core_edit)
-        core_browse = QPushButton('Browse'); core_browse.clicked.connect(self._browse_core); core_row.addWidget(core_browse)
-        form.addRow('RetroArch core:', core_row)
+        self.core_label = QLabel('RetroArch core:')
+        self.core_widget = QWidget()
+        core_row = QHBoxLayout(self.core_widget)
+        core_row.setContentsMargins(0, 0, 0, 0)
+        core_row.addWidget(self.core_edit)
+        self.core_browse = QPushButton('Browse')
+        self.core_browse.clicked.connect(self._browse_core)
+        core_row.addWidget(self.core_browse)
+        form.addRow(self.core_label, self.core_widget)
         rom_row = QHBoxLayout(); rom_row.addWidget(self.rom_dir_edit)
         rom_browse = QPushButton('Browse'); rom_browse.clicked.connect(self._browse_rom_dir); rom_row.addWidget(rom_browse)
         form.addRow('ROM path:', rom_row)
@@ -55,10 +65,19 @@ class CreateLauncherDialog(QDialog):
             rel = folder.relative_to(self.menu_root)
             self.folder_combo.addItem(str(rel).replace('\\', '/'), str(rel))
         self.folder_combo.addItem('Create New Folder...', '__create_new__')
+        self._on_folder_changed()
+
+    def _on_folder_changed(self):
+        is_new_folder = self.folder_combo.currentData() == '__create_new__'
+        self.new_folder_label.setVisible(is_new_folder)
+        self.new_folder_edit.setVisible(is_new_folder)
 
     def _on_type_changed(self, text: str):
         is_retroarch = text == 'RetroArch'
+        self.core_label.setVisible(is_retroarch)
+        self.core_widget.setVisible(is_retroarch)
         self.core_edit.setEnabled(is_retroarch)
+        self.core_browse.setEnabled(is_retroarch)
         if is_retroarch:
             self.arguments_edit.setText('-L "{core}" "{rom}"')
             self.extensions_edit.setPlaceholderText('.sfc,.smc,.zip')
@@ -106,9 +125,11 @@ class CreateLauncherDialog(QDialog):
             launcher_type = 'custom'
         folder_data = self.folder_combo.currentData()
         if folder_data == '__create_new__':
-            folder_name, ok = QInputDialog.getText(self, 'Create Menu Folder', 'Folder name inside menu/:')
-            if not ok or not folder_name.strip(): return
-            target_folder = self.menu_root / self._safe_filename(folder_name.strip())
+            folder_name = self.new_folder_edit.text().strip()
+            if not folder_name:
+                QMessageBox.warning(self, 'Missing folder name', 'Enter a new menu folder name.')
+                return
+            target_folder = self.menu_root / self._safe_filename(folder_name)
         elif folder_data:
             target_folder = self.menu_root / folder_data
         else:
