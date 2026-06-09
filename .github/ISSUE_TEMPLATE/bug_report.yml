@@ -1,0 +1,82 @@
+name: Bug Report
+description: Report a problem with Gentleman
+title: "[BUG] "
+labels: ["bug"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Gentleman bug.
+
+        Please keep it short, but include enough detail to reproduce the issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: Gentleman Version
+      description: What version of Gentleman are you using?
+      placeholder: e.g. v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_type
+    attributes:
+      label: Installation Type
+      description: How are you running Gentleman?
+      options:
+        - Windows Executable
+        - Python Script
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected_area
+    attributes:
+      label: Affected Area
+      description: Which part of Gentleman is affected?
+      options:
+        - Menu
+        - Launcher Creation / Editing
+        - Game Browsing
+        - Game Launching
+        - Favorites / Recent
+        - Controller Input
+        - API
+        - UI / Wallpaper / Logo
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the Bug
+      description: What happened?
+      placeholder: Describe the problem clearly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: What did you do before the issue happened?
+      placeholder: |
+        1.
+        2.
+        3.
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots / Logs / Launcher JSON
+      description: Add screenshots, error messages, logs, or launcher JSON if relevant.
+      render: text

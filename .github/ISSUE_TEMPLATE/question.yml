@@ -1,0 +1,36 @@
+name: Question
+description: Ask a question about Gentleman
+title: "[QUESTION] "
+labels: ["question"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question about Gentleman?
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What would you like to know?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: What Part of Gentleman Is This About?
+      options:
+        - Setup
+        - Launchers
+        - Controller
+        - API
+        - UI
+        - Other
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Add any relevant details about your setup.

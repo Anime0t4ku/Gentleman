@@ -1,0 +1,96 @@
+name: Gentleman
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================
+  # Windows Build
+  # ============================================================
+  build-windows:
+    name: Build Windows Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        working-directory: Gentleman-Frontend
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: List Files
+        working-directory: Gentleman-Frontend
+        run: |
+          pwd
+          dir
+          dir assets
+
+      - name: Build Executable
+        working-directory: Gentleman-Frontend
+        run: pyinstaller --clean --onefile --windowed --icon app.ico --add-data "assets;assets" --name Gentleman main.py
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gentleman-Windows-x86_64
+          path: Gentleman-Frontend/dist/Gentleman.exe
+
+  # ============================================================
+  # Pre-release Creation
+  # ============================================================
+  release:
+    name: Create / Update Windows Pre-release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Zip Windows Build
+        run: |
+          cd dist
+          zip ../Gentleman-Windows-x86_64.zip Gentleman.exe
+
+      - name: Update Git Tag
+        run: |
+          git tag -f Pre-release
+          git push -f origin Pre-release
+
+      - name: Create or Update Release
+        uses: ncipollo/release-action@v1
+        with:
+          prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          tag: Pre-release
+          artifacts: |
+            Gentleman-Windows-x86_64.zip
