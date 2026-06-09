@@ -116,6 +116,7 @@ class GentlemanWindow(QMainWindow):
         self.controller_button_state = {}
         self.controller_repeat_action = None
         self.controller_repeat_next_ms = 0
+        self.controller_last_scan_ms = 0
 
         self.refresh_menu()
 
@@ -1894,33 +1895,48 @@ class GentlemanWindow(QMainWindow):
         try:
             pygame.init()
             pygame.joystick.init()
-
-            if pygame.joystick.get_count() > 0:
-                self.controller = pygame.joystick.Joystick(0)
-                self.controller.init()
-                self.controller_available = True
+            self.refresh_controller(force=True)
         except Exception:
             self.controller = None
             self.controller_available = False
 
-    def refresh_controller(self):
+    def refresh_controller(self, force: bool = False):
         if pygame is None:
             return
 
-        try:
-            pygame.joystick.quit()
-            pygame.joystick.init()
+        now = int(time.monotonic() * 1000)
+        if not force and now - self.controller_last_scan_ms < 1000:
+            return
 
-            if pygame.joystick.get_count() > 0:
-                self.controller = pygame.joystick.Joystick(0)
-                self.controller.init()
+        self.controller_last_scan_ms = now
+
+        try:
+            if not pygame.joystick.get_init():
+                pygame.joystick.init()
+
+            count = pygame.joystick.get_count()
+
+            if count > 0:
+                if self.controller is None or not self.controller.get_init():
+                    self.controller = pygame.joystick.Joystick(0)
+                    self.controller.init()
+                    self.controller_button_state.clear()
+                    self.controller_repeat_action = None
+                    self.controller_repeat_next_ms = 0
+
                 self.controller_available = True
             else:
                 self.controller = None
                 self.controller_available = False
+                self.controller_button_state.clear()
+                self.controller_repeat_action = None
+                self.controller_repeat_next_ms = 0
         except Exception:
             self.controller = None
             self.controller_available = False
+            self.controller_button_state.clear()
+            self.controller_repeat_action = None
+            self.controller_repeat_next_ms = 0
 
     def controller_activate(self):
         self.active_input = "controller"
@@ -1990,13 +2006,24 @@ class GentlemanWindow(QMainWindow):
             return
 
         try:
-            pygame.event.pump()
+            events = pygame.event.get()
         except Exception:
-            self.refresh_controller()
+            self.refresh_controller(force=True)
             return
 
+        device_changed = False
+        for event in events:
+            if event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                device_changed = True
+
+        if device_changed:
+            self.controller = None
+            self.controller_available = False
+            self.refresh_controller(force=True)
+
+        self.refresh_controller()
+
         if not self.controller_available or self.controller is None:
-            self.refresh_controller()
             return
 
         try:
@@ -2052,7 +2079,9 @@ class GentlemanWindow(QMainWindow):
 
                 self.controller_button_state[button] = pressed
         except Exception:
-            self.refresh_controller()
+            self.controller = None
+            self.controller_available = False
+            self.refresh_controller(force=True)
 
     def move_selection(self, delta: int):
         count = self.current_items_count()
