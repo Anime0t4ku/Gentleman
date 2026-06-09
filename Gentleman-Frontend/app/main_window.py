@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import socket
 import subprocess
@@ -11,7 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from PyQt6.QtCore import Qt, QTimer, QRect, QRectF
-from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon
+from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon, QImage
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -126,7 +127,7 @@ class GentlemanWindow(QMainWindow):
 
         self.marquee_timer = QTimer(self)
         self.marquee_timer.timeout.connect(self.view.update)
-        self.marquee_timer.start(120)
+        self.marquee_timer.start(45)
 
         self.init_controller_support()
         self.controller_timer = QTimer(self)
@@ -2173,6 +2174,9 @@ class GentlemanView(QWidget):
 
         self.logo = QPixmap(str(self.window.assets_dir / "logo.png"))
 
+        self.static_noise = QPixmap()
+        self.static_noise_frame = 0
+
         self.icon_dir = self.window.assets_dir / "icons"
         self.icon_renderers = {
             "lan": QSvgRenderer(str(self.icon_dir / "lan.svg")),
@@ -2239,8 +2243,7 @@ class GentlemanView(QWidget):
             painter.drawPixmap(x, y, scaled)
             painter.fillRect(self.rect(), QColor(0, 0, 0, 95))
         else:
-            painter.fillRect(self.rect(), self.bg)
-            self.draw_starfield(painter)
+            self.draw_static_noise(painter)
 
         self.draw_logo(painter)
         self.draw_top_bar(painter)
@@ -2272,14 +2275,32 @@ class GentlemanView(QWidget):
         )
         painter.drawPixmap(margin, margin, scaled)
 
-    def draw_starfield(self, painter: QPainter):
-        painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
-        w = self.width()
-        h = self.height()
-        for i in range(180):
-            x = (i * 97) % max(1, w)
-            y = (i * 53) % max(1, h)
-            painter.drawPoint(x, y)
+    def draw_static_noise(self, painter: QPainter):
+        noise_w = 220
+        noise_h = 124
+
+        data = bytearray(os.urandom(noise_w * noise_h))
+        for index, value in enumerate(data):
+            data[index] = 70 + (value % 150)
+
+        image = QImage(
+            bytes(data),
+            noise_w,
+            noise_h,
+            noise_w,
+            QImage.Format.Format_Grayscale8,
+        )
+        self.static_noise = QPixmap.fromImage(image.copy())
+        self.static_noise_frame += 1
+
+        scaled = self.static_noise.scaled(
+            self.size(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+
+        painter.drawPixmap(0, 0, scaled)
+        painter.fillRect(self.rect(), QColor(30, 0, 10, 45))
 
     def network_icon(self) -> str:
         try:
