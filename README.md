@@ -313,20 +313,6 @@ See:
 
 [API Documentation](API-Doc.docx)
 
-## Assets
-
-Gentleman uses assets from the `assets/` folder.
-
-Common assets include:
-
-```text
-assets/icon.png
-assets/logo.png
-assets/icons/
-```
-
-These assets are also resolved correctly when the app is bundled into a compiled executable.
-
 ## Notes
 
 Gentleman is still experimental.
