@@ -1,4 +1,4 @@
-# Gentleman
+![Gentleman Logo](Gentleman-Frontend/assets/logo.png)
 
 Gentleman is a MiSTer-inspired emulator frontend prototype for PC.
 
