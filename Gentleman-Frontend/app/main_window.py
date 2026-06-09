@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
-from PyQt6.QtCore import Qt, QTimer, QRect, QRectF
+from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent
 from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon, QImage
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -105,6 +105,7 @@ class GentlemanWindow(QMainWindow):
         self.current_rom_folder: Path | None = None
         self.selected_index = 0
         self.active_input = "keyboard"
+        self.input_suspended_for_launch = False
 
         self.controller_available = False
         self.controller = None
@@ -660,10 +661,12 @@ class GentlemanWindow(QMainWindow):
         config = load_launcher(launcher_path)
 
         if config.launcher_type == "application":
+            self.suspend_frontend_input_for_launch()
             launch_external_process(f'"{config.emulator}" {config.arguments}'.strip(), str(Path(config.emulator).parent))
             return {"ok": True, "launched": "application", "launcher": launcher}
 
         rom_path = self.api_safe_rom_path(config, game)
+        self.suspend_frontend_input_for_launch()
         launch_rom(config, rom_path)
         self.add_recent_game(launcher_path, rom_path)
         self.update_recent_items()
@@ -1582,8 +1585,10 @@ class GentlemanWindow(QMainWindow):
                 return
 
             try:
+                self.suspend_frontend_input_for_launch()
                 launch_external_process(f'"{emulator_path}"', str(Path(emulator_path).parent))
             except Exception as exc:
+                self.resume_frontend_input_after_launch()
                 QMessageBox.critical(self, "Launch failed", str(exc))
             return
 
@@ -1619,10 +1624,12 @@ class GentlemanWindow(QMainWindow):
                 return
 
             try:
+                self.suspend_frontend_input_for_launch()
                 launch_rom(self.current_launcher, selected.path)
                 self.add_recent_game(self.current_launcher.path, selected.path)
                 self.update_recent_items()
             except Exception as exc:
+                self.resume_frontend_input_after_launch()
                 QMessageBox.critical(self, "Launch failed", str(exc))
             return
 
@@ -1684,11 +1691,13 @@ class GentlemanWindow(QMainWindow):
 
         try:
             launcher = load_launcher(launcher_path)
+            self.suspend_frontend_input_for_launch()
             launch_rom(launcher, rom)
             self.add_recent_game(launcher_path, rom)
             self.update_recent_items()
             self.view.update()
         except Exception as exc:
+            self.resume_frontend_input_after_launch()
             QMessageBox.critical(self, "Launch failed", str(exc))
 
     def open_launcher_item(self, item: MenuItem):
@@ -1889,6 +1898,30 @@ class GentlemanWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Open folder failed", str(exc))
 
+    def suspend_frontend_input_for_launch(self):
+        self.input_suspended_for_launch = True
+        self.controller_button_state.clear()
+        self.controller_repeat_action = None
+        self.controller_repeat_next_ms = 0
+
+        for action in self.controller_axis_state:
+            self.controller_axis_state[action] = False
+
+    def resume_frontend_input_after_launch(self):
+        if not self.input_suspended_for_launch:
+            return
+
+        self.input_suspended_for_launch = False
+        self.controller_button_state.clear()
+        self.controller_repeat_action = None
+        self.controller_repeat_next_ms = 0
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            QTimer.singleShot(150, self.resume_frontend_input_after_launch)
+
+        super().changeEvent(event)
+
     def init_controller_support(self):
         if pygame is None:
             return
@@ -2027,6 +2060,12 @@ class GentlemanWindow(QMainWindow):
         if not self.controller_available or self.controller is None:
             return
 
+        if self.input_suspended_for_launch:
+            self.controller_button_state.clear()
+            self.controller_repeat_action = None
+            self.controller_repeat_next_ms = 0
+            return
+
         try:
             hat_x = 0
             hat_y = 0
@@ -2108,6 +2147,9 @@ class GentlemanWindow(QMainWindow):
         QTimer.singleShot(50, self.view.update)
 
     def keyPressEvent(self, event: QKeyEvent):
+        if self.input_suspended_for_launch:
+            self.resume_frontend_input_after_launch()
+
         self.active_input = "keyboard"
 
         key = event.key()
