@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 
 from app.app_info import ABOUT_LINES
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
-from core.launcher import load_launcher, scan_rom_folder, launch_rom, LauncherConfig, RomBrowserItem
+from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
 from core.remote_api import GentlemanApiServer
 
@@ -659,7 +659,7 @@ class GentlemanWindow(QMainWindow):
         config = load_launcher(launcher_path)
 
         if config.launcher_type == "application":
-            subprocess.Popen(f'"{config.emulator}" {config.arguments}'.strip(), cwd=str(Path(config.emulator).parent), shell=True)
+            launch_external_process(f'"{config.emulator}" {config.arguments}'.strip(), str(Path(config.emulator).parent))
             return {"ok": True, "launched": "application", "launcher": launcher}
 
         rom_path = self.api_safe_rom_path(config, game)
@@ -1581,7 +1581,7 @@ class GentlemanWindow(QMainWindow):
                 return
 
             try:
-                subprocess.Popen(f'"{emulator_path}"', cwd=str(Path(emulator_path).parent), shell=True)
+                launch_external_process(f'"{emulator_path}"', str(Path(emulator_path).parent))
             except Exception as exc:
                 QMessageBox.critical(self, "Launch failed", str(exc))
             return

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,6 +83,41 @@ def scan_rom_folder(config: LauncherConfig, folder: Path) -> list[RomBrowserItem
     return folders + files
 
 
+def external_process_env() -> dict[str, str]:
+    env = os.environ.copy()
+
+    for key in (
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QML2_IMPORT_PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+    ):
+        env.pop(key, None)
+
+    if getattr(sys, "frozen", False):
+        bundle_path = str(getattr(sys, "_MEIPASS", ""))
+
+        if bundle_path:
+            path_parts = []
+            for part in env.get("PATH", "").split(os.pathsep):
+                if part and bundle_path.lower() not in part.lower():
+                    path_parts.append(part)
+
+            env["PATH"] = os.pathsep.join(path_parts)
+
+    return env
+
+
+def launch_external_process(command: str, cwd: str | None = None) -> None:
+    subprocess.Popen(
+        command,
+        cwd=cwd if cwd and os.path.isdir(cwd) else None,
+        shell=True,
+        env=external_process_env(),
+    )
+
+
 def build_command(config: LauncherConfig, rom: Path) -> tuple[str, str]:
     args = config.arguments
     args = args.replace("{rom}", str(rom))
@@ -98,4 +134,4 @@ def launch_rom(config: LauncherConfig, rom: Path) -> None:
     command = f'"{executable}" {args}'.strip()
     cwd = config.working_directory or str(Path(executable).parent)
 
-    subprocess.Popen(command, cwd=cwd if os.path.isdir(cwd) else None, shell=True)
+    launch_external_process(command, cwd)
