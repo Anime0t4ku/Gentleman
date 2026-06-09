@@ -4,6 +4,7 @@ import json
 import platform
 import socket
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,11 +34,17 @@ except Exception:
     pygame = None
 
 
+def resource_path(relative_path: str) -> Path:
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+    return base_path / relative_path
+
+
 class GentlemanWindow(QMainWindow):
     def __init__(self, base_dir: Path):
         super().__init__()
 
         self.base_dir = base_dir
+        self.assets_dir = resource_path("assets")
         self.menu_root = base_dir / "menu"
         self.config_dir = base_dir / "config"
         self.settings_path = self.config_dir / "settings.json"
@@ -2110,7 +2117,7 @@ class GentlemanView(QWidget):
         self.wallpaper = QPixmap()
         self.reload_wallpaper()
 
-        self.icon_dir = self.window.base_dir / "assets" / "icons"
+        self.icon_dir = self.window.assets_dir / "icons"
         self.icon_renderers = {
             "lan": QSvgRenderer(str(self.icon_dir / "lan.svg")),
             "wifi": QSvgRenderer(str(self.icon_dir / "wifi.svg")),
