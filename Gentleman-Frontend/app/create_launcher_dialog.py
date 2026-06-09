@@ -1,17 +1,21 @@
 from __future__ import annotations
 import json
 from pathlib import Path
+from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
 from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget
 
 class CreateLauncherDialog(QDialog):
-    def __init__(self, base_dir: Path, menu_root: Path, parent=None):
+    def __init__(self, base_dir: Path, menu_root: Path, parent=None, launcher_path: Path | None = None):
         super().__init__(parent)
         self.base_dir = base_dir
         self.menu_root = menu_root
+        self.launcher_path = launcher_path
         self.created_path: Path | None = None
-        self.setWindowTitle('Create Launcher')
+        self.setWindowTitle('Edit Launcher' if self.launcher_path else 'Create Launcher')
         self.setMinimumWidth(620)
         self.name_edit = QLineEdit()
+        self.emulator_name_edit = QLineEdit()
+        self.system_combo = QComboBox()
         self.folder_combo = QComboBox()
         self.new_folder_label = QLabel('New folder name:')
         self.new_folder_edit = QLineEdit()
@@ -24,11 +28,16 @@ class CreateLauncherDialog(QDialog):
         self.recursive_check = QCheckBox('Scan subfolders')
         self.recursive_check.setChecked(True)
         self.type_combo.addItems(['Standalone Emulator', 'RetroArch', 'Custom Command'])
+        self.system_combo.addItem('Custom / Unknown', '')
+        for system_name in ZAPAROO_SYSTEM_NAMES:
+            self.system_combo.addItem(system_name, system_name)
         self.type_combo.currentTextChanged.connect(self._on_type_changed)
         self.folder_combo.currentIndexChanged.connect(self._on_folder_changed)
         self._load_folders()
         form = QFormLayout()
         form.addRow('Launcher name:', self.name_edit)
+        form.addRow('Emulator name:', self.emulator_name_edit)
+        form.addRow('System:', self.system_combo)
         form.addRow('Save in menu folder:', self.folder_combo)
         form.addRow(self.new_folder_label, self.new_folder_edit)
         form.addRow('Type:', self.type_combo)
@@ -51,10 +60,48 @@ class CreateLauncherDialog(QDialog):
         form.addRow('Arguments:', self.arguments_edit)
         form.addRow('', self.recursive_check)
         buttons = QHBoxLayout()
-        save_button = QPushButton('Create'); cancel_button = QPushButton('Cancel')
+        save_button = QPushButton('Save' if self.launcher_path else 'Create'); cancel_button = QPushButton('Cancel')
         save_button.clicked.connect(self._save); cancel_button.clicked.connect(self.reject)
         buttons.addStretch(); buttons.addWidget(save_button); buttons.addWidget(cancel_button)
         layout = QVBoxLayout(self); layout.addLayout(form); layout.addLayout(buttons)
+        self._on_type_changed(self.type_combo.currentText())
+        if self.launcher_path:
+            self._load_existing_launcher()
+
+    def _load_existing_launcher(self):
+        try:
+            data = json.loads(self.launcher_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            QMessageBox.warning(self, "Load failed", str(exc))
+            return
+
+        self.name_edit.setText(self.launcher_path.stem)
+        self.name_edit.setEnabled(False)
+        self.folder_combo.setEnabled(False)
+        self.new_folder_label.setVisible(False)
+        self.new_folder_edit.setVisible(False)
+
+        self.emulator_name_edit.setText(str(data.get("emulator_name", "")))
+
+        system_name = str(data.get("system", ""))
+        index = self.system_combo.findData(system_name)
+        if index >= 0:
+            self.system_combo.setCurrentIndex(index)
+
+        launcher_type = str(data.get("type", "standalone"))
+        if launcher_type == "retroarch":
+            self.type_combo.setCurrentText("RetroArch")
+        elif launcher_type == "custom":
+            self.type_combo.setCurrentText("Custom Command")
+        else:
+            self.type_combo.setCurrentText("Standalone Emulator")
+
+        self.emulator_edit.setText(str(data.get("emulator", "")))
+        self.core_edit.setText(str(data.get("core", "")))
+        self.rom_dir_edit.setText(str(data.get("rom_directory", "")))
+        self.extensions_edit.setText(",".join(data.get("extensions", [])))
+        self.arguments_edit.setText(str(data.get("arguments", '"{rom}"')))
+        self.recursive_check.setChecked(bool(data.get("recursive", True)))
         self._on_type_changed(self.type_combo.currentText())
 
     def _load_folders(self):
@@ -107,11 +154,15 @@ class CreateLauncherDialog(QDialog):
 
     def _save(self):
         name = self.name_edit.text().strip()
+        emulator_name = self.emulator_name_edit.text().strip()
+        system_name = str(self.system_combo.currentData() or '').strip()
         emulator = self.emulator_edit.text().strip()
         rom_dir = self.rom_dir_edit.text().strip()
         launcher_type_text = self.type_combo.currentText()
         if not name:
             QMessageBox.warning(self, 'Missing name', 'Enter a launcher name.'); return
+        if not emulator_name:
+            QMessageBox.warning(self, 'Missing emulator name', 'Enter an emulator name.'); return
         if not emulator:
             QMessageBox.warning(self, 'Missing emulator', 'Select an emulator executable.'); return
         if not rom_dir:
@@ -123,21 +174,24 @@ class CreateLauncherDialog(QDialog):
                 QMessageBox.warning(self, 'Missing core', 'Select a RetroArch core.'); return
         elif launcher_type_text == 'Custom Command':
             launcher_type = 'custom'
-        folder_data = self.folder_combo.currentData()
-        if folder_data == '__create_new__':
-            folder_name = self.new_folder_edit.text().strip()
-            if not folder_name:
-                QMessageBox.warning(self, 'Missing folder name', 'Enter a new menu folder name.')
-                return
-            target_folder = self.menu_root / self._safe_filename(folder_name)
-        elif folder_data:
-            target_folder = self.menu_root / folder_data
+        if self.launcher_path:
+            json_path = self.launcher_path
         else:
-            target_folder = self.menu_root
-        target_folder.mkdir(parents=True, exist_ok=True)
-        json_path = target_folder / f'{self._safe_filename(name)}.json'
-        if json_path.exists():
-            QMessageBox.warning(self, 'Already exists', f'{json_path.name} already exists.'); return
+            folder_data = self.folder_combo.currentData()
+            if folder_data == '__create_new__':
+                folder_name = self.new_folder_edit.text().strip()
+                if not folder_name:
+                    QMessageBox.warning(self, 'Missing folder name', 'Enter a new menu folder name.')
+                    return
+                target_folder = self.menu_root / self._safe_filename(folder_name)
+            elif folder_data:
+                target_folder = self.menu_root / folder_data
+            else:
+                target_folder = self.menu_root
+            target_folder.mkdir(parents=True, exist_ok=True)
+            json_path = target_folder / f'{self._safe_filename(name)}.json'
+            if json_path.exists():
+                QMessageBox.warning(self, 'Already exists', f'{json_path.name} already exists.'); return
         extensions = []
         for ext in self.extensions_edit.text().split(','):
             ext = ext.strip().lower()
@@ -146,6 +200,8 @@ class CreateLauncherDialog(QDialog):
             extensions.append(ext)
         data = {
             'type': launcher_type,
+            'emulator_name': emulator_name,
+            'system': system_name,
             'emulator': emulator,
             'rom_directory': rom_dir,
             'extensions': extensions,

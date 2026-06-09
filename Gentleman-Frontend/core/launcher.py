@@ -73,7 +73,13 @@ def scan_rom_folder(config: LauncherConfig, folder: Path) -> list[RomBrowserItem
     except OSError:
         return []
 
-    return items
+    folders = [item for item in items if item.is_dir]
+    files = [item for item in items if not item.is_dir]
+
+    folders.sort(key=lambda item: item.name.lower())
+    files.sort(key=lambda item: item.name.lower())
+
+    return folders + files
 
 
 def build_command(config: LauncherConfig, rom: Path) -> tuple[str, str]:
