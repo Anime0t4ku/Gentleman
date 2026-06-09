@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from PyQt6.QtCore import Qt, QTimer, QRect, QRectF
-from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap
+from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -57,7 +57,13 @@ class GentlemanWindow(QMainWindow):
         self.remote_api_server: GentlemanApiServer | None = None
 
         self.setWindowTitle("Gentleman")
+
+        app_icon = self.assets_dir / "icon.png"
+        if app_icon.exists():
+            self.setWindowIcon(QIcon(str(app_icon)))
+
         self.resize(1280, 720)
+        self.setMinimumSize(960, 640)
 
         self.view = GentlemanView(self)
         self.setCentralWidget(self.view)
@@ -139,9 +145,9 @@ class GentlemanWindow(QMainWindow):
                 "show_emulators_menu": True,
                 "show_recent_menu": True,
                 "show_favorites_menu": True,
+                "show_logo": True,
                 "swap_controller_ab": False,
                 "swap_controller_xy": False,
-                "api_enabled": False,
                 "api_enabled": False,
                 "remote_api_port": 8755,
             }
@@ -155,6 +161,7 @@ class GentlemanWindow(QMainWindow):
                     "show_emulators_menu": True,
                     "show_recent_menu": True,
                     "show_favorites_menu": True,
+                    "show_logo": True,
                     "swap_controller_ab": False,
                     "swap_controller_xy": False,
                     "api_enabled": False,
@@ -165,6 +172,7 @@ class GentlemanWindow(QMainWindow):
             data.setdefault("show_emulators_menu", True)
             data.setdefault("show_recent_menu", True)
             data.setdefault("show_favorites_menu", True)
+            data.setdefault("show_logo", True)
             data.setdefault("swap_controller_ab", False)
             data.setdefault("swap_controller_xy", False)
             data.setdefault("api_enabled", False)
@@ -705,6 +713,12 @@ class GentlemanWindow(QMainWindow):
             else "Enable Favorites Menu"
         )
 
+        logo_label = (
+            "Disable Logo"
+            if self.settings.get("show_logo", True)
+            else "Enable Logo"
+        )
+
         swap_ab_label = (
             "Disable Swap A/B"
             if self.settings.get("swap_controller_ab", False)
@@ -728,6 +742,7 @@ class GentlemanWindow(QMainWindow):
             emulators_menu_label,
             recent_menu_label,
             favorites_menu_label,
+            logo_label,
             "Clear Recent",
             "Clear Favorites",
             api_label,
@@ -1786,6 +1801,16 @@ class GentlemanWindow(QMainWindow):
             self.save_settings()
             self.update_settings_items()
             self.view.update()
+        elif item == "Enable Logo":
+            self.settings["show_logo"] = True
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
+        elif item == "Disable Logo":
+            self.settings["show_logo"] = False
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
         elif item == "Clear Recent":
             self.clear_recent_items()
         elif item == "Clear Favorites":
@@ -2117,6 +2142,8 @@ class GentlemanView(QWidget):
         self.wallpaper = QPixmap()
         self.reload_wallpaper()
 
+        self.logo = QPixmap(str(self.window.assets_dir / "logo.png"))
+
         self.icon_dir = self.window.assets_dir / "icons"
         self.icon_renderers = {
             "lan": QSvgRenderer(str(self.icon_dir / "lan.svg")),
@@ -2186,8 +2213,35 @@ class GentlemanView(QWidget):
             painter.fillRect(self.rect(), self.bg)
             self.draw_starfield(painter)
 
+        self.draw_logo(painter)
         self.draw_top_bar(painter)
         self.draw_panel(painter)
+
+    def draw_logo(self, painter: QPainter):
+        if not self.window.settings.get("show_logo", True):
+            return
+
+        if self.logo.isNull():
+            return
+
+        margin = 28
+        max_w = min(260, max(180, int(self.width() * 0.22)))
+        scale = max_w / self.logo.width()
+        logo_w = int(self.logo.width() * scale)
+        logo_h = int(self.logo.height() * scale)
+
+        if logo_h > int(self.height() * 0.16):
+            scale = (self.height() * 0.16) / self.logo.height()
+            logo_w = int(self.logo.width() * scale)
+            logo_h = int(self.logo.height() * scale)
+
+        scaled = self.logo.scaled(
+            logo_w,
+            logo_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        painter.drawPixmap(margin, margin, scaled)
 
     def draw_starfield(self, painter: QPainter):
         painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
