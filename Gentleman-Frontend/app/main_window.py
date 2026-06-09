@@ -7,6 +7,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 
 from PyQt6.QtCore import Qt, QTimer, QRect, QRectF
 from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap
@@ -24,6 +25,7 @@ from app.app_info import ABOUT_LINES
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
 from core.launcher import load_launcher, scan_rom_folder, launch_rom, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
+from core.remote_api import GentlemanApiServer
 
 try:
     import pygame
@@ -45,6 +47,7 @@ class GentlemanWindow(QMainWindow):
         self.config_dir.mkdir(exist_ok=True)
 
         self.settings = self.load_settings()
+        self.remote_api_server: GentlemanApiServer | None = None
 
         self.setWindowTitle("Gentleman")
         self.resize(1280, 720)
@@ -116,6 +119,8 @@ class GentlemanWindow(QMainWindow):
         self.controller_timer.timeout.connect(self.poll_controller)
         self.controller_timer.start(33)
 
+        self.apply_remote_api_state()
+
         if self.settings.get("fullscreen_at_launch", False):
             QTimer.singleShot(0, self.showFullScreen)
 
@@ -129,6 +134,9 @@ class GentlemanWindow(QMainWindow):
                 "show_favorites_menu": True,
                 "swap_controller_ab": False,
                 "swap_controller_xy": False,
+                "api_enabled": False,
+                "api_enabled": False,
+                "remote_api_port": 8755,
             }
 
         try:
@@ -142,6 +150,8 @@ class GentlemanWindow(QMainWindow):
                     "show_favorites_menu": True,
                     "swap_controller_ab": False,
                     "swap_controller_xy": False,
+                    "api_enabled": False,
+                    "remote_api_port": 8755,
                 }
             data.setdefault("wallpaper", "")
             data.setdefault("fullscreen_at_launch", False)
@@ -150,6 +160,8 @@ class GentlemanWindow(QMainWindow):
             data.setdefault("show_favorites_menu", True)
             data.setdefault("swap_controller_ab", False)
             data.setdefault("swap_controller_xy", False)
+            data.setdefault("api_enabled", False)
+            data.setdefault("remote_api_port", 8755)
             return data
         except Exception:
             return {
@@ -160,6 +172,7 @@ class GentlemanWindow(QMainWindow):
                 "show_favorites_menu": True,
                 "swap_controller_ab": False,
                 "swap_controller_xy": False,
+                "remote_api_port": 8755,
             }
 
     def save_settings(self):
@@ -355,6 +368,300 @@ class GentlemanWindow(QMainWindow):
                 except Exception:
                     self.emulator_paths[emulator_name] = ""
 
+    def remote_api_enabled(self) -> bool:
+        return bool(self.settings.get("api_enabled", False))
+
+    def remote_api_host(self) -> str:
+        return "0.0.0.0"
+
+    def apply_remote_api_state(self):
+        enabled = self.remote_api_enabled()
+        host = self.remote_api_host()
+        port = int(self.settings.get("remote_api_port", 8755))
+
+        if not enabled:
+            if self.remote_api_server:
+                self.remote_api_server.stop()
+                self.remote_api_server = None
+            return
+
+        if self.remote_api_server and self.remote_api_server.is_running():
+            if self.remote_api_server.host == host and self.remote_api_server.port == port:
+                return
+
+            self.remote_api_server.stop()
+            self.remote_api_server = None
+
+        try:
+            self.remote_api_server = GentlemanApiServer(self, host=host, port=port)
+            self.remote_api_server.start()
+        except Exception as exc:
+            self.remote_api_server = None
+            QMessageBox.warning(self, "Remote API", f"Could not start Remote API:\\n{exc}")
+
+    def api_status(self) -> dict:
+        return {
+            "app": "Gentleman",
+            "api": "Gentleman Remote API",
+            "version": "0.1.0",
+            "running": True,
+            "remote_api_enabled": self.remote_api_enabled(),
+            "host": self.remote_api_host(),
+            "port": int(self.settings.get("remote_api_port", 8755)),
+        }
+
+    def api_safe_menu_folder(self, folder: str) -> Path:
+        folder = unquote(str(folder or "")).strip().replace("\\\\", "/").strip("/")
+        target = (self.menu_root / folder).resolve()
+        root = self.menu_root.resolve()
+
+        if target != root and root not in target.parents:
+            raise ValueError("Menu path is outside menu root")
+
+        return target
+
+    def api_safe_launcher_path(self, launcher: str) -> Path:
+        launcher = unquote(str(launcher or "")).strip().replace("\\\\", "/").strip("/")
+        if not launcher:
+            raise ValueError("Missing launcher")
+
+        target = (self.menu_root / launcher).resolve()
+        root = self.menu_root.resolve()
+
+        if target != root and root not in target.parents:
+            raise ValueError("Launcher path is outside menu root")
+        if not target.exists() or target.suffix.lower() != ".json":
+            raise ValueError("Launcher not found")
+
+        return target
+
+    def api_safe_rom_folder(self, launcher_config: LauncherConfig, folder: str) -> Path:
+        folder = unquote(str(folder or "")).strip().replace("\\\\", "/").strip("/")
+        root = Path(launcher_config.rom_directory).resolve()
+        target = (root / folder).resolve()
+
+        if target != root and root not in target.parents:
+            raise ValueError("ROM folder is outside launcher ROM directory")
+
+        return target
+
+    def api_safe_rom_path(self, launcher_config: LauncherConfig, game: str) -> Path:
+        game = unquote(str(game or "")).strip().replace("\\\\", "/").strip("/")
+        root = Path(launcher_config.rom_directory).resolve()
+        target = (root / game).resolve()
+
+        if target != root and root not in target.parents:
+            raise ValueError("Game path is outside launcher ROM directory")
+        if not target.exists() or not target.is_file():
+            raise ValueError("Game file not found")
+
+        return target
+
+    def api_launcher_metadata(self, launcher_path: Path) -> dict:
+        data = {}
+        try:
+            data = json.loads(launcher_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+        try:
+            rel = str(launcher_path.relative_to(self.menu_root)).replace(chr(92), "/")
+        except ValueError:
+            rel = str(launcher_path).replace(chr(92), "/")
+
+        return {
+            "name": launcher_path.stem,
+            "type": "launcher",
+            "path": rel,
+            "system": data.get("system", ""),
+            "emulator_name": data.get("emulator_name", ""),
+            "launcher_type": data.get("type", "standalone"),
+        }
+
+    def api_all_launchers(self) -> list[dict]:
+        launchers = []
+
+        for launcher_path in self.menu_root.rglob("*.json"):
+            try:
+                metadata = self.api_launcher_metadata(launcher_path)
+            except Exception:
+                continue
+
+            launchers.append(metadata)
+
+        launchers.sort(key=lambda item: (
+            str(item.get("system", "")).lower(),
+            str(item.get("name", "")).lower(),
+        ))
+        return launchers
+
+    def api_systems(self) -> dict:
+        systems: dict[str, dict] = {}
+
+        for launcher in self.api_all_launchers():
+            system = str(launcher.get("system", "")).strip()
+            if not system:
+                continue
+
+            if system not in systems:
+                systems[system] = {
+                    "system": system,
+                    "launchers": [],
+                }
+
+            systems[system]["launchers"].append({
+                "name": launcher.get("name", ""),
+                "path": launcher.get("path", ""),
+                "emulator_name": launcher.get("emulator_name", ""),
+                "launcher_type": launcher.get("launcher_type", ""),
+            })
+
+        return {
+            "systems": [systems[key] for key in sorted(systems.keys(), key=str.lower)]
+        }
+
+    def api_find_launchers_by_system(self, system: str) -> list[dict]:
+        requested = str(system or "").strip().lower()
+        if not requested:
+            raise ValueError("Missing system")
+
+        matches = []
+        for launcher in self.api_all_launchers():
+            if str(launcher.get("system", "")).strip().lower() == requested:
+                matches.append(launcher)
+
+        if not matches:
+            raise ValueError("No launchers found for system")
+
+        return matches
+
+    def api_games_by_system(self, system: str, launcher: str = "", folder: str = "") -> dict:
+        launchers = self.api_find_launchers_by_system(system)
+
+        if not launcher and len(launchers) > 1:
+            return {
+                "system": system,
+                "needs_launcher": True,
+                "launchers": launchers,
+                "items": [],
+            }
+
+        selected_launcher = launcher or str(launchers[0].get("path", ""))
+        result = self.api_games(selected_launcher, folder)
+        result["system"] = system
+        result["selected_launcher"] = selected_launcher
+
+        if len(launchers) > 1:
+            result["launchers"] = launchers
+
+        return result
+
+    def api_launch_by_system(self, payload: dict) -> dict:
+        system = str(payload.get("system", "")).strip()
+        launcher = str(payload.get("launcher", "")).strip()
+        game = str(payload.get("game", payload.get("rom", ""))).strip()
+
+        launchers = self.api_find_launchers_by_system(system)
+
+        if not launcher:
+            if len(launchers) > 1:
+                raise ValueError("Multiple launchers found for system, pass launcher from /api/systems or /api/games-by-system")
+            launcher = str(launchers[0].get("path", ""))
+
+        return self.api_launch({
+            "launcher": launcher,
+            "game": game,
+        })
+
+    def api_menu(self, folder: str = "") -> dict:
+        target = self.api_safe_menu_folder(folder)
+        items = []
+
+        if target != self.menu_root.resolve():
+            items.append({"name": "...", "type": "back"})
+
+        for item in scan_menu_folder(target):
+            if item.item_type == "folder":
+                try:
+                    rel = str(item.path.relative_to(self.menu_root)).replace(chr(92), "/")
+                except ValueError:
+                    rel = item.name
+                items.append({
+                    "name": item.name,
+                    "type": "folder",
+                    "path": rel,
+                })
+            else:
+                items.append(self.api_launcher_metadata(item.path))
+
+        try:
+            path = str(target.relative_to(self.menu_root)).replace(chr(92), "/")
+        except ValueError:
+            path = ""
+
+        return {"path": "" if path == "." else path, "items": items}
+
+    def api_games(self, launcher: str, folder: str = "") -> dict:
+        launcher_path = self.api_safe_launcher_path(launcher)
+        config = load_launcher(launcher_path)
+        target = self.api_safe_rom_folder(config, folder)
+
+        items = []
+        root = Path(config.rom_directory).resolve()
+
+        if target != root:
+            items.append({"name": "...", "type": "back"})
+
+        for item in scan_rom_folder(config, target):
+            try:
+                rel = str(item.path.resolve().relative_to(root)).replace(chr(92), "/")
+            except ValueError:
+                rel = item.name
+
+            items.append({
+                "name": item.display_name,
+                "type": "folder" if item.is_dir else "game",
+                "path": rel,
+            })
+
+        try:
+            folder_rel = str(target.relative_to(root)).replace(chr(92), "/")
+        except ValueError:
+            folder_rel = ""
+
+        return {
+            "launcher": launcher,
+            "folder": "" if folder_rel == "." else folder_rel,
+            "items": items,
+        }
+
+    def api_launch(self, payload: dict) -> dict:
+        launcher = str(payload.get("launcher", ""))
+        game = str(payload.get("game", payload.get("rom", "")))
+
+        launcher_path = self.api_safe_launcher_path(launcher)
+        config = load_launcher(launcher_path)
+
+        if config.launcher_type == "application":
+            subprocess.Popen(f'"{config.emulator}" {config.arguments}'.strip(), cwd=str(Path(config.emulator).parent), shell=True)
+            return {"ok": True, "launched": "application", "launcher": launcher}
+
+        rom_path = self.api_safe_rom_path(config, game)
+        launch_rom(config, rom_path)
+        self.add_recent_game(launcher_path, rom_path)
+        self.update_recent_items()
+
+        return {
+            "ok": True,
+            "launcher": launcher,
+            "game": game,
+        }
+
+    def api_show(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def update_system_items(self):
         self.system_items = [
             "Toggle Fullscreen",
@@ -403,6 +710,12 @@ class GentlemanWindow(QMainWindow):
             else "Enable Swap X/Y"
         )
 
+        api_label = (
+            "Disable API"
+            if self.settings.get("api_enabled", False)
+            else "Enable API"
+        )
+
         self.settings_items = [
             fullscreen_launch_label,
             emulators_menu_label,
@@ -410,6 +723,7 @@ class GentlemanWindow(QMainWindow):
             favorites_menu_label,
             "Clear Recent",
             "Clear Favorites",
+            api_label,
             swap_ab_label,
             swap_xy_label,
             "Wallpaper",
@@ -1469,6 +1783,18 @@ class GentlemanWindow(QMainWindow):
             self.clear_recent_items()
         elif item == "Clear Favorites":
             self.clear_favorite_items()
+        elif item == "Enable API":
+            self.settings["api_enabled"] = True
+            self.save_settings()
+            self.apply_remote_api_state()
+            self.update_settings_items()
+            self.view.update()
+        elif item == "Disable API":
+            self.settings["api_enabled"] = False
+            self.save_settings()
+            self.apply_remote_api_state()
+            self.update_settings_items()
+            self.view.update()
         elif item == "Enable Swap A/B":
             self.settings["swap_controller_ab"] = True
             self.save_settings()
@@ -1754,6 +2080,13 @@ class GentlemanWindow(QMainWindow):
 
         self.view.update()
 
+    def closeEvent(self, event):
+        if self.remote_api_server:
+            self.remote_api_server.stop()
+            self.remote_api_server = None
+        super().closeEvent(event)
+
+
 
 class GentlemanView(QWidget):
     def __init__(self, window: GentlemanWindow):
@@ -1785,6 +2118,7 @@ class GentlemanView(QWidget):
             "keyboard": QSvgRenderer(str(self.icon_dir / "keyboard.svg")),
             "controller": QSvgRenderer(str(self.icon_dir / "controller.svg")),
             "favorite": QSvgRenderer(str(self.icon_dir / "favorite.svg")),
+            "api": QSvgRenderer(str(self.icon_dir / "api.svg")),
         }
 
     def reload_wallpaper(self):
@@ -1905,6 +2239,10 @@ class GentlemanView(QWidget):
         self.draw_svg_icon(painter, self.bluetooth_icon(), QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
         icon_x += icon_gap
         self.draw_svg_icon(painter, self.input_icon(), QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
+
+        if self.window.remote_api_server and self.window.remote_api_server.is_running():
+            icon_x += icon_gap
+            self.draw_svg_icon(painter, "api", QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
 
         time_text = datetime.now().strftime("%H:%M")
         painter.drawText(x + bar_w - 82, y + 31, time_text)
