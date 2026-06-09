@@ -1,6 +1,6 @@
 ![Gentleman Logo](Gentleman-Frontend/assets/logo.png)
 
-Gentleman is a MiSTer-inspired emulator frontend prototype for PC.
+Gentleman is a MiSTer-inspired emulator frontend for PC.
 
 The goal is to bring the simple, fast, menu-driven feel of the MiSTer interface to a PC-based emulator setup. Instead of using a database-heavy frontend, Gentleman builds its menu from a normal `menu/` folder. Folders become menu categories, and JSON files become launcher entries.
 
