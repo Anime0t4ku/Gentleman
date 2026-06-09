@@ -10,6 +10,8 @@ Gentleman is designed to stay simple and transparent. Users can either create la
 
 This project is experimental and not affiliated with the official MiSTer FPGA project.
 
+![Gentleman Screenshot](assets/Screenshot.png)
+
 ## Platform Status
 
 Gentleman is currently focused on Windows.
