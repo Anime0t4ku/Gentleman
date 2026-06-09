@@ -1,5 +1,5 @@
 APP_NAME = "Gentleman"
-APP_VERSION = "0.1.0"
+APP_VERSION = "1.0.0"
 APP_DEVELOPER = "Anime0t4ku"
 APP_LICENSE = "GPL-3.0"
 
@@ -10,8 +10,8 @@ ABOUT_LINES = [
     f"License: {APP_LICENSE}",
     "",
     "Gentleman is a MiSTer-",
-    "inspired PC frontend",
-    "for Windows.",
+    "inspired Emulation",
+    "frontend for PC.",
     "",
     "It is free and",
     "open-source software.",

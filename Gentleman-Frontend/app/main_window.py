@@ -16,13 +16,19 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
     QWidget,
 )
 
 from app.app_info import ABOUT_LINES
-from app.create_launcher_dialog import CreateLauncherDialog
+from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
 from core.launcher import load_launcher, scan_rom_folder, launch_rom, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
+
+try:
+    import pygame
+except Exception:
+    pygame = None
 
 
 class GentlemanWindow(QMainWindow):
@@ -50,6 +56,15 @@ class GentlemanWindow(QMainWindow):
         self.current_folder = self.menu_root
         self.current_edit_folder = self.menu_root
         self.edit_launcher_items: list[MenuItem] = []
+        self.launcher_form_mode = "create"
+        self.launcher_form_path: Path | None = None
+        self.launcher_form_data: dict = {}
+        self.launcher_form_fields: list[str] = []
+        self.launcher_form_folders: list[str] = []
+        self.system_picker_items: list[str] = []
+        self.type_picker_items: list[str] = []
+        self.folder_picker_items: list[str] = []
+        self.launcher_form_return_index = 0
         self.mode = "menu"
 
         self.menu_items: list[MenuItem] = []
@@ -74,6 +89,18 @@ class GentlemanWindow(QMainWindow):
         self.selected_index = 0
         self.active_input = "keyboard"
 
+        self.controller_available = False
+        self.controller = None
+        self.controller_axis_state = {
+            "up": False,
+            "down": False,
+            "left": False,
+            "right": False,
+        }
+        self.controller_button_state = {}
+        self.controller_repeat_action = None
+        self.controller_repeat_next_ms = 0
+
         self.refresh_menu()
 
         self.clock_timer = QTimer(self)
@@ -84,25 +111,56 @@ class GentlemanWindow(QMainWindow):
         self.marquee_timer.timeout.connect(self.view.update)
         self.marquee_timer.start(120)
 
+        self.init_controller_support()
+        self.controller_timer = QTimer(self)
+        self.controller_timer.timeout.connect(self.poll_controller)
+        self.controller_timer.start(33)
+
         if self.settings.get("fullscreen_at_launch", False):
             QTimer.singleShot(0, self.showFullScreen)
 
     def load_settings(self) -> dict:
         if not self.settings_path.exists():
-            return {"wallpaper": "", "fullscreen_at_launch": False, "show_emulators_menu": True, "show_recent_menu": True, "show_favorites_menu": True}
+            return {
+                "wallpaper": "",
+                "fullscreen_at_launch": False,
+                "show_emulators_menu": True,
+                "show_recent_menu": True,
+                "show_favorites_menu": True,
+                "swap_controller_ab": False,
+                "swap_controller_xy": False,
+            }
 
         try:
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                return {"wallpaper": "", "fullscreen_at_launch": False, "show_emulators_menu": True, "show_recent_menu": True, "show_favorites_menu": True}
+                return {
+                    "wallpaper": "",
+                    "fullscreen_at_launch": False,
+                    "show_emulators_menu": True,
+                    "show_recent_menu": True,
+                    "show_favorites_menu": True,
+                    "swap_controller_ab": False,
+                    "swap_controller_xy": False,
+                }
             data.setdefault("wallpaper", "")
             data.setdefault("fullscreen_at_launch", False)
             data.setdefault("show_emulators_menu", True)
             data.setdefault("show_recent_menu", True)
             data.setdefault("show_favorites_menu", True)
+            data.setdefault("swap_controller_ab", False)
+            data.setdefault("swap_controller_xy", False)
             return data
         except Exception:
-            return {"wallpaper": "", "fullscreen_at_launch": False, "show_emulators_menu": True, "show_recent_menu": True, "show_favorites_menu": True}
+            return {
+                "wallpaper": "",
+                "fullscreen_at_launch": False,
+                "show_emulators_menu": True,
+                "show_recent_menu": True,
+                "show_favorites_menu": True,
+                "swap_controller_ab": False,
+                "swap_controller_xy": False,
+            }
 
     def save_settings(self):
         self.settings_path.write_text(json.dumps(self.settings, indent=2), encoding="utf-8")
@@ -304,8 +362,8 @@ class GentlemanWindow(QMainWindow):
             "Edit Launcher",
             "Refresh Menu",
             "Settings",
-            "About Gentleman",
-            "Exit Gentleman",
+            "About",
+            "Exit",
         ]
 
     def update_settings_items(self):
@@ -333,13 +391,480 @@ class GentlemanWindow(QMainWindow):
             else "Enable Favorites Menu"
         )
 
+        swap_ab_label = (
+            "Disable Swap A/B"
+            if self.settings.get("swap_controller_ab", False)
+            else "Enable Swap A/B"
+        )
+
+        swap_xy_label = (
+            "Disable Swap X/Y"
+            if self.settings.get("swap_controller_xy", False)
+            else "Enable Swap X/Y"
+        )
+
         self.settings_items = [
             fullscreen_launch_label,
             emulators_menu_label,
             recent_menu_label,
             favorites_menu_label,
+            "Clear Recent",
+            "Clear Favorites",
+            swap_ab_label,
+            swap_xy_label,
             "Wallpaper",
         ]
+
+    def launcher_type_values(self) -> list[str]:
+        return ["Standalone Emulator", "RetroArch", "Application"]
+
+    def launcher_type_to_json(self, type_name: str) -> str:
+        if type_name == "RetroArch":
+            return "retroarch"
+        if type_name == "Application":
+            return "application"
+        return "standalone"
+
+    def launcher_type_from_json(self, type_name: str) -> str:
+        if type_name == "retroarch":
+            return "RetroArch"
+        if type_name == "application":
+            return "Application"
+        if type_name == "custom":
+            return "Standalone Emulator"
+        return "Standalone Emulator"
+
+    def rebuild_launcher_form_folders(self):
+        folders = [""]
+        for folder in self.menu_root.rglob("*"):
+            if folder.is_dir():
+                try:
+                    folders.append(str(folder.relative_to(self.menu_root)).replace(chr(92), "/"))
+                except ValueError:
+                    pass
+        folders.append("__new__")
+        self.launcher_form_folders = folders
+
+    def launcher_form_folder_label(self) -> str:
+        folder = self.launcher_form_data.get("folder", "")
+        if folder == "__new__":
+            return "Create New Folder"
+        return "Root Menu" if not folder else folder
+
+    def update_launcher_form_fields(self):
+        launcher_type = self.launcher_form_data.get("type", "Standalone Emulator")
+
+        fields = [
+            "Type",
+            "Launcher Name",
+            "Save Folder",
+        ]
+
+        if self.launcher_form_data.get("folder") == "__new__":
+            fields.append("New Folder Name")
+
+        if launcher_type == "Application":
+            fields.extend([
+                "Application Name",
+                "App Path",
+                "Arguments",
+                "Save",
+                "Cancel",
+            ])
+        else:
+            fields.extend([
+                "Emulator Name",
+                "System",
+                "Emulator Path",
+            ])
+
+            if launcher_type == "RetroArch":
+                fields.append("RetroArch Core")
+
+            fields.extend([
+                "ROM Path",
+                "Extensions",
+                "Arguments",
+                "Save",
+                "Cancel",
+            ])
+
+        if self.launcher_form_mode == "edit":
+            fields.remove("Save Folder")
+            if "New Folder Name" in fields:
+                fields.remove("New Folder Name")
+
+        self.launcher_form_fields = fields
+
+    def open_launcher_form(self, launcher_path: Path | None = None):
+        self.launcher_form_mode = "edit" if launcher_path else "create"
+        self.launcher_form_path = launcher_path
+        self.rebuild_launcher_form_folders()
+
+        if launcher_path:
+            try:
+                data = json.loads(launcher_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                QMessageBox.warning(self, "Load failed", str(exc))
+                return
+
+            launcher_type = self.launcher_type_from_json(str(data.get("type", "standalone")))
+            self.launcher_form_data = {
+                "launcher_name": launcher_path.stem,
+                "folder": "",
+                "new_folder": "",
+                "emulator_name": str(data.get("emulator_name", "")),
+                "system": str(data.get("system", "")),
+                "type": launcher_type,
+                "emulator": str(data.get("emulator", "")),
+                "core": str(data.get("core", "")),
+                "rom_directory": str(data.get("rom_directory", "")),
+                "extensions": ",".join(data.get("extensions", [])),
+                "arguments": str(data.get("arguments", '"{rom}"')),
+            }
+        else:
+            self.launcher_form_data = {
+                "launcher_name": "",
+                "folder": "",
+                "new_folder": "",
+                "emulator_name": "",
+                "system": "",
+                "type": "Standalone Emulator",
+                "emulator": "",
+                "core": "",
+                "rom_directory": "",
+                "extensions": "",
+                "arguments": '"{rom}"',
+            }
+
+        self.update_launcher_form_fields()
+        self.mode = "launcher_form"
+        self.selected_index = 0
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def default_arguments_for_type(self, type_name: str) -> str:
+        if type_name == "RetroArch":
+            return '-L "{core}" "{rom}"'
+        if type_name == "Application":
+            return ""
+        return '"{rom}"'
+
+    def set_launcher_type(self, type_name: str):
+        old_type = self.launcher_form_data.get("type", "Standalone Emulator")
+        old_default = self.default_arguments_for_type(old_type)
+        current_args = self.launcher_form_data.get("arguments", "")
+
+        self.launcher_form_data["type"] = type_name
+
+        if not current_args or current_args == old_default:
+            self.launcher_form_data["arguments"] = self.default_arguments_for_type(type_name)
+
+    def launcher_form_value(self, field: str) -> str:
+        if field == "Launcher Name":
+            return self.launcher_form_data.get("launcher_name", "")
+        if field == "Save Folder":
+            return self.launcher_form_folder_label()
+        if field == "New Folder Name":
+            return self.launcher_form_data.get("new_folder", "")
+        if field == "Emulator Name":
+            return self.launcher_form_data.get("emulator_name", "")
+        if field == "Application Name":
+            return self.launcher_form_data.get("emulator_name", "")
+        if field == "System":
+            return self.launcher_form_data.get("system", "") or "Custom / Unknown"
+        if field == "Type":
+            return self.launcher_form_data.get("type", "Standalone Emulator")
+        if field == "Emulator Path":
+            return self.launcher_form_data.get("emulator", "")
+        if field == "App Path":
+            return self.launcher_form_data.get("emulator", "")
+        if field == "RetroArch Core":
+            return self.launcher_form_data.get("core", "")
+        if field == "ROM Path":
+            return self.launcher_form_data.get("rom_directory", "")
+        if field == "Extensions":
+            return self.launcher_form_data.get("extensions", "")
+        if field == "Arguments":
+            return self.launcher_form_data.get("arguments", "")
+        return ""
+
+    def cycle_launcher_form_value(self, delta: int):
+        if not self.launcher_form_fields:
+            return
+
+        field = self.launcher_form_fields[self.selected_index]
+
+        if field == "Save Folder":
+            self.open_folder_picker()
+            return
+
+        if field == "Type":
+            self.open_type_picker()
+            return
+
+    def open_folder_picker(self):
+        self.rebuild_launcher_form_folders()
+        self.folder_picker_items = self.launcher_form_folders[:]
+        self.launcher_form_return_index = self.selected_index
+
+        current = self.launcher_form_data.get("folder", "")
+        try:
+            self.selected_index = self.folder_picker_items.index(current)
+        except ValueError:
+            self.selected_index = 0
+
+        self.mode = "folder_picker"
+        self.view.scroll_offset = 0
+        self.view.ensure_visible()
+        self.view.update()
+
+    def select_folder_picker_item(self):
+        if not self.folder_picker_items:
+            return
+
+        selected = self.folder_picker_items[self.selected_index]
+        self.launcher_form_data["folder"] = selected
+        self.update_launcher_form_fields()
+        self.mode = "launcher_form"
+        self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
+        self.view.scroll_offset = 0
+        self.view.ensure_visible()
+        self.view.update()
+
+    def open_type_picker(self):
+        self.type_picker_items = self.launcher_type_values()
+        self.launcher_form_return_index = self.selected_index
+
+        current = self.launcher_form_data.get("type", "Standalone Emulator")
+        try:
+            self.selected_index = self.type_picker_items.index(current)
+        except ValueError:
+            self.selected_index = 0
+
+        self.mode = "type_picker"
+        self.view.scroll_offset = 0
+        self.view.ensure_visible()
+        self.view.update()
+
+    def select_type_picker_item(self):
+        if not self.type_picker_items:
+            return
+
+        selected = self.type_picker_items[self.selected_index]
+        self.set_launcher_type(selected)
+        self.update_launcher_form_fields()
+        self.mode = "launcher_form"
+        self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
+        self.view.scroll_offset = 0
+        self.view.ensure_visible()
+        self.view.update()
+
+    def open_system_picker(self):
+        self.system_picker_items = ["Custom / Unknown"] + ZAPAROO_SYSTEM_NAMES
+        self.launcher_form_return_index = self.selected_index
+
+        current = self.launcher_form_data.get("system", "")
+        current_label = current or "Custom / Unknown"
+
+        try:
+            self.selected_index = self.system_picker_items.index(current_label)
+        except ValueError:
+            self.selected_index = 0
+
+        self.mode = "system_picker"
+        self.view.scroll_offset = 0
+        self.view.ensure_visible()
+        self.view.update()
+
+    def select_system_picker_item(self):
+        if not self.system_picker_items:
+            return
+
+        selected = self.system_picker_items[self.selected_index]
+        self.launcher_form_data["system"] = "" if selected == "Custom / Unknown" else selected
+        self.mode = "launcher_form"
+        self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
+        self.view.scroll_offset = 0
+        self.view.ensure_visible()
+        self.view.update()
+
+    def edit_launcher_form_field(self):
+        if not self.launcher_form_fields:
+            return
+
+        field = self.launcher_form_fields[self.selected_index]
+
+        if field == "Save":
+            self.save_launcher_form()
+            return
+
+        if field == "Cancel":
+            self.cancel_launcher_form()
+            return
+
+        if field == "Type":
+            self.open_type_picker()
+            return
+
+        if field == "System":
+            self.open_system_picker()
+            return
+
+        if field == "Save Folder":
+            self.open_folder_picker()
+            return
+
+        key_map = {
+            "Launcher Name": "launcher_name",
+            "New Folder Name": "new_folder",
+            "Emulator Name": "emulator_name",
+            "Application Name": "emulator_name",
+            "Extensions": "extensions",
+            "Arguments": "arguments",
+        }
+
+        if field in key_map:
+            key = key_map[field]
+            prompt = field + ":"
+
+            if field == "Arguments":
+                launcher_type = self.launcher_form_data.get("type", "Standalone Emulator")
+                if launcher_type == "Application":
+                    prompt = "Optional application arguments. Usually empty."
+                elif launcher_type == "RetroArch":
+                    prompt = 'Arguments. Use {core} and {rom}, for example: -L "{core}" "{rom}"'
+                else:
+                    prompt = 'Arguments. Use {rom} for the selected game, for example: -fullscreen "{rom}"'
+
+            value, ok = QInputDialog.getText(self, field, prompt, text=self.launcher_form_data.get(key, ""))
+            if ok:
+                self.launcher_form_data[key] = value.strip()
+                self.view.update()
+            return
+
+        if field in ("Emulator Path", "App Path"):
+            title = "Select application" if field == "App Path" else "Select emulator executable"
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                title,
+                str(self.base_dir),
+                "Executables (*.exe);;All files (*.*)",
+            )
+            if path:
+                self.launcher_form_data["emulator"] = path.replace(chr(92), "/")
+                self.view.update()
+            return
+
+        if field == "RetroArch Core":
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select RetroArch core",
+                str(self.base_dir),
+                "RetroArch cores (*.dll);;All files (*.*)",
+            )
+            if path:
+                self.launcher_form_data["core"] = path.replace(chr(92), "/")
+                self.view.update()
+            return
+
+        if field == "ROM Path":
+            path = QFileDialog.getExistingDirectory(self, "Select ROM folder", str(self.base_dir))
+            if path:
+                self.launcher_form_data["rom_directory"] = path.replace(chr(92), "/")
+                self.view.update()
+            return
+
+    def launcher_form_safe_filename(self, name: str) -> str:
+        blocked = '<>:"/\\|?*'
+        cleaned = "".join("_" if ch in blocked else ch for ch in name).strip()
+        return cleaned or "Launcher"
+
+    def save_launcher_form(self):
+        data = self.launcher_form_data
+
+        launcher_name = data.get("launcher_name", "").strip()
+        emulator_name = data.get("emulator_name", "").strip()
+        emulator = data.get("emulator", "").strip()
+        rom_directory = data.get("rom_directory", "").strip()
+        launcher_type = data.get("type", "Standalone Emulator")
+
+        if not launcher_name:
+            QMessageBox.warning(self, "Missing launcher name", "Enter a launcher name.")
+            return
+        if not emulator_name:
+            QMessageBox.warning(self, "Missing emulator name", "Enter an emulator name.")
+            return
+        if not emulator:
+            QMessageBox.warning(self, "Missing executable", "Select an emulator or application path.")
+            return
+        if launcher_type != "Application" and not rom_directory:
+            QMessageBox.warning(self, "Missing ROM path", "Select a ROM path.")
+            return
+        if launcher_type == "RetroArch" and not data.get("core", "").strip():
+            QMessageBox.warning(self, "Missing core", "Select a RetroArch core.")
+            return
+
+        if self.launcher_form_mode == "edit" and self.launcher_form_path:
+            json_path = self.launcher_form_path
+        else:
+            folder_value = data.get("folder", "")
+            if folder_value == "__new__":
+                folder_name = data.get("new_folder", "").strip()
+                if not folder_name:
+                    QMessageBox.warning(self, "Missing folder name", "Enter a new folder name.")
+                    return
+                target_folder = self.menu_root / self.launcher_form_safe_filename(folder_name)
+            elif folder_value:
+                target_folder = self.menu_root / folder_value
+            else:
+                target_folder = self.menu_root
+
+            target_folder.mkdir(parents=True, exist_ok=True)
+            json_path = target_folder / f"{self.launcher_form_safe_filename(launcher_name)}.json"
+
+            if json_path.exists():
+                QMessageBox.warning(self, "Already exists", f"{json_path.name} already exists.")
+                return
+
+        extensions = []
+        for ext in data.get("extensions", "").split(","):
+            ext = ext.strip().lower()
+            if not ext:
+                continue
+            if not ext.startswith("."):
+                ext = "." + ext
+            extensions.append(ext)
+
+        output = {
+            "type": self.launcher_type_to_json(data.get("type", "Standalone Emulator")),
+            "emulator_name": emulator_name,
+            "system": data.get("system", ""),
+            "emulator": emulator,
+            "rom_directory": rom_directory,
+            "extensions": extensions,
+            "arguments": data.get("arguments", "").strip() or '"{rom}"',
+            "recursive": True,
+        }
+
+        if data.get("type") == "RetroArch":
+            output["core"] = data.get("core", "").strip()
+
+        json_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+
+        if self.launcher_form_mode == "edit":
+            self.open_edit_launcher_browser(self.current_edit_folder)
+        else:
+            self.current_folder = self.menu_root
+            self.refresh_menu()
+
+    def cancel_launcher_form(self):
+        if self.launcher_form_mode == "edit":
+            self.open_edit_launcher_browser(self.current_edit_folder)
+        else:
+            self.mode = "system"
+            self.selected_index = 0
+            self.view.update()
 
     def title_path(self) -> str:
         if self.mode == "system":
@@ -348,6 +873,14 @@ class GentlemanWindow(QMainWindow):
             return "Settings"
         if self.mode == "wallpaper":
             return "Wallpaper"
+        if self.mode == "launcher_form":
+            return "Edit Launcher" if self.launcher_form_mode == "edit" else "Create Launcher"
+        if self.mode == "system_picker":
+            return "System"
+        if self.mode == "type_picker":
+            return "Type"
+        if self.mode == "folder_picker":
+            return "Save Folder"
         if self.mode == "edit_launchers":
             if self.current_edit_folder == self.menu_root:
                 return "Edit Launcher"
@@ -388,6 +921,15 @@ class GentlemanWindow(QMainWindow):
             return len(self.settings_items)
         if self.mode == "wallpaper":
             return len(self.wallpaper_items)
+        if self.mode == "launcher_form":
+            self.update_launcher_form_fields()
+            return len(self.launcher_form_fields)
+        if self.mode == "system_picker":
+            return len(self.system_picker_items)
+        if self.mode == "type_picker":
+            return len(self.type_picker_items)
+        if self.mode == "folder_picker":
+            return len(self.folder_picker_items)
         if self.mode == "edit_launchers":
             return len(self.edit_launcher_items) + 1
         if self.mode == "about":
@@ -420,6 +962,29 @@ class GentlemanWindow(QMainWindow):
             return [(name, "") for name in self.settings_items]
         if self.mode == "wallpaper":
             return [(name, "") for name in self.wallpaper_items]
+        if self.mode == "launcher_form":
+            self.update_launcher_form_fields()
+            labels = []
+            for field in self.launcher_form_fields:
+                if field in ("Save", "Cancel"):
+                    labels.append((field, ""))
+                else:
+                    labels.append((f"{field}: {self.launcher_form_value(field)}", ""))
+            return labels
+        if self.mode == "system_picker":
+            return [(name, "") for name in self.system_picker_items]
+        if self.mode == "type_picker":
+            return [(name, "") for name in self.type_picker_items]
+        if self.mode == "folder_picker":
+            labels = []
+            for item in self.folder_picker_items:
+                if item == "":
+                    labels.append(("Root Menu", ""))
+                elif item == "__new__":
+                    labels.append(("Create New Folder", ""))
+                else:
+                    labels.append((item, ""))
+            return labels
         if self.mode == "edit_launchers":
             return [("...", "<DIR>")] + [(item.name, "<DIR>") for item in self.edit_launcher_items]
         if self.mode == "about":
@@ -494,6 +1059,31 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "wallpaper":
             self.mode = "settings"
             self.selected_index = 0
+            self.view.update()
+            return
+
+        if self.mode == "launcher_form":
+            self.cancel_launcher_form()
+            return
+
+        if self.mode == "system_picker":
+            self.mode = "launcher_form"
+            self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
+            self.view.ensure_visible()
+            self.view.update()
+            return
+
+        if self.mode == "type_picker":
+            self.mode = "launcher_form"
+            self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
+            self.view.ensure_visible()
+            self.view.update()
+            return
+
+        if self.mode == "folder_picker":
+            self.mode = "launcher_form"
+            self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
+            self.view.ensure_visible()
             self.view.update()
             return
 
@@ -584,6 +1174,22 @@ class GentlemanWindow(QMainWindow):
             self.activate_wallpaper_item(self.wallpaper_items[self.selected_index])
             return
 
+        if self.mode == "system_picker":
+            self.select_system_picker_item()
+            return
+
+        if self.mode == "type_picker":
+            self.select_type_picker_item()
+            return
+
+        if self.mode == "folder_picker":
+            self.select_folder_picker_item()
+            return
+
+        if self.mode == "launcher_form":
+            self.edit_launcher_form_field()
+            return
+
         if self.mode == "edit_launchers":
             if self.selected_index == 0:
                 self.go_back()
@@ -598,9 +1204,7 @@ class GentlemanWindow(QMainWindow):
                 self.open_edit_launcher_browser(item.path)
                 return
 
-            dialog = CreateLauncherDialog(self.base_dir, self.menu_root, self, launcher_path=item.path)
-            if dialog.exec():
-                self.open_edit_launcher_browser(self.current_edit_folder)
+            self.open_launcher_form(item.path)
             return
 
         if self.mode == "favorites":
@@ -770,10 +1374,7 @@ class GentlemanWindow(QMainWindow):
             self.update_system_items()
             self.view.update()
         elif item == "Create Launcher":
-            dialog = CreateLauncherDialog(self.base_dir, self.menu_root, self)
-            if dialog.exec():
-                self.current_folder = self.menu_root
-                self.refresh_menu()
+            self.open_launcher_form()
         elif item == "Edit Launcher":
             self.edit_launcher()
         elif item == "Refresh Menu":
@@ -784,12 +1385,44 @@ class GentlemanWindow(QMainWindow):
             self.mode = "settings"
             self.selected_index = 0
             self.view.update()
-        elif item == "About Gentleman":
+        elif item == "About":
             self.mode = "about"
             self.selected_index = 0
             self.view.update()
-        elif item == "Exit Gentleman":
+        elif item == "Exit":
             QApplication.quit()
+
+    def clear_recent_items(self):
+        reply = QMessageBox.question(
+            self,
+            "Clear Recent",
+            "Clear all recently launched games?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.save_recent_items([])
+        self.update_recent_items()
+        self.view.update()
+
+    def clear_favorite_items(self):
+        reply = QMessageBox.question(
+            self,
+            "Clear Favorites",
+            "Clear all favorite games?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.save_favorite_items([])
+        self.update_favorite_items()
+        self.view.update()
 
     def activate_settings_item(self, item: str):
         if item == "Enable Fullscreen at Launch":
@@ -829,6 +1462,30 @@ class GentlemanWindow(QMainWindow):
             self.view.update()
         elif item == "Disable Favorites Menu":
             self.settings["show_favorites_menu"] = False
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
+        elif item == "Clear Recent":
+            self.clear_recent_items()
+        elif item == "Clear Favorites":
+            self.clear_favorite_items()
+        elif item == "Enable Swap A/B":
+            self.settings["swap_controller_ab"] = True
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
+        elif item == "Disable Swap A/B":
+            self.settings["swap_controller_ab"] = False
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
+        elif item == "Enable Swap X/Y":
+            self.settings["swap_controller_xy"] = True
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
+        elif item == "Disable Swap X/Y":
+            self.settings["swap_controller_xy"] = False
             self.save_settings()
             self.update_settings_items()
             self.view.update()
@@ -872,6 +1529,173 @@ class GentlemanWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Open folder failed", str(exc))
 
+    def init_controller_support(self):
+        if pygame is None:
+            return
+
+        try:
+            pygame.init()
+            pygame.joystick.init()
+
+            if pygame.joystick.get_count() > 0:
+                self.controller = pygame.joystick.Joystick(0)
+                self.controller.init()
+                self.controller_available = True
+        except Exception:
+            self.controller = None
+            self.controller_available = False
+
+    def refresh_controller(self):
+        if pygame is None:
+            return
+
+        try:
+            pygame.joystick.quit()
+            pygame.joystick.init()
+
+            if pygame.joystick.get_count() > 0:
+                self.controller = pygame.joystick.Joystick(0)
+                self.controller.init()
+                self.controller_available = True
+            else:
+                self.controller = None
+                self.controller_available = False
+        except Exception:
+            self.controller = None
+            self.controller_available = False
+
+    def controller_activate(self):
+        self.active_input = "controller"
+        self.activate_selected()
+        self.view.update()
+
+    def controller_back(self):
+        self.active_input = "controller"
+        self.go_back()
+        self.view.update()
+
+    def controller_favorite(self):
+        self.active_input = "controller"
+        if self.mode == "favorites":
+            self.remove_selected_favorite()
+        else:
+            self.toggle_current_favorite()
+        self.view.update()
+
+    def controller_move(self, delta: int):
+        self.active_input = "controller"
+        self.move_selection(delta)
+        self.view.update()
+
+    def controller_step(self, action: str):
+        if action == "up":
+            self.controller_move(-1)
+        elif action == "down":
+            self.controller_move(1)
+        elif action == "left":
+            if self.mode == "launcher_form":
+                self.cycle_launcher_form_value(-1)
+                self.active_input = "controller"
+                self.view.update()
+            else:
+                self.controller_move(-10)
+        elif action == "right":
+            if self.mode == "launcher_form":
+                self.cycle_launcher_form_value(1)
+                self.active_input = "controller"
+                self.view.update()
+            else:
+                self.controller_move(10)
+
+    def handle_controller_repeat(self, active_actions: list[str]):
+        now = int(time.monotonic() * 1000)
+
+        if not active_actions:
+            self.controller_repeat_action = None
+            self.controller_repeat_next_ms = 0
+            return
+
+        action = active_actions[0]
+
+        if action != self.controller_repeat_action:
+            self.controller_repeat_action = action
+            self.controller_repeat_next_ms = now + 350
+            self.controller_step(action)
+            return
+
+        if now >= self.controller_repeat_next_ms:
+            self.controller_repeat_next_ms = now + 90
+            self.controller_step(action)
+
+    def poll_controller(self):
+        if pygame is None:
+            return
+
+        try:
+            pygame.event.pump()
+        except Exception:
+            self.refresh_controller()
+            return
+
+        if not self.controller_available or self.controller is None:
+            self.refresh_controller()
+            return
+
+        try:
+            hat_x = 0
+            hat_y = 0
+            if self.controller.get_numhats() > 0:
+                hat_x, hat_y = self.controller.get_hat(0)
+
+            axis_x = self.controller.get_axis(0) if self.controller.get_numaxes() > 0 else 0
+            axis_y = self.controller.get_axis(1) if self.controller.get_numaxes() > 1 else 0
+
+            active_actions = []
+            if hat_y > 0 or axis_y < -0.5:
+                active_actions.append("up")
+            elif hat_y < 0 or axis_y > 0.5:
+                active_actions.append("down")
+            elif hat_x < 0 or axis_x < -0.5:
+                active_actions.append("left")
+            elif hat_x > 0 or axis_x > 0.5:
+                active_actions.append("right")
+
+            self.handle_controller_repeat(active_actions)
+
+            if self.settings.get("swap_controller_ab", False):
+                accept_button = 1
+                back_button = 0
+            else:
+                accept_button = 0
+                back_button = 1
+
+            if self.settings.get("swap_controller_xy", False):
+                favorite_button = 3
+            else:
+                favorite_button = 2
+
+            button_actions = {
+                accept_button: self.controller_activate,
+                back_button: self.controller_back,
+                favorite_button: self.controller_favorite,
+                6: self.controller_back,
+                7: self.controller_activate,
+            }
+
+            for button, callback in button_actions.items():
+                if button >= self.controller.get_numbuttons():
+                    continue
+
+                pressed = bool(self.controller.get_button(button))
+                previous = self.controller_button_state.get(button, False)
+
+                if pressed and not previous:
+                    callback()
+
+                self.controller_button_state[button] = pressed
+        except Exception:
+            self.refresh_controller()
+
     def move_selection(self, delta: int):
         count = self.current_items_count()
         if count <= 0:
@@ -905,9 +1729,15 @@ class GentlemanWindow(QMainWindow):
         elif key in (Qt.Key.Key_Down, Qt.Key.Key_S):
             self.move_selection(1)
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_A):
-            self.move_selection(-10)
+            if self.mode == "launcher_form":
+                self.cycle_launcher_form_value(-1)
+            else:
+                self.move_selection(-10)
         elif key in (Qt.Key.Key_Right, Qt.Key.Key_D):
-            self.move_selection(10)
+            if self.mode == "launcher_form":
+                self.cycle_launcher_form_value(1)
+            else:
+                self.move_selection(10)
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
             self.activate_selected()
         elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
