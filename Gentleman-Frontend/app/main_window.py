@@ -2245,7 +2245,8 @@ class GentlemanView(QWidget):
             self.draw_svg_icon(painter, "api", QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
 
         time_text = datetime.now().strftime("%H:%M")
-        painter.drawText(x + bar_w - 82, y + 31, time_text)
+        time_width = painter.fontMetrics().horizontalAdvance(time_text)
+        painter.drawText(x + bar_w - 18 - time_width, y + 31, time_text)
 
     def draw_panel(self, painter: QPainter):
         panel_rect = self.menu_panel_rect()
