@@ -48,14 +48,6 @@ Linux support may be added later, but the current version should be treated as W
 - App icon and logo support
 - Logo can be enabled or disabled from Settings
 
-## API Documentation
-
-Gentleman includes an API that third-party apps can use to retrieve systems, browse games, and launch games without knowing which emulator, JSON launcher, or ROM folder is being used.
-
-See the API documentation here:
-
-[API Documentation](API-Doc.docx)
-
 ## Run
 
 ```bash
