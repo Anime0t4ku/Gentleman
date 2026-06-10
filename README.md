@@ -42,6 +42,8 @@ Linux support may be added later, but the current version should be treated as W
 - Controller navigation support
 - A/B and X/Y controller button swap settings
 - API support for third-party apps and remote devices
+- Manual update check from the Gentleman Menu
+- Optional external Gentleman Updater support
 - API active indicator in the top bar
 - App icon and logo support
 - Logo can be enabled or disabled from Settings
@@ -60,6 +62,14 @@ See the API documentation here:
 pip install -r requirements.txt
 python main.py
 ```
+
+## Updating
+
+Gentleman can check GitHub for stable releases. The update check can be started manually from the Gentleman Menu, and the launch-time update check can be enabled or disabled from Settings.
+
+The updater is optional and is released as a separate download. To use it, download `Gentleman-Updater-Windows-x86_64.zip`, extract `Gentleman-Updater.exe`, and place it next to `Gentleman.exe`. When an update is found, Gentleman can then start the updater for you.
+
+The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders such as `config/` and `menu/` are created on first launch and are not part of the release ZIP.
 
 ## Navigation
 
@@ -102,6 +112,7 @@ From here you can:
 - Create Launcher
 - Edit Launcher
 - Refresh Menu
+- Check for Updates
 - Open Settings
 - View About
 - Exit
@@ -110,16 +121,17 @@ From here you can:
 
 The Settings menu currently includes:
 
-- Enable / Disable Fullscreen at Launch
-- Enable / Disable Emulators Menu
-- Enable / Disable Recent Menu
-- Enable / Disable Favorites Menu
-- Enable / Disable Logo
+- Fullscreen at Launch: Enabled / Disabled
+- Emulators Menu: Enabled / Disabled
+- Recent Menu: Enabled / Disabled
+- Favorites Menu: Enabled / Disabled
+- Logo: Enabled / Disabled
+- Update Check at Launch: Enabled / Disabled
+- API: Enabled / Disabled
+- Swap A/B: Enabled / Disabled
+- Swap X/Y: Enabled / Disabled
 - Clear Recent
 - Clear Favorites
-- Enable / Disable API
-- Enable / Disable Swap A/B
-- Enable / Disable Swap X/Y
 - Wallpaper
 
 ## Menu Structure

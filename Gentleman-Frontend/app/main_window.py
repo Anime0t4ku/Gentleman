@@ -716,59 +716,54 @@ class GentlemanWindow(QMainWindow):
             "Exit",
         ]
 
+    def setting_state_label(self, name: str, enabled: bool) -> str:
+        state = "Enabled" if enabled else "Disabled"
+        return f"{name}: {state}"
+
     def update_settings_items(self):
-        fullscreen_launch_label = (
-            "Disable Fullscreen at Launch"
-            if self.settings.get("fullscreen_at_launch", False)
-            else "Enable Fullscreen at Launch"
+        fullscreen_launch_label = self.setting_state_label(
+            "Fullscreen at Launch",
+            self.settings.get("fullscreen_at_launch", False),
         )
 
-        emulators_menu_label = (
-            "Disable Emulators Menu"
-            if self.emulators_menu_enabled()
-            else "Enable Emulators Menu"
+        emulators_menu_label = self.setting_state_label(
+            "Emulators Menu",
+            self.emulators_menu_enabled(),
         )
 
-        recent_menu_label = (
-            "Disable Recent Menu"
-            if self.recent_menu_enabled()
-            else "Enable Recent Menu"
+        recent_menu_label = self.setting_state_label(
+            "Recent Menu",
+            self.recent_menu_enabled(),
         )
 
-        favorites_menu_label = (
-            "Disable Favorites Menu"
-            if self.favorites_menu_enabled()
-            else "Enable Favorites Menu"
+        favorites_menu_label = self.setting_state_label(
+            "Favorites Menu",
+            self.favorites_menu_enabled(),
         )
 
-        logo_label = (
-            "Disable Logo"
-            if self.settings.get("show_logo", True)
-            else "Enable Logo"
+        logo_label = self.setting_state_label(
+            "Logo",
+            self.settings.get("show_logo", True),
         )
 
-        swap_ab_label = (
-            "Disable Swap A/B"
-            if self.settings.get("swap_controller_ab", False)
-            else "Enable Swap A/B"
+        swap_ab_label = self.setting_state_label(
+            "Swap A/B",
+            self.settings.get("swap_controller_ab", False),
         )
 
-        swap_xy_label = (
-            "Disable Swap X/Y"
-            if self.settings.get("swap_controller_xy", False)
-            else "Enable Swap X/Y"
+        swap_xy_label = self.setting_state_label(
+            "Swap X/Y",
+            self.settings.get("swap_controller_xy", False),
         )
 
-        api_label = (
-            "Disable API"
-            if self.settings.get("api_enabled", False)
-            else "Enable API"
+        api_label = self.setting_state_label(
+            "API",
+            self.settings.get("api_enabled", False),
         )
 
-        update_check_label = (
-            "Disable Update Check at Launch"
-            if self.settings.get("check_updates_at_launch", True)
-            else "Enable Update Check at Launch"
+        update_check_label = self.setting_state_label(
+            "Update Check at Launch",
+            self.settings.get("check_updates_at_launch", True),
         )
 
         self.settings_items = [
@@ -1908,103 +1903,46 @@ class GentlemanWindow(QMainWindow):
         self.update_favorite_items()
         self.view.update()
 
+    def refresh_settings_menu(self):
+        self.save_settings()
+        self.update_settings_items()
+        self.view.update()
+
     def activate_settings_item(self, item: str):
-        if item == "Enable Fullscreen at Launch":
-            self.settings["fullscreen_at_launch"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Fullscreen at Launch":
-            self.settings["fullscreen_at_launch"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Enable Emulators Menu":
-            self.settings["show_emulators_menu"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Emulators Menu":
-            self.settings["show_emulators_menu"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Enable Recent Menu":
-            self.settings["show_recent_menu"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Recent Menu":
-            self.settings["show_recent_menu"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Enable Favorites Menu":
-            self.settings["show_favorites_menu"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Favorites Menu":
-            self.settings["show_favorites_menu"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Enable Logo":
-            self.settings["show_logo"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Logo":
-            self.settings["show_logo"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
+        if item.startswith("Fullscreen at Launch:"):
+            self.settings["fullscreen_at_launch"] = not self.settings.get("fullscreen_at_launch", False)
+            self.refresh_settings_menu()
+        elif item.startswith("Emulators Menu:"):
+            self.settings["show_emulators_menu"] = not self.emulators_menu_enabled()
+            self.refresh_settings_menu()
+        elif item.startswith("Recent Menu:"):
+            self.settings["show_recent_menu"] = not self.recent_menu_enabled()
+            self.refresh_settings_menu()
+        elif item.startswith("Favorites Menu:"):
+            self.settings["show_favorites_menu"] = not self.favorites_menu_enabled()
+            self.refresh_settings_menu()
+        elif item.startswith("Logo:"):
+            self.settings["show_logo"] = not self.settings.get("show_logo", True)
+            self.refresh_settings_menu()
         elif item == "Clear Recent":
             self.clear_recent_items()
         elif item == "Clear Favorites":
             self.clear_favorite_items()
-        elif item == "Enable Update Check at Launch":
-            self.settings["check_updates_at_launch"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Update Check at Launch":
-            self.settings["check_updates_at_launch"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Enable API":
-            self.settings["api_enabled"] = True
+        elif item.startswith("Update Check at Launch:"):
+            self.settings["check_updates_at_launch"] = not self.settings.get("check_updates_at_launch", True)
+            self.refresh_settings_menu()
+        elif item.startswith("API:"):
+            self.settings["api_enabled"] = not self.settings.get("api_enabled", False)
             self.save_settings()
             self.apply_remote_api_state()
             self.update_settings_items()
             self.view.update()
-        elif item == "Disable API":
-            self.settings["api_enabled"] = False
-            self.save_settings()
-            self.apply_remote_api_state()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Enable Swap A/B":
-            self.settings["swap_controller_ab"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Swap A/B":
-            self.settings["swap_controller_ab"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Enable Swap X/Y":
-            self.settings["swap_controller_xy"] = True
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
-        elif item == "Disable Swap X/Y":
-            self.settings["swap_controller_xy"] = False
-            self.save_settings()
-            self.update_settings_items()
-            self.view.update()
+        elif item.startswith("Swap A/B:"):
+            self.settings["swap_controller_ab"] = not self.settings.get("swap_controller_ab", False)
+            self.refresh_settings_menu()
+        elif item.startswith("Swap X/Y:"):
+            self.settings["swap_controller_xy"] = not self.settings.get("swap_controller_xy", False)
+            self.refresh_settings_menu()
         elif item == "Wallpaper":
             self.mode = "wallpaper"
             self.selected_index = 0
