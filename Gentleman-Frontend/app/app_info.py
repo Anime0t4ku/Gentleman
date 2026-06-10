@@ -1,7 +1,9 @@
 APP_NAME = "Gentleman"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 APP_DEVELOPER = "Anime0t4ku"
 APP_LICENSE = "GPL-3.0"
+GITHUB_OWNER = "Anime0t4ku"
+GITHUB_REPO = "Gentleman"
 
 ABOUT_LINES = [
     APP_NAME,

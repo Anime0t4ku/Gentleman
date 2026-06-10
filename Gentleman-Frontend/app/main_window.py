@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
-from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent
+from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon, QImage
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -24,15 +24,35 @@ from PyQt6.QtWidgets import (
 )
 
 from app.app_info import ABOUT_LINES
+from app.dialogs.changelog_dialog import ChangelogDialog
+from app.dialogs.update_available_dialog import UpdateAvailableDialog
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
 from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
 from core.remote_api import GentlemanApiServer
+from core.updater import (
+    check_for_update,
+    gentleman_updater_available,
+    launch_gentleman_updater,
+    open_release_page,
+)
 
 try:
     import pygame
 except Exception:
     pygame = None
+
+
+class UpdateCheckWorker(QThread):
+    result = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def run(self):
+        try:
+            info = check_for_update()
+            self.result.emit(info)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 def resource_path(relative_path: str) -> Path:
@@ -56,6 +76,8 @@ class GentlemanWindow(QMainWindow):
 
         self.settings = self.load_settings()
         self.remote_api_server: GentlemanApiServer | None = None
+        self.update_check_worker: UpdateCheckWorker | None = None
+        self.startup_update_check_done = False
 
         self.setWindowTitle("Gentleman")
 
@@ -140,6 +162,9 @@ class GentlemanWindow(QMainWindow):
         if self.settings.get("fullscreen_at_launch", False):
             QTimer.singleShot(0, self.showFullScreen)
 
+        if self.settings.get("check_updates_at_launch", True):
+            QTimer.singleShot(1500, self.check_for_updates_on_startup)
+
     def load_settings(self) -> dict:
         if not self.settings_path.exists():
             return {
@@ -153,6 +178,7 @@ class GentlemanWindow(QMainWindow):
                 "swap_controller_xy": False,
                 "api_enabled": False,
                 "remote_api_port": 8755,
+                "check_updates_at_launch": True,
             }
 
         try:
@@ -180,6 +206,7 @@ class GentlemanWindow(QMainWindow):
             data.setdefault("swap_controller_xy", False)
             data.setdefault("api_enabled", False)
             data.setdefault("remote_api_port", 8755)
+            data.setdefault("check_updates_at_launch", True)
             return data
         except Exception:
             return {
@@ -190,7 +217,9 @@ class GentlemanWindow(QMainWindow):
                 "show_favorites_menu": True,
                 "swap_controller_ab": False,
                 "swap_controller_xy": False,
+                "api_enabled": False,
                 "remote_api_port": 8755,
+                "check_updates_at_launch": True,
             }
 
     def save_settings(self):
@@ -689,6 +718,7 @@ class GentlemanWindow(QMainWindow):
             "Edit Launcher",
             "Refresh Menu",
             "Settings",
+            "Check for Updates",
             "About",
             "Exit",
         ]
@@ -742,6 +772,12 @@ class GentlemanWindow(QMainWindow):
             else "Enable API"
         )
 
+        update_check_label = (
+            "Disable Update Check at Launch"
+            if self.settings.get("check_updates_at_launch", True)
+            else "Enable Update Check at Launch"
+        )
+
         self.settings_items = [
             fullscreen_launch_label,
             emulators_menu_label,
@@ -750,6 +786,7 @@ class GentlemanWindow(QMainWindow):
             logo_label,
             "Clear Recent",
             "Clear Favorites",
+            update_check_label,
             api_label,
             swap_ab_label,
             swap_xy_label,
@@ -1732,12 +1769,119 @@ class GentlemanWindow(QMainWindow):
             self.mode = "settings"
             self.selected_index = 0
             self.view.update()
+        elif item == "Check for Updates":
+            self.check_for_updates_manual()
         elif item == "About":
             self.mode = "about"
             self.selected_index = 0
             self.view.update()
         elif item == "Exit":
             QApplication.quit()
+
+
+    def check_for_updates_on_startup(self):
+        if self.startup_update_check_done:
+            return
+
+        self.startup_update_check_done = True
+        self.start_update_check(show_no_update=False, show_errors=False)
+
+    def check_for_updates_manual(self):
+        self.start_update_check(show_no_update=True, show_errors=True)
+
+    def start_update_check(self, show_no_update: bool, show_errors: bool):
+        if self.update_check_worker is not None and self.update_check_worker.isRunning():
+            return
+
+        self.update_check_worker = UpdateCheckWorker()
+        self.update_check_worker.show_no_update = show_no_update
+        self.update_check_worker.show_errors = show_errors
+        self.update_check_worker.result.connect(self.on_update_check_result)
+        self.update_check_worker.error.connect(self.on_update_check_error)
+        self.update_check_worker.finished.connect(self.on_update_check_finished)
+        self.update_check_worker.start()
+
+    def on_update_check_result(self, info):
+        show_no_update = getattr(self.update_check_worker, "show_no_update", True)
+
+        if info.update_available:
+            if gentleman_updater_available():
+                while True:
+                    dialog = UpdateAvailableDialog(
+                        info,
+                        "Run Gentleman-Updater",
+                        "Do you want to run Gentleman-Updater now?",
+                        self,
+                    )
+                    dialog.exec()
+
+                    if dialog.selected_action == UpdateAvailableDialog.ACTION_SHOW_CHANGELOG:
+                        self.show_update_changelog(info)
+                        continue
+
+                    if dialog.selected_action == UpdateAvailableDialog.ACTION_UPDATE:
+                        if launch_gentleman_updater():
+                            QApplication.quit()
+                        else:
+                            QMessageBox.warning(
+                                self,
+                                "Updater Failed",
+                                "Gentleman-Updater could not be started.",
+                            )
+
+                    break
+
+                return
+
+            while True:
+                dialog = UpdateAvailableDialog(
+                    info,
+                    "Open Download Page",
+                    "Do you want to open the download page?",
+                    self,
+                )
+                dialog.exec()
+
+                if dialog.selected_action == UpdateAvailableDialog.ACTION_SHOW_CHANGELOG:
+                    self.show_update_changelog(info)
+                    continue
+
+                if dialog.selected_action == UpdateAvailableDialog.ACTION_UPDATE:
+                    open_release_page(info.release_url)
+
+                break
+        elif show_no_update:
+            QMessageBox.information(
+                self,
+                "No Update Available",
+                (
+                    "You are already running the latest version.\n\n"
+                    f"Current version: {info.current_version}"
+                ),
+            )
+
+    def show_update_changelog(self, info):
+        release_body = getattr(info, "release_body", "") or ""
+
+        if not release_body.strip():
+            open_release_page(info.release_url)
+            return
+
+        dialog = ChangelogDialog(info.release_name, release_body, self)
+        dialog.exec()
+
+    def on_update_check_error(self, message: str):
+        show_errors = getattr(self.update_check_worker, "show_errors", True)
+
+        if show_errors:
+            QMessageBox.warning(
+                self,
+                "Update Check Failed",
+                f"Unable to check for updates.\n\n{message}",
+            )
+
+    def on_update_check_finished(self):
+        self.update_check_worker = None
 
     def clear_recent_items(self):
         reply = QMessageBox.question(
@@ -1826,6 +1970,16 @@ class GentlemanWindow(QMainWindow):
             self.clear_recent_items()
         elif item == "Clear Favorites":
             self.clear_favorite_items()
+        elif item == "Enable Update Check at Launch":
+            self.settings["check_updates_at_launch"] = True
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
+        elif item == "Disable Update Check at Launch":
+            self.settings["check_updates_at_launch"] = False
+            self.save_settings()
+            self.update_settings_items()
+            self.view.update()
         elif item == "Enable API":
             self.settings["api_enabled"] = True
             self.save_settings()
@@ -2185,6 +2339,11 @@ class GentlemanWindow(QMainWindow):
         self.view.update()
 
     def closeEvent(self, event):
+        if self.update_check_worker is not None and self.update_check_worker.isRunning():
+            self.update_check_worker.quit()
+            self.update_check_worker.wait(1000)
+            self.update_check_worker = None
+
         if self.remote_api_server:
             self.remote_api_server.stop()
             self.remote_api_server = None
