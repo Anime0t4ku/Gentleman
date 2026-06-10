@@ -27,6 +27,7 @@ from app.app_info import APP_NAME, APP_VERSION, ABOUT_LINES
 from app.dialogs.changelog_dialog import ChangelogDialog
 from app.dialogs.update_available_dialog import UpdateAvailableDialog
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
+from core.arcade_names import ArcadeNameDatabase
 from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
 from core.remote_api import GentlemanApiServer
@@ -75,6 +76,7 @@ class GentlemanWindow(QMainWindow):
         self.config_dir.mkdir(exist_ok=True)
 
         self.settings = self.load_settings()
+        self.arcade_name_database = ArcadeNameDatabase(self.assets_dir / "databases" / "arcade_names.json")
         self.ensure_settings_app_info()
         self.remote_api_server: GentlemanApiServer | None = None
         self.update_check_worker: UpdateCheckWorker | None = None
@@ -181,6 +183,7 @@ class GentlemanWindow(QMainWindow):
             "api_enabled": False,
             "remote_api_port": 8755,
             "check_updates_at_launch": True,
+            "normalize_arcade_names": True,
         }
 
     def load_settings(self) -> dict:
@@ -217,6 +220,24 @@ class GentlemanWindow(QMainWindow):
 
     def save_settings(self):
         self.settings_path.write_text(json.dumps(self.settings, indent=2), encoding="utf-8")
+
+
+    def arcade_name_normalization_enabled(self) -> bool:
+        return bool(self.settings.get("normalize_arcade_names", True))
+
+    def arcade_names_for_launcher(self, launcher: LauncherConfig) -> dict[str, str] | None:
+        if not self.arcade_name_normalization_enabled():
+            return None
+        if launcher.system.strip().lower() != "arcade":
+            return None
+        return self.arcade_name_database.names()
+
+    def scan_launcher_folder(self, launcher: LauncherConfig, folder: Path) -> list[RomBrowserItem]:
+        return scan_rom_folder(
+            launcher,
+            folder,
+            self.arcade_names_for_launcher(launcher),
+        )
 
     def emulators_menu_enabled(self) -> bool:
         return bool(self.settings.get("show_emulators_menu", True))
@@ -652,7 +673,7 @@ class GentlemanWindow(QMainWindow):
         if target != root:
             items.append({"name": "...", "type": "back"})
 
-        for item in scan_rom_folder(config, target):
+        for item in self.scan_launcher_folder(config, target):
             try:
                 rel = str(item.path.resolve().relative_to(root)).replace(chr(92), "/")
             except ValueError:
@@ -761,6 +782,11 @@ class GentlemanWindow(QMainWindow):
             self.settings.get("api_enabled", False),
         )
 
+        arcade_names_label = self.setting_state_label(
+            "Arcade ROM Names",
+            self.arcade_name_normalization_enabled(),
+        )
+
         update_check_label = self.setting_state_label(
             "Update Check at Launch",
             self.settings.get("check_updates_at_launch", True),
@@ -772,6 +798,7 @@ class GentlemanWindow(QMainWindow):
             recent_menu_label,
             favorites_menu_label,
             logo_label,
+            arcade_names_label,
             "Clear Recent",
             "Clear Favorites",
             update_check_label,
@@ -1501,7 +1528,7 @@ class GentlemanWindow(QMainWindow):
 
                 if current != rom_root and rom_root in current.parents:
                     self.current_rom_folder = self.current_rom_folder.parent
-                    self.rom_items = scan_rom_folder(self.current_launcher, self.current_rom_folder)
+                    self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
                     self.selected_index = 0
                     self.view.scroll_offset = 0
                     self.view.update()
@@ -1642,7 +1669,7 @@ class GentlemanWindow(QMainWindow):
 
             if selected.is_dir:
                 self.current_rom_folder = selected.path
-                self.rom_items = scan_rom_folder(self.current_launcher, self.current_rom_folder)
+                self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
                 self.selected_index = 0
                 self.view.scroll_offset = 0
                 self.view.update()
@@ -1729,7 +1756,7 @@ class GentlemanWindow(QMainWindow):
         try:
             self.current_launcher = load_launcher(item.path)
             self.current_rom_folder = Path(self.current_launcher.rom_directory)
-            self.rom_items = scan_rom_folder(self.current_launcher, self.current_rom_folder)
+            self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
             self.mode = "roms"
             self.selected_index = 0
             self.view.scroll_offset = 0
@@ -1923,6 +1950,11 @@ class GentlemanWindow(QMainWindow):
             self.refresh_settings_menu()
         elif item.startswith("Logo:"):
             self.settings["show_logo"] = not self.settings.get("show_logo", True)
+            self.refresh_settings_menu()
+        elif item.startswith("Arcade ROM Names:"):
+            self.settings["normalize_arcade_names"] = not self.arcade_name_normalization_enabled()
+            if self.current_launcher and self.current_rom_folder:
+                self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
             self.refresh_settings_menu()
         elif item == "Clear Recent":
             self.clear_recent_items()

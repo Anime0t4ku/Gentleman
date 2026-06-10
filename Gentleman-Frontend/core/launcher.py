@@ -19,6 +19,7 @@ class LauncherConfig:
     recursive: bool = True
     core: str = ""
     working_directory: str = ""
+    system: str = ""
 
 
 @dataclass
@@ -26,10 +27,11 @@ class RomBrowserItem:
     name: str
     path: Path
     is_dir: bool
+    normalized_name: str = ""
 
     @property
     def display_name(self) -> str:
-        return self.name
+        return self.normalized_name or self.name
 
     @property
     def marker(self) -> str:
@@ -49,10 +51,15 @@ def load_launcher(path: Path) -> LauncherConfig:
         recursive=bool(data.get("recursive", True)),
         core=data.get("core", ""),
         working_directory=data.get("working_directory", ""),
+        system=str(data.get("system", "")),
     )
 
 
-def scan_rom_folder(config: LauncherConfig, folder: Path) -> list[RomBrowserItem]:
+def scan_rom_folder(
+    config: LauncherConfig,
+    folder: Path,
+    arcade_names: dict[str, str] | None = None,
+) -> list[RomBrowserItem]:
     allowed_extensions = {ext.lower() for ext in config.extensions}
     items: list[RomBrowserItem] = []
 
@@ -68,7 +75,10 @@ def scan_rom_folder(config: LauncherConfig, folder: Path) -> list[RomBrowserItem
                     elif entry.is_file(follow_symlinks=False):
                         _, ext = os.path.splitext(entry.name)
                         if ext.lower() in allowed_extensions:
-                            items.append(RomBrowserItem(entry.name, Path(entry.path), False))
+                            normalized_name = ""
+                            if arcade_names is not None:
+                                normalized_name = arcade_names.get(Path(entry.name).stem.lower(), "")
+                            items.append(RomBrowserItem(entry.name, Path(entry.path), False, normalized_name))
                 except OSError:
                     continue
     except OSError:
