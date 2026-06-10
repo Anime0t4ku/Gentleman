@@ -28,7 +28,7 @@ APP_NAME = "Gentleman-Updater"
 GITHUB_OWNER = "Anime0t4ku"
 GITHUB_REPO = "Gentleman"
 
-CONFIG_FILE = "config.json"
+SETTINGS_FILE = Path("config") / "settings.json"
 UPDATE_NOW_FILE = "updatenow.txt"
 
 WINDOWS_TARGET_EXE = "Gentleman.exe"
@@ -87,14 +87,14 @@ def version_to_text(version):
 
 
 def read_current_version(base_path):
-    config_path = base_path / CONFIG_FILE
+    settings_path = base_path / SETTINGS_FILE
     version_txt_path = base_path / "version.txt"
     app_info_path = base_path / "app" / "app_info.py"
 
     version_text = None
 
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
+    if settings_path.exists():
+        with open(settings_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         if isinstance(data, dict):
@@ -114,11 +114,10 @@ def read_current_version(base_path):
     if not version:
         raise ValueError(
             "Could not read the installed Gentleman version. "
-            "Expected config.json with app_version, version.txt, or app/app_info.py."
+            "Expected config/settings.json with app_version, version.txt, or app/app_info.py."
         )
 
     return version_text, version
-
 
 def github_api_json(url):
     request = urllib.request.Request(

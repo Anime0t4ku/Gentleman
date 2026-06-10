@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.app_info import ABOUT_LINES
+from app.app_info import APP_NAME, APP_VERSION, ABOUT_LINES
 from app.dialogs.changelog_dialog import ChangelogDialog
 from app.dialogs.update_available_dialog import UpdateAvailableDialog
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
@@ -75,6 +75,7 @@ class GentlemanWindow(QMainWindow):
         self.config_dir.mkdir(exist_ok=True)
 
         self.settings = self.load_settings()
+        self.ensure_settings_app_info()
         self.remote_api_server: GentlemanApiServer | None = None
         self.update_check_worker: UpdateCheckWorker | None = None
         self.startup_update_check_done = False
@@ -165,62 +166,54 @@ class GentlemanWindow(QMainWindow):
         if self.settings.get("check_updates_at_launch", True):
             QTimer.singleShot(1500, self.check_for_updates_on_startup)
 
+    def default_settings(self) -> dict:
+        return {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "wallpaper": "",
+            "fullscreen_at_launch": False,
+            "show_emulators_menu": True,
+            "show_recent_menu": True,
+            "show_favorites_menu": True,
+            "show_logo": True,
+            "swap_controller_ab": False,
+            "swap_controller_xy": False,
+            "api_enabled": False,
+            "remote_api_port": 8755,
+            "check_updates_at_launch": True,
+        }
+
     def load_settings(self) -> dict:
+        defaults = self.default_settings()
+
         if not self.settings_path.exists():
-            return {
-                "wallpaper": "",
-                "fullscreen_at_launch": False,
-                "show_emulators_menu": True,
-                "show_recent_menu": True,
-                "show_favorites_menu": True,
-                "show_logo": True,
-                "swap_controller_ab": False,
-                "swap_controller_xy": False,
-                "api_enabled": False,
-                "remote_api_port": 8755,
-                "check_updates_at_launch": True,
-            }
+            return defaults
 
         try:
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                return {
-                    "wallpaper": "",
-                    "fullscreen_at_launch": False,
-                    "show_emulators_menu": True,
-                    "show_recent_menu": True,
-                    "show_favorites_menu": True,
-                    "show_logo": True,
-                    "swap_controller_ab": False,
-                    "swap_controller_xy": False,
-                    "api_enabled": False,
-                    "remote_api_port": 8755,
-                }
-            data.setdefault("wallpaper", "")
-            data.setdefault("fullscreen_at_launch", False)
-            data.setdefault("show_emulators_menu", True)
-            data.setdefault("show_recent_menu", True)
-            data.setdefault("show_favorites_menu", True)
-            data.setdefault("show_logo", True)
-            data.setdefault("swap_controller_ab", False)
-            data.setdefault("swap_controller_xy", False)
-            data.setdefault("api_enabled", False)
-            data.setdefault("remote_api_port", 8755)
-            data.setdefault("check_updates_at_launch", True)
+                return defaults
+
+            for key, value in defaults.items():
+                data.setdefault(key, value)
+
             return data
         except Exception:
-            return {
-                "wallpaper": "",
-                "fullscreen_at_launch": False,
-                "show_emulators_menu": True,
-                "show_recent_menu": True,
-                "show_favorites_menu": True,
-                "swap_controller_ab": False,
-                "swap_controller_xy": False,
-                "api_enabled": False,
-                "remote_api_port": 8755,
-                "check_updates_at_launch": True,
-            }
+            return defaults
+
+    def ensure_settings_app_info(self):
+        changed = False
+
+        if self.settings.get("app_name") != APP_NAME:
+            self.settings["app_name"] = APP_NAME
+            changed = True
+
+        if self.settings.get("app_version") != APP_VERSION:
+            self.settings["app_version"] = APP_VERSION
+            changed = True
+
+        if changed or not self.settings_path.exists():
+            self.save_settings()
 
     def save_settings(self):
         self.settings_path.write_text(json.dumps(self.settings, indent=2), encoding="utf-8")
