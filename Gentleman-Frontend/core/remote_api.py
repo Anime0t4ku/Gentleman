@@ -55,6 +55,10 @@ class GentlemanApiServer:
                         self._send_json(app.api_status())
                         return
 
+                    if parsed.path in ("/api/session", "/api/v1/session"):
+                        self._send_json(app.active_session_snapshot())
+                        return
+
                     if parsed.path == "/api/menu":
                         folder = query.get("path", [""])[0]
                         self._send_json(app.api_menu(folder))
@@ -106,6 +110,16 @@ class GentlemanApiServer:
                     if parsed.path == "/api/show":
                         app.api_show()
                         self._send_json({"ok": True})
+                        return
+
+                    if parsed.path in ("/api/session/close", "/api/v1/session/close"):
+                        result = app.close_active_session(force=False)
+                        self._send_json(result, 200 if result.get("ok") else 409)
+                        return
+
+                    if parsed.path in ("/api/session/force-close", "/api/v1/session/force-close"):
+                        result = app.close_active_session(force=True)
+                        self._send_json(result, 200 if result.get("ok") else 409)
                         return
 
                     self._send_json({"error": "Not found"}, 404)

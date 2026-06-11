@@ -20,6 +20,7 @@ class LauncherConfig:
     core: str = ""
     working_directory: str = ""
     system: str = ""
+    emulator_name: str = ""
 
 
 @dataclass
@@ -52,6 +53,7 @@ def load_launcher(path: Path) -> LauncherConfig:
         core=data.get("core", ""),
         working_directory=data.get("working_directory", ""),
         system=str(data.get("system", "")),
+        emulator_name=str(data.get("emulator_name", "")).strip(),
     )
 
 
@@ -119,12 +121,17 @@ def external_process_env() -> dict[str, str]:
     return env
 
 
-def launch_external_process(command: str, cwd: str | None = None) -> None:
-    subprocess.Popen(
+def launch_external_process(command: str, cwd: str | None = None) -> subprocess.Popen:
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    return subprocess.Popen(
         command,
         cwd=cwd if cwd and os.path.isdir(cwd) else None,
         shell=True,
         env=external_process_env(),
+        creationflags=creationflags,
     )
 
 
@@ -138,10 +145,10 @@ def build_command(config: LauncherConfig, rom: Path) -> tuple[str, str]:
     return config.emulator, args
 
 
-def launch_rom(config: LauncherConfig, rom: Path) -> None:
+def launch_rom(config: LauncherConfig, rom: Path) -> subprocess.Popen:
     executable, args = build_command(config, rom)
 
     command = f'"{executable}" {args}'.strip()
     cwd = config.working_directory or str(Path(executable).parent)
 
-    launch_external_process(command, cwd)
+    return launch_external_process(command, cwd)

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import ctypes
+import threading
 import os
 import platform
 import socket
 import subprocess
 import sys
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
@@ -43,6 +46,11 @@ try:
 except Exception:
     pygame = None
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 
 class UpdateCheckWorker(QThread):
     result = pyqtSignal(object)
@@ -59,6 +67,158 @@ class UpdateCheckWorker(QThread):
 def resource_path(relative_path: str) -> Path:
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
     return base_path / relative_path
+
+
+class InGameOsd(QWidget):
+    def __init__(self, window):
+        super().__init__(None)
+        self.window = window
+        self.selected_index = 0
+        self.options = []
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.resize(960, 640)
+
+        self.panel = QColor(55, 0, 15, 245)
+        self.light = QColor(220, 185, 190)
+        self.text = QColor(245, 235, 235)
+        self.dark_text = QColor(40, 0, 10)
+
+        self.font = QFont("Consolas", 20)
+        self.font.setStyleHint(QFont.StyleHint.Monospace)
+        self.title_font = QFont("Consolas", 22, QFont.Weight.Bold)
+        self.title_font.setStyleHint(QFont.StyleHint.Monospace)
+
+    def refresh_options(self):
+        session = self.window.active_session_snapshot()
+        kind = session.get("type")
+        noun = "Game" if kind == "game" else "Emulator" if kind == "emulator" else "Application"
+        self.options = ["Resume", f"Close {noun}", f"Force Close {noun}"]
+        self.selected_index = min(self.selected_index, len(self.options) - 1)
+        self.update()
+
+    def show_osd(self):
+        self.refresh_options()
+        screen = QApplication.primaryScreen()
+        if screen:
+            geometry = screen.geometry()
+            self.resize(geometry.size())
+            self.move(geometry.topLeft())
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+
+    def move_selection(self, delta):
+        if not self.options:
+            return
+        self.selected_index = (self.selected_index + delta) % len(self.options)
+        self.update()
+
+    def activate_selected(self):
+        if self.selected_index == 0:
+            self.window.hide_ingame_osd(resume=True)
+        elif self.selected_index == 1:
+            self.window.close_active_session(force=False)
+            self.window.hide_ingame_osd(resume=False)
+        elif self.selected_index == 2:
+            answer = QMessageBox.warning(
+                self,
+                "Force Close",
+                "Force closing may interrupt save data or emulator writes.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.window.close_active_session(force=True)
+                self.window.hide_ingame_osd(resume=False)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_Up, Qt.Key.Key_W):
+            self.move_selection(-1)
+        elif key in (Qt.Key.Key_Down, Qt.Key.Key_S):
+            self.move_selection(1)
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.activate_selected()
+        elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
+            self.window.hide_ingame_osd(resume=True)
+        event.accept()
+
+    def menu_panel_rect(self) -> QRect:
+        panel_w = min(620, self.width() - 160)
+        panel_h = min(430, self.height() - 200)
+        return QRect((self.width() - panel_w) // 2, (self.height() - panel_h) // 2, panel_w, panel_h)
+
+    def top_bar_rect(self) -> QRect:
+        panel = self.menu_panel_rect()
+        return QRect(panel.x(), max(16, panel.y() - 78), panel.width(), 44)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 205))
+
+        bar = self.top_bar_rect()
+        painter.fillRect(bar, self.light)
+        painter.setFont(self.title_font)
+        painter.setPen(self.dark_text)
+        painter.drawText(bar.x() + 18, bar.y() + 31, "Gentleman")
+
+        time_text = datetime.now().strftime("%H:%M")
+        time_width = painter.fontMetrics().horizontalAdvance(time_text)
+        painter.drawText(bar.right() - 18 - time_width, bar.y() + 31, time_text)
+
+        panel = self.menu_panel_rect()
+        side_w = 48
+        painter.fillRect(panel, self.panel)
+        painter.fillRect(QRect(panel.x(), panel.y(), side_w, panel.height()), self.light)
+
+        painter.setFont(self.font)
+        painter.setPen(self.dark_text)
+        side_title = "IN-GAME OSD"
+        title_width = painter.fontMetrics().horizontalAdvance(side_title)
+        painter.save()
+        painter.translate(panel.x() + 31, panel.y() + (panel.height() + title_width) // 2)
+        painter.rotate(-90)
+        painter.drawText(0, 0, side_title)
+        painter.restore()
+
+        session = self.window.active_session_snapshot()
+        name = str(session.get("name") or "Running Session")
+        emulator = str(session.get("emulator") or "")
+        text_x = panel.x() + side_w + 22
+        right_x = panel.right() - 72
+
+        painter.setPen(self.text)
+        painter.setFont(self.title_font)
+        name_metrics = painter.fontMetrics()
+        available = max(40, right_x - text_x)
+        painter.drawText(text_x, panel.y() + 48, name_metrics.elidedText(name, Qt.TextElideMode.ElideRight, available))
+
+        if emulator:
+            painter.setFont(self.font)
+            painter.drawText(text_x, panel.y() + 82, painter.fontMetrics().elidedText(emulator, Qt.TextElideMode.ElideRight, available))
+
+        divider_y = panel.y() + 108
+        painter.fillRect(QRect(text_x - 6, divider_y, right_x - text_x + 6, 2), self.light)
+
+        painter.setFont(self.font)
+        start_y = divider_y + 45
+        for index, option in enumerate(self.options):
+            yy = start_y + index * 42
+            row = QRect(text_x - 6, yy - 27, right_x - text_x + 6, 32)
+            if index == self.selected_index:
+                painter.fillRect(row, self.light)
+                painter.setPen(self.dark_text)
+            else:
+                painter.setPen(self.text)
+            painter.drawText(text_x, yy, option)
 
 
 class GentlemanWindow(QMainWindow):
@@ -128,12 +288,25 @@ class GentlemanWindow(QMainWindow):
             "Set Wallpaper",
             "Clear Wallpaper",
         ]
+        self.support_items = [
+            "Ko-fi",
+            "Buy Me a Coffee",
+        ]
 
         self.current_launcher: LauncherConfig | None = None
         self.current_rom_folder: Path | None = None
         self.selected_index = 0
         self.active_input = "keyboard"
         self.input_suspended_for_launch = False
+        self.active_process = None
+        self.active_session = {"running": False, "type": None, "name": None, "emulator": None}
+        self.active_session_lock = threading.RLock()
+        self.osd_shortcut_started_ms = 0
+        self.osd_shortcut_latched = False
+        self.keyboard_osd_latched = False
+        self.ingame_osd = InGameOsd(self)
+        self.suspended_session_processes = []
+        self.local_ip_address = self.resolve_local_ip_address()
 
         self.controller_available = False
         self.controller = None
@@ -163,6 +336,14 @@ class GentlemanWindow(QMainWindow):
         self.controller_timer.timeout.connect(self.poll_controller)
         self.controller_timer.start(33)
 
+        self.process_timer = QTimer(self)
+        self.process_timer.timeout.connect(self.check_active_process)
+        self.process_timer.start(500)
+
+        self.ip_refresh_timer = QTimer(self)
+        self.ip_refresh_timer.timeout.connect(self.refresh_local_ip_address)
+        self.ip_refresh_timer.start(30000)
+
         self.apply_remote_api_state()
 
         if self.settings.get("fullscreen_at_launch", False):
@@ -170,6 +351,27 @@ class GentlemanWindow(QMainWindow):
 
         if self.settings.get("check_updates_at_launch", True):
             QTimer.singleShot(1500, self.check_for_updates_on_startup)
+
+    def resolve_local_ip_address(self) -> str:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            address = sock.getsockname()[0]
+            return address or "Not connected"
+        except OSError:
+            try:
+                return socket.gethostbyname(socket.gethostname()) or "Not connected"
+            except OSError:
+                return "Not connected"
+        finally:
+            sock.close()
+
+    def refresh_local_ip_address(self):
+        address = self.resolve_local_ip_address()
+        if address != self.local_ip_address:
+            self.local_ip_address = address
+            if self.mode == "system":
+                self.view.update()
 
     def default_settings(self) -> dict:
         return {
@@ -187,6 +389,7 @@ class GentlemanWindow(QMainWindow):
             "remote_api_port": 8755,
             "check_updates_at_launch": True,
             "normalize_arcade_names": True,
+            "ingame_osd_enabled": True,
         }
 
     def load_settings(self) -> dict:
@@ -432,6 +635,9 @@ class GentlemanWindow(QMainWindow):
                 except Exception:
                     self.emulator_paths[emulator_name] = ""
 
+    def ingame_osd_enabled(self) -> bool:
+        return bool(self.settings.get("ingame_osd_enabled", True))
+
     def remote_api_enabled(self) -> bool:
         return bool(self.settings.get("api_enabled", False))
 
@@ -472,6 +678,7 @@ class GentlemanWindow(QMainWindow):
             "remote_api_enabled": self.remote_api_enabled(),
             "host": self.remote_api_host(),
             "port": int(self.settings.get("remote_api_port", 8755)),
+            "session": self.active_session_snapshot(),
         }
 
     def api_safe_menu_folder(self, folder: str) -> Path:
@@ -707,13 +914,14 @@ class GentlemanWindow(QMainWindow):
         config = load_launcher(launcher_path)
 
         if config.launcher_type == "application":
-            self.suspend_frontend_input_for_launch()
-            launch_external_process(f'"{config.emulator}" {config.arguments}'.strip(), str(Path(config.emulator).parent))
-            return {"ok": True, "launched": "application", "launcher": launcher}
+            process = launch_external_process(f'"{config.emulator}" {config.arguments}'.strip(), str(Path(config.emulator).parent))
+            self.begin_active_session(process, "application", config.emulator_name or launcher_path.stem, "")
+            return {"ok": True, "launched": "application", "launcher": launcher, "session": self.active_session_snapshot()}
 
         rom_path = self.api_safe_rom_path(config, game)
-        self.suspend_frontend_input_for_launch()
-        launch_rom(config, rom_path)
+        display_name = self.display_name_for_rom(config, rom_path)
+        process = launch_rom(config, rom_path)
+        self.begin_active_session(process, "game", display_name, config.emulator_name or launcher_path.stem)
         self.add_recent_game(launcher_path, rom_path)
         self.update_recent_items()
 
@@ -721,6 +929,7 @@ class GentlemanWindow(QMainWindow):
             "ok": True,
             "launcher": launcher,
             "game": game,
+            "session": self.active_session_snapshot(),
         }
 
     def api_show(self):
@@ -738,6 +947,9 @@ class GentlemanWindow(QMainWindow):
             "Edit Launcher",
             "Refresh Menu",
             "Settings",
+            "Wallpapers",
+            "Report Issues & Requests",
+            "Support the Project",
             "Check for Updates",
             "About",
             "Exit",
@@ -798,6 +1010,11 @@ class GentlemanWindow(QMainWindow):
             self.settings.get("check_updates_at_launch", True),
         )
 
+        ingame_osd_label = self.setting_state_label(
+            "In-Game OSD",
+            self.ingame_osd_enabled(),
+        )
+
         self.settings_items = [
             fullscreen_launch_label,
             emulators_menu_label,
@@ -808,10 +1025,10 @@ class GentlemanWindow(QMainWindow):
             "Clear Recent",
             "Clear Favorites",
             update_check_label,
+            ingame_osd_label,
             api_label,
             swap_ab_label,
             swap_xy_label,
-            "Wallpaper",
         ]
 
     def launcher_type_values(self) -> list[str]:
@@ -1271,7 +1488,9 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "settings":
             return "Settings"
         if self.mode == "wallpaper":
-            return "Wallpaper"
+            return "Wallpapers"
+        if self.mode == "support":
+            return "Support the Project"
         if self.mode == "launcher_form":
             return "Edit Launcher" if self.launcher_form_mode == "edit" else "Create Launcher"
         if self.mode == "system_picker":
@@ -1320,6 +1539,8 @@ class GentlemanWindow(QMainWindow):
             return len(self.settings_items)
         if self.mode == "wallpaper":
             return len(self.wallpaper_items)
+        if self.mode == "support":
+            return len(self.support_items)
         if self.mode == "launcher_form":
             self.update_launcher_form_fields()
             return len(self.launcher_form_fields)
@@ -1361,6 +1582,8 @@ class GentlemanWindow(QMainWindow):
             return [(name, "") for name in self.settings_items]
         if self.mode == "wallpaper":
             return [(name, "") for name in self.wallpaper_items]
+        if self.mode == "support":
+            return [(name, "") for name in self.support_items]
         if self.mode == "launcher_form":
             self.update_launcher_form_fields()
             labels = []
@@ -1456,7 +1679,13 @@ class GentlemanWindow(QMainWindow):
             return
 
         if self.mode == "wallpaper":
-            self.mode = "settings"
+            self.mode = "system"
+            self.selected_index = 0
+            self.view.update()
+            return
+
+        if self.mode == "support":
+            self.mode = "system"
             self.selected_index = 0
             self.view.update()
             return
@@ -1573,6 +1802,10 @@ class GentlemanWindow(QMainWindow):
             self.activate_wallpaper_item(self.wallpaper_items[self.selected_index])
             return
 
+        if self.mode == "support":
+            self.activate_support_item(self.support_items[self.selected_index])
+            return
+
         if self.mode == "system_picker":
             self.select_system_picker_item()
             return
@@ -1643,8 +1876,8 @@ class GentlemanWindow(QMainWindow):
                 return
 
             try:
-                self.suspend_frontend_input_for_launch()
-                launch_external_process(f'"{emulator_path}"', str(Path(emulator_path).parent))
+                process = launch_external_process(f'"{emulator_path}"', str(Path(emulator_path).parent))
+                self.begin_active_session(process, "emulator", emulator_name, "")
             except Exception as exc:
                 self.resume_frontend_input_after_launch()
                 QMessageBox.critical(self, "Launch failed", str(exc))
@@ -1682,8 +1915,13 @@ class GentlemanWindow(QMainWindow):
                 return
 
             try:
-                self.suspend_frontend_input_for_launch()
-                launch_rom(self.current_launcher, selected.path)
+                process = launch_rom(self.current_launcher, selected.path)
+                self.begin_active_session(
+                    process,
+                    "game",
+                    selected.display_name,
+                    self.current_launcher.emulator_name or self.current_launcher.path.stem,
+                )
                 self.add_recent_game(self.current_launcher.path, selected.path)
                 self.update_recent_items()
             except Exception as exc:
@@ -1749,8 +1987,13 @@ class GentlemanWindow(QMainWindow):
 
         try:
             launcher = load_launcher(launcher_path)
-            self.suspend_frontend_input_for_launch()
-            launch_rom(launcher, rom)
+            process = launch_rom(launcher, rom)
+            self.begin_active_session(
+                process,
+                "game",
+                self.display_name_for_rom(launcher, rom),
+                launcher.emulator_name or launcher.path.stem,
+            )
             self.add_recent_game(launcher_path, rom)
             self.update_recent_items()
             self.view.update()
@@ -1785,9 +2028,19 @@ class GentlemanWindow(QMainWindow):
         elif item == "Refresh Menu":
             self.mode = "menu"
             self.refresh_menu()
+        elif item == "Wallpapers":
+            self.mode = "wallpaper"
+            self.selected_index = 0
+            self.view.update()
         elif item == "Settings":
             self.update_settings_items()
             self.mode = "settings"
+            self.selected_index = 0
+            self.view.update()
+        elif item == "Report Issues & Requests":
+            webbrowser.open("https://github.com/Anime0t4ku/Gentleman/issues/new/choose")
+        elif item == "Support the Project":
+            self.mode = "support"
             self.selected_index = 0
             self.view.update()
         elif item == "Check for Updates":
@@ -1969,6 +2222,12 @@ class GentlemanWindow(QMainWindow):
         elif item.startswith("Update Check at Launch:"):
             self.settings["check_updates_at_launch"] = not self.settings.get("check_updates_at_launch", True)
             self.refresh_settings_menu()
+        elif item.startswith("In-Game OSD:"):
+            self.settings["ingame_osd_enabled"] = not self.ingame_osd_enabled()
+            self.osd_shortcut_started_ms = 0
+            self.osd_shortcut_latched = False
+            self.keyboard_osd_latched = False
+            self.refresh_settings_menu()
         elif item.startswith("API:"):
             self.settings["api_enabled"] = not self.settings.get("api_enabled", False)
             self.save_settings()
@@ -1981,10 +2240,6 @@ class GentlemanWindow(QMainWindow):
         elif item.startswith("Swap X/Y:"):
             self.settings["swap_controller_xy"] = not self.settings.get("swap_controller_xy", False)
             self.refresh_settings_menu()
-        elif item == "Wallpaper":
-            self.mode = "wallpaper"
-            self.selected_index = 0
-            self.view.update()
 
     def activate_wallpaper_item(self, item: str):
         if item == "Set Wallpaper":
@@ -1994,6 +2249,12 @@ class GentlemanWindow(QMainWindow):
             self.save_settings()
             self.view.reload_wallpaper()
             self.view.update()
+
+    def activate_support_item(self, item: str):
+        if item == "Ko-fi":
+            webbrowser.open("https://ko-fi.com/anime0t4ku")
+        elif item == "Buy Me a Coffee":
+            webbrowser.open("https://buymeacoffee.com/anime0t4ku")
 
     def set_wallpaper(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2021,6 +2282,190 @@ class GentlemanWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Open folder failed", str(exc))
 
+    def display_name_for_rom(self, config: LauncherConfig, rom: Path) -> str:
+        if self.settings.get("normalize_arcade_names", True) and config.system.strip().lower() == "arcade":
+            normalized = self.arcade_name_database.display_name(rom.name)
+            if normalized:
+                return normalized
+        return rom.stem
+
+    def begin_active_session(self, process, session_type: str, name: str, emulator: str = ""):
+        with self.active_session_lock:
+            self.active_process = process
+            self.active_session = {
+                "running": True,
+                "type": session_type,
+                "name": name,
+                "emulator": emulator or None,
+                "pid": getattr(process, "pid", None),
+            }
+        self.suspend_frontend_input_for_launch()
+
+    def active_session_snapshot(self) -> dict:
+        with self.active_session_lock:
+            return dict(self.active_session)
+
+    def clear_active_session(self):
+        self.resume_active_session_processes()
+        with self.active_session_lock:
+            self.active_process = None
+            self.active_session = {"running": False, "type": None, "name": None, "emulator": None}
+        self.resume_frontend_input_after_launch()
+
+    def check_active_process(self):
+        self.poll_keyboard_osd_shortcut()
+        process = self.active_process
+        if process is None:
+            return
+        try:
+            ended = process.poll() is not None
+        except Exception:
+            ended = False
+        if ended:
+            if self.ingame_osd.isVisible():
+                self.ingame_osd.hide()
+            self.clear_active_session()
+
+    def suspend_active_session_processes(self):
+        self.suspended_session_processes = []
+        if psutil is None:
+            return
+        session = self.active_session_snapshot()
+        pid = session.get("pid")
+        if not pid:
+            return
+        try:
+            root = psutil.Process(int(pid))
+            processes = root.children(recursive=True) + [root]
+            for process in reversed(processes):
+                try:
+                    process.suspend()
+                    self.suspended_session_processes.append(process)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            self.suspended_session_processes = []
+
+    def resume_active_session_processes(self):
+        processes = self.suspended_session_processes
+        self.suspended_session_processes = []
+        for process in reversed(processes):
+            try:
+                process.resume()
+            except Exception:
+                continue
+
+    def close_active_session(self, force: bool = False) -> dict:
+        session = self.active_session_snapshot()
+        if not session.get("running"):
+            return {"ok": False, "error": "no_active_session", "session": session}
+
+        self.resume_active_session_processes()
+        process = self.active_process
+        pid = session.get("pid")
+        try:
+            if os.name == "nt" and pid:
+                command = ["taskkill", "/PID", str(pid), "/T"]
+                if force:
+                    command.append("/F")
+                completed = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                if completed.returncode != 0 and process is not None:
+                    if force:
+                        process.kill()
+                    else:
+                        process.terminate()
+            elif process is not None:
+                if force:
+                    process.kill()
+                else:
+                    process.terminate()
+            else:
+                return {"ok": False, "error": "process_unavailable", "session": session}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "session": session}
+
+        if force:
+            self.clear_active_session()
+        return {"ok": True, "action": "force_close" if force else "close", "session": self.active_session_snapshot()}
+
+    def show_ingame_osd(self):
+        if not self.ingame_osd_enabled():
+            return
+        if not self.active_session_snapshot().get("running") or self.ingame_osd.isVisible():
+            return
+        self.suspend_active_session_processes()
+        self.ingame_osd.show_osd()
+
+    def hide_ingame_osd(self, resume: bool):
+        self.ingame_osd.hide()
+        if resume:
+            self.resume_active_session_processes()
+        else:
+            self.suspended_session_processes = []
+        if resume and self.active_session_snapshot().get("running"):
+            try:
+                if os.name == "nt":
+                    ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x09, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x09, 0, 2, 0)
+                    ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
+            except Exception:
+                pass
+
+    def poll_keyboard_osd_shortcut(self):
+        if not self.ingame_osd_enabled():
+            self.keyboard_osd_latched = False
+            return
+        if os.name != "nt" or not self.active_session_snapshot().get("running"):
+            self.keyboard_osd_latched = False
+            return
+        user32 = ctypes.windll.user32
+        pressed = bool(user32.GetAsyncKeyState(0x11) & 0x8000) and bool(user32.GetAsyncKeyState(0x12) & 0x8000) and bool(user32.GetAsyncKeyState(ord("G")) & 0x8000)
+        if pressed and not self.keyboard_osd_latched:
+            self.keyboard_osd_latched = True
+            self.show_ingame_osd()
+        elif not pressed:
+            self.keyboard_osd_latched = False
+
+    def controller_osd_shortcut_pressed(self) -> bool:
+        if self.controller is None:
+            return False
+        try:
+            buttons = self.controller.get_numbuttons()
+            axes = self.controller.get_numaxes()
+            l1 = buttons > 4 and bool(self.controller.get_button(4))
+            r1 = buttons > 5 and bool(self.controller.get_button(5))
+            l3 = buttons > 8 and bool(self.controller.get_button(8))
+            r3 = buttons > 9 and bool(self.controller.get_button(9))
+            l2 = (axes > 2 and self.controller.get_axis(2) > 0.5) or (axes > 4 and self.controller.get_axis(4) > 0.5)
+            r2 = axes > 5 and self.controller.get_axis(5) > 0.5
+            return l1 and l2 and l3 and r1 and r2 and r3
+        except Exception:
+            return False
+
+    def poll_ingame_osd_shortcuts(self):
+        if not self.ingame_osd_enabled():
+            self.osd_shortcut_started_ms = 0
+            self.osd_shortcut_latched = False
+            self.keyboard_osd_latched = False
+            return
+        self.poll_keyboard_osd_shortcut()
+        if not self.active_session_snapshot().get("running"):
+            self.osd_shortcut_started_ms = 0
+            self.osd_shortcut_latched = False
+            return
+        pressed = self.controller_osd_shortcut_pressed()
+        now = int(time.monotonic() * 1000)
+        if pressed:
+            if not self.osd_shortcut_started_ms:
+                self.osd_shortcut_started_ms = now
+            elif now - self.osd_shortcut_started_ms >= 1000 and not self.osd_shortcut_latched:
+                self.osd_shortcut_latched = True
+                self.show_ingame_osd()
+        else:
+            self.osd_shortcut_started_ms = 0
+            self.osd_shortcut_latched = False
+
     def suspend_frontend_input_for_launch(self):
         self.input_suspended_for_launch = True
         self.controller_button_state.clear()
@@ -2040,7 +2485,7 @@ class GentlemanWindow(QMainWindow):
         self.controller_repeat_next_ms = 0
 
     def changeEvent(self, event):
-        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow() and not self.active_session_snapshot().get("running"):
             QTimer.singleShot(150, self.resume_frontend_input_after_launch)
 
         super().changeEvent(event)
@@ -2184,9 +2629,31 @@ class GentlemanWindow(QMainWindow):
             return
 
         if self.input_suspended_for_launch:
-            self.controller_button_state.clear()
+            self.poll_ingame_osd_shortcuts()
+            if not self.ingame_osd.isVisible():
+                self.controller_button_state.clear()
             self.controller_repeat_action = None
             self.controller_repeat_next_ms = 0
+            if self.ingame_osd.isVisible():
+                try:
+                    hat_y = self.controller.get_hat(0)[1] if self.controller.get_numhats() > 0 else 0
+                    axis_y = self.controller.get_axis(1) if self.controller.get_numaxes() > 1 else 0
+                    up = hat_y > 0 or axis_y < -0.5
+                    down = hat_y < 0 or axis_y > 0.5
+                    accept = self.controller.get_button(0) if self.controller.get_numbuttons() > 0 else False
+                    back = self.controller.get_button(1) if self.controller.get_numbuttons() > 1 else False
+                    for key, pressed, callback in (
+                        ("osd_up", up, lambda: self.ingame_osd.move_selection(-1)),
+                        ("osd_down", down, lambda: self.ingame_osd.move_selection(1)),
+                        ("osd_accept", accept, self.ingame_osd.activate_selected),
+                        ("osd_back", back, lambda: self.hide_ingame_osd(resume=True)),
+                    ):
+                        previous = self.controller_button_state.get(key, False)
+                        if pressed and not previous:
+                            callback()
+                        self.controller_button_state[key] = bool(pressed)
+                except Exception:
+                    pass
             return
 
         try:
@@ -2396,7 +2863,8 @@ class GentlemanView(QWidget):
 
     def visible_rows(self) -> int:
         _, panel_h = self.menu_panel_size()
-        return max(1, (panel_h - 30) // 28)
+        reserved_height = 114 if self.window.mode == "system" else 30
+        return max(1, (panel_h - reserved_height) // 28)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -2578,6 +3046,12 @@ class GentlemanView(QWidget):
 
         painter.setFont(self.font)
 
+        if self.window.mode == "system":
+            painter.setPen(self.text)
+            painter.drawText(text_x, row_y, f"IP: {self.window.local_ip_address}")
+            painter.drawText(text_x, row_y + 28, f"Version: {APP_VERSION}")
+            row_y += 84
+
         if not labels:
             painter.setPen(self.text)
             painter.drawText(text_x, row_y, "No entries")
@@ -2585,7 +3059,8 @@ class GentlemanView(QWidget):
 
         for row, idx in enumerate(range(start, end)):
             label, marker = labels[idx]
-            yy = row_y + row * 28
+            support_gap = 14 if self.window.mode == "system" and idx >= 6 else 0
+            yy = row_y + row * 28 + support_gap
 
             row_left_x = text_x - 6
 

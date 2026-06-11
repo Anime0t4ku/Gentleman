@@ -36,17 +36,21 @@ Linux support may be added later, but the current version should be treated as W
 - Optional Favorites, Recent, and Emulators menu entries
 - Automatic Emulators menu generated from launcher JSON files
 - System selection using a predefined system list
-- Wallpaper support
+- Wallpaper support through the Gentleman Menu
 - Fullscreen support
 - Fullscreen-at-launch setting
 - Controller navigation support
 - A/B and X/Y controller button swap settings
 - API support for third-party apps and remote devices
+- Active-session API reporting and close controls
+- In-game OSD for running games, emulators, and applications
 - Manual update check from the Gentleman Menu
 - Optional external Gentleman Updater support
 - API active indicator in the top bar
 - App icon and logo support
 - Logo can be enabled or disabled from Settings
+- Gentleman Menu shows the local IP address and app version
+- Built-in links for issue reports, feature requests, and project support
 
 ## Run
 
@@ -75,6 +79,7 @@ The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders suc
 - F11: toggle fullscreen
 - F5: refresh menu
 - F: favorite or unfavorite selected game
+- Ctrl + Alt + G: open the in-game OSD while a game, emulator, or application is running
 
 ### Controller
 
@@ -89,6 +94,7 @@ Default controller mapping:
 - X: favorite or unfavorite selected game
 - Start: select
 - Back: back
+- Hold L1 + L2 + L3 + R1 + R2 + R3 for one second: open the in-game OSD
 
 The button layout can be adjusted from Settings:
 
@@ -99,15 +105,25 @@ The button layout can be adjusted from Settings:
 
 Press Backspace or Esc on the home screen to open the Gentleman Menu.
 
+The local IP address and Gentleman version are shown at the top of this menu.
+
 From here you can:
 
+- Toggle Fullscreen
 - Create Launcher
 - Edit Launcher
 - Refresh Menu
-- Check for Updates
 - Open Settings
+- Open Wallpapers
+- Report Issues & Requests
+- Open Support the Project
+- Check for Updates
 - View About
 - Exit
+
+Report Issues & Requests opens the Gentleman GitHub issue templates.
+
+Support the Project opens a submenu with links to Ko-fi and Buy Me a Coffee.
 
 ## Settings
 
@@ -122,9 +138,9 @@ The Settings menu currently includes:
 - API: Enabled / Disabled
 - Swap A/B: Enabled / Disabled
 - Swap X/Y: Enabled / Disabled
+- In-Game OSD: Enabled / Disabled
 - Clear Recent
 - Clear Favorites
-- Wallpaper
 
 ## Menu Structure
 
@@ -295,6 +311,30 @@ PCSX2
 
 Selecting an emulator opens the emulator directly without a ROM.
 
+
+## In-Game OSD
+
+Gentleman includes an optional in-game OSD for running games, emulators, and applications.
+
+The OSD displays the active game and emulator. For application launchers, it displays the application name.
+
+Available actions include:
+
+- Resume
+- Close Game, Emulator, or Application
+- Force Close Game, Emulator, or Application
+
+Force Close includes a warning because it may interrupt save data or emulator writes.
+
+The OSD can be opened with:
+
+- `Ctrl + Alt + G` on a keyboard
+- Hold `L1 + L2 + L3 + R1 + R2 + R3` for one second on a controller
+
+While the OSD is open, the launched process is paused so OSD navigation does not also affect the running game.
+
+The In-Game OSD setting is enabled by default and can be disabled from Settings.
+
 ## API
 
 Gentleman includes an API for third-party apps.
@@ -309,6 +349,9 @@ The API allows external tools to:
 - Launch applications
 - Retrieve recent games
 - Retrieve favorites
+- View the active game, emulator, or application
+- Close the active session
+- Force close the active session
 - Bring Gentleman to the front
 
 Third-party apps do not need to know which emulator is used, which JSON launcher exists, or which ROM folder is configured. They can ask Gentleman for systems and games directly.
