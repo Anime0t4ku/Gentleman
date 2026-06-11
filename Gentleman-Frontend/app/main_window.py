@@ -62,6 +62,8 @@ def resource_path(relative_path: str) -> Path:
 
 
 class GentlemanWindow(QMainWindow):
+    api_show_requested = pyqtSignal()
+
     def __init__(self, base_dir: Path):
         super().__init__()
 
@@ -79,6 +81,7 @@ class GentlemanWindow(QMainWindow):
         self.arcade_name_database = ArcadeNameDatabase(self.assets_dir / "databases" / "arcade_names.json")
         self.ensure_settings_app_info()
         self.remote_api_server: GentlemanApiServer | None = None
+        self.api_show_requested.connect(self._show_from_api)
         self.update_check_worker: UpdateCheckWorker | None = None
         self.startup_update_check_done = False
 
@@ -721,6 +724,9 @@ class GentlemanWindow(QMainWindow):
         }
 
     def api_show(self):
+        self.api_show_requested.emit()
+
+    def _show_from_api(self):
         self.showNormal()
         self.raise_()
         self.activateWindow()
