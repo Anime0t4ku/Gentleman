@@ -348,6 +348,8 @@ class GentlemanWindow(QMainWindow):
 
         self.resize(1280, 720)
         self.setMinimumSize(960, 640)
+        self._windowed_geometry = None
+        self._fullscreen_screen_geometry = None
 
         self.view = GentlemanView(self)
         self.setCentralWidget(self.view)
@@ -456,7 +458,7 @@ class GentlemanWindow(QMainWindow):
         self.apply_remote_api_state()
 
         if self.settings.get("fullscreen_at_launch", False):
-            QTimer.singleShot(0, self.showFullScreen)
+            QTimer.singleShot(0, self.enter_fullscreen)
 
         if self.settings.get("check_updates_at_launch", True):
             QTimer.singleShot(1500, self.check_for_updates_on_startup)
@@ -3342,12 +3344,55 @@ class GentlemanWindow(QMainWindow):
         self.view.ensure_visible()
         self.view.update()
 
+    def _target_fullscreen_screen(self):
+        screen = self.screen()
+        if screen is None:
+            screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        return screen
+
+    def _enforce_fullscreen_geometry(self):
+        if not self.isFullScreen():
+            return
+        screen = self._target_fullscreen_screen()
+        if screen is None:
+            return
+        geometry = screen.geometry()
+        self._fullscreen_screen_geometry = geometry
+        self.setGeometry(geometry)
+        self.move(geometry.topLeft())
+        self.resize(geometry.size())
+        self.raise_()
+        self.view.update()
+
+    def enter_fullscreen(self):
+        if not self.isFullScreen():
+            self._windowed_geometry = self.geometry()
+        screen = self._target_fullscreen_screen()
+        if screen is not None:
+            self._fullscreen_screen_geometry = screen.geometry()
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.showFullScreen()
+        self._enforce_fullscreen_geometry()
+        QTimer.singleShot(0, self._enforce_fullscreen_geometry)
+        QTimer.singleShot(100, self._enforce_fullscreen_geometry)
+
+    def leave_fullscreen(self):
+        self.showNormal()
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)
+        self.showNormal()
+        if self._windowed_geometry is not None:
+            self.setGeometry(self._windowed_geometry)
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(50, self.view.update)
+
     def toggle_fullscreen(self):
         if self.isFullScreen():
-            self.showNormal()
+            self.leave_fullscreen()
         else:
-            self.showFullScreen()
-        QTimer.singleShot(50, self.view.update)
+            self.enter_fullscreen()
 
     def keyPressEvent(self, event: QKeyEvent):
         if self.input_suspended_for_launch: self.resume_frontend_input_after_launch()
