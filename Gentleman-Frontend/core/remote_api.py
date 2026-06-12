@@ -89,6 +89,11 @@ class GentlemanApiServer:
                         self._send_json({"items": app.load_favorite_items()})
                         return
 
+                    if parsed.path in ("/api/input/context", "/api/v1/input/context"):
+                        result = app.api_input_context()
+                        self._send_json(result, 200 if result.get("ok") else 500)
+                        return
+
                     self._send_json({"error": "Not found"}, 404)
                 except Exception as exc:
                     self._send_json({"error": str(exc)}, 500)
@@ -110,6 +115,13 @@ class GentlemanApiServer:
                     if parsed.path == "/api/show":
                         app.api_show()
                         self._send_json({"ok": True})
+                        return
+
+                    if parsed.path in ("/api/input", "/api/v1/input"):
+                        action = str(payload.get("action", "")).strip().lower()
+                        result = app.api_input(action)
+                        status = 200 if result.get("ok") else 409
+                        self._send_json(result, status)
                         return
 
                     if parsed.path in ("/api/session/close", "/api/v1/session/close"):

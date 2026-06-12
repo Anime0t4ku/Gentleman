@@ -223,6 +223,8 @@ class InGameOsd(QWidget):
 
 class GentlemanWindow(QMainWindow):
     api_show_requested = pyqtSignal()
+    api_input_requested = pyqtSignal(str, object)
+    api_input_context_requested = pyqtSignal(object)
 
     def __init__(self, base_dir: Path):
         super().__init__()
@@ -242,6 +244,8 @@ class GentlemanWindow(QMainWindow):
         self.ensure_settings_app_info()
         self.remote_api_server: GentlemanApiServer | None = None
         self.api_show_requested.connect(self._show_from_api)
+        self.api_input_requested.connect(self._handle_api_input)
+        self.api_input_context_requested.connect(self._handle_api_input_context)
         self.update_check_worker: UpdateCheckWorker | None = None
         self.startup_update_check_done = False
 
@@ -934,6 +938,103 @@ class GentlemanWindow(QMainWindow):
 
     def api_show(self):
         self.api_show_requested.emit()
+
+    def api_input(self, action: str) -> dict:
+        request = {
+            "event": threading.Event(),
+            "result": None,
+        }
+        self.api_input_requested.emit(str(action or "").strip().lower(), request)
+
+        if not request["event"].wait(2.0):
+            return {"ok": False, "error": "Input request timed out"}
+
+        return request.get("result") or {"ok": False, "error": "Input request failed"}
+
+    def api_input_context(self) -> dict:
+        request = {
+            "event": threading.Event(),
+            "result": None,
+        }
+        self.api_input_context_requested.emit(request)
+
+        if not request["event"].wait(2.0):
+            return {"ok": False, "error": "Input context request timed out"}
+
+        return request.get("result") or {"ok": False, "error": "Input context request failed"}
+
+    def _input_context_snapshot(self) -> dict:
+        favorite_item = self.favorite_item_from_current_selection()
+        favorite_available = favorite_item is not None
+
+        return {
+            "ok": True,
+            "mode": self.mode,
+            "favorite_available": favorite_available,
+            "is_favorite": self.current_selection_is_favorite() if favorite_available else False,
+            "selected_game": favorite_item.get("name", "") if favorite_item else "",
+        }
+
+    def _handle_api_input_context(self, request: object):
+        try:
+            request["result"] = self._input_context_snapshot()
+        except Exception as exc:
+            request["result"] = {"ok": False, "error": str(exc)}
+        finally:
+            request["event"].set()
+
+    def _handle_api_input(self, action: str, request: object):
+        try:
+            if self.input_suspended_for_launch:
+                request["result"] = {
+                    "ok": False,
+                    "error": "Gentleman navigation is unavailable while a game or application is running",
+                }
+                return
+
+            self.active_input = "controller"
+
+            if action == "up":
+                self.move_selection(-1)
+            elif action == "down":
+                self.move_selection(1)
+            elif action == "left":
+                if self.mode == "launcher_form":
+                    self.cycle_launcher_form_value(-1)
+                else:
+                    self.move_selection(-10)
+            elif action == "right":
+                if self.mode == "launcher_form":
+                    self.cycle_launcher_form_value(1)
+                else:
+                    self.move_selection(10)
+            elif action == "select":
+                self.activate_selected()
+            elif action == "back":
+                self.go_back()
+            elif action == "favorite":
+                if self.favorite_item_from_current_selection() is None:
+                    request["result"] = {
+                        "ok": False,
+                        "error": "Favorite is only available for a selected game",
+                        "context": self._input_context_snapshot(),
+                    }
+                    return
+                self.toggle_current_favorite()
+            else:
+                request["result"] = {"ok": False, "error": "Unsupported input action"}
+                return
+
+            self.view.update()
+            request["result"] = {
+                "ok": True,
+                "action": action,
+                "context": self._input_context_snapshot(),
+            }
+        except Exception as exc:
+            request["result"] = {"ok": False, "error": str(exc)}
+        finally:
+            request["event"].set()
 
     def _show_from_api(self):
         self.showNormal()
