@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import ctypes
 import threading
 import os
@@ -393,10 +394,8 @@ class GentlemanWindow(QMainWindow):
         self.update_system_items()
         self.settings_items = []
         self.update_settings_items()
-        self.wallpaper_items = [
-            "Set Wallpaper",
-            "Clear Wallpaper",
-        ]
+        self.wallpaper_items = []
+        self.update_wallpaper_items()
         self.support_items = [
             "Ko-fi",
             "Buy Me a Coffee",
@@ -488,6 +487,7 @@ class GentlemanWindow(QMainWindow):
             "app_name": APP_NAME,
             "app_version": APP_VERSION,
             "wallpaper": "",
+            "wallpaper_folder": "",
             "fullscreen_at_launch": False,
             "show_emulators_menu": True,
             "show_recent_menu": True,
@@ -1820,7 +1820,7 @@ class GentlemanWindow(QMainWindow):
             label = ''
         return f'{drive}  {label}' if label else drive
 
-    def open_file_browser(self, title: str, start: Path, extensions, select_folder: bool, callback):
+    def open_file_browser(self, title: str, start: Path, extensions, select_folder: bool, callback, use_start: bool = False):
         self.overlay_return_mode = self.mode
         self.overlay_return_index = self.selected_index
         self.overlay_return_scroll_offset = self.view.scroll_offset
@@ -1828,7 +1828,8 @@ class GentlemanWindow(QMainWindow):
         self.file_browser_extensions = [x.lower() for x in extensions]
         self.file_browser_select_folder = select_folder
         self.file_browser_callback = callback
-        self.file_browser_path = None
+        start_path = Path(start) if start else None
+        self.file_browser_path = start_path if use_start and start_path and start_path.is_dir() else None
         self.mode = 'file_browser'
         self.selected_index = 0
         self.refresh_file_browser()
@@ -2498,8 +2499,10 @@ class GentlemanWindow(QMainWindow):
             self.mode = "menu"
             self.refresh_menu()
         elif item == "Wallpapers":
+            self.update_wallpaper_items()
             self.mode = "wallpaper"
             self.selected_index = 0
+            self.view.scroll_offset = 0
             self.view.update()
         elif item == "Settings":
             self.update_settings_items()
@@ -2655,23 +2658,87 @@ class GentlemanWindow(QMainWindow):
         self.view.scroll_offset = 0
         self.view.update()
 
+    def wallpaper_folder_path(self) -> Path | None:
+        value = str(self.settings.get("wallpaper_folder", "")).strip()
+        if not value:
+            return None
+        path = Path(value)
+        if path.is_dir():
+            return path
+        self.settings["wallpaper_folder"] = ""
+        self.save_settings()
+        return None
+
+    def update_wallpaper_items(self):
+        if self.wallpaper_folder_path() is not None:
+            self.wallpaper_items = [
+                "Choose Wallpaper",
+                "Clear Wallpaper Folder",
+                "Browse This PC",
+            ]
+        else:
+            self.wallpaper_items = [
+                "Set Wallpaper Folder",
+                "Browse This PC",
+            ]
+
     def activate_wallpaper_item(self, item: str):
-        if item == "Set Wallpaper":
-            self.set_wallpaper()
-        elif item == "Clear Wallpaper":
-            self.settings["wallpaper"] = ""
+        if item == "Choose Wallpaper":
+            folder = self.wallpaper_folder_path()
+            if folder is None:
+                self.update_wallpaper_items()
+                self.selected_index = 0
+                self.view.update()
+                return
+            self.open_file_browser(
+                "Select wallpaper",
+                folder,
+                [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"],
+                False,
+                self._set_wallpaper_path,
+                use_start=True,
+            )
+        elif item == "Set Wallpaper Folder":
+            self.open_file_browser(
+                "Select wallpaper folder",
+                self.base_dir,
+                [],
+                True,
+                self._set_wallpaper_folder,
+            )
+        elif item == "Clear Wallpaper Folder":
+            self.settings["wallpaper_folder"] = ""
             self.save_settings()
-            self.view.reload_wallpaper()
+            self.update_wallpaper_items()
+            self.selected_index = 0
+            self.view.scroll_offset = 0
             self.view.update()
+        elif item == "Browse This PC":
+            self.open_file_browser(
+                "Select wallpaper",
+                self.base_dir,
+                [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"],
+                False,
+                self._set_wallpaper_path,
+            )
+
+    def _set_wallpaper_folder(self, path):
+        folder = Path(path)
+        if not folder.is_dir():
+            self.show_message("Wallpaper Folder", "The selected wallpaper folder is not available.")
+            return
+        self.settings["wallpaper_folder"] = str(folder).replace("\\", "/")
+        self.save_settings()
+        self.update_wallpaper_items()
+        self.selected_index = 0
+        self.view.scroll_offset = 0
+        self.view.update()
 
     def activate_support_item(self, item: str):
         if item == "Ko-fi":
             webbrowser.open("https://ko-fi.com/anime0t4ku")
         elif item == "Buy Me a Coffee":
             webbrowser.open("https://buymeacoffee.com/anime0t4ku")
-
-    def set_wallpaper(self):
-        self.open_file_browser("Select wallpaper", self.base_dir, [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"], False, self._set_wallpaper_path)
 
     def _set_wallpaper_path(self, path):
         self.settings["wallpaper"] = path
@@ -3545,17 +3612,29 @@ class GentlemanView(QWidget):
 
         wallpaper_frame = self.wallpaper_movie.currentPixmap() if self.wallpaper_movie is not None else self.wallpaper
         if not wallpaper_frame.isNull():
-            target_size = self.size()
-            target_size.setWidth(target_size.width() + 2)
-            target_size.setHeight(target_size.height() + 2)
+            viewport_w = max(1, self.width())
+            viewport_h = max(1, self.height())
+            source_w = max(1, wallpaper_frame.width())
+            source_h = max(1, wallpaper_frame.height())
+            overscan = 8
+            scale = max(
+                (viewport_w + overscan * 2) / source_w,
+                (viewport_h + overscan * 2) / source_h,
+            )
+            scaled_w = max(viewport_w + overscan * 2, math.ceil(source_w * scale))
+            scaled_h = max(viewport_h + overscan * 2, math.ceil(source_h * scale))
             scaled = wallpaper_frame.scaled(
-                target_size,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                scaled_w,
+                scaled_h,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
+            x = (viewport_w - scaled.width()) // 2
+            y = (viewport_h - scaled.height()) // 2
+            painter.save()
+            painter.setClipRect(self.rect())
             painter.drawPixmap(x, y, scaled)
+            painter.restore()
             painter.fillRect(self.rect(), QColor(0, 0, 0, 95))
         else:
             self.draw_static_noise(painter)
@@ -3843,6 +3922,10 @@ class GentlemanView(QWidget):
             painter.drawText(text_x, row_y, "Menu size applies in fullscreen mode.")
             painter.drawText(text_x, row_y + 28, "Windowed mode always uses 100%.")
             row_y += 70
+        elif self.window.mode == "wallpaper" and self.window.wallpaper_folder_path() is not None:
+            painter.setPen(self.text)
+            painter.drawText(text_x, row_y, "Wallpaper folder set")
+            row_y += 56
 
         if not labels:
             painter.setPen(self.text)
