@@ -15,20 +15,15 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon, QImage
+from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon, QImage, QMovie
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QMainWindow,
-    QMessageBox,
-    QInputDialog,
     QWidget,
 )
 
 from app.app_info import APP_NAME, APP_VERSION, ABOUT_LINES
-from app.dialogs.changelog_dialog import ChangelogDialog
-from app.dialogs.update_available_dialog import UpdateAvailableDialog
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
 from core.arcade_names import ArcadeNameDatabase
 from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, LauncherConfig, RomBrowserItem
@@ -75,6 +70,10 @@ class InGameOsd(QWidget):
         self.window = window
         self.selected_index = 0
         self.options = []
+        self.confirmation_active = False
+        self.confirmation_selected = 0
+        self.confirmation_title = ""
+        self.confirmation_message = ""
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -127,19 +126,55 @@ class InGameOsd(QWidget):
             self.window.close_active_session(force=False)
             self.window.hide_ingame_osd(resume=False)
         elif self.selected_index == 2:
-            answer = QMessageBox.warning(
-                self,
+            self.window.show_osd_confirmation(
                 "Force Close",
                 "Force closing may interrupt save data or emulator writes.\n\nContinue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
             )
-            if answer == QMessageBox.StandardButton.Yes:
-                self.window.close_active_session(force=True)
-                self.window.hide_ingame_osd(resume=False)
+
+    def controller_accept(self):
+        if self.confirmation_active:
+            if self.confirmation_selected == 1:
+                self.window.close_active_session(force=True); self.close_confirmation(); self.window.hide_ingame_osd(resume=False)
+            else: self.close_confirmation()
+        else: self.activate_selected()
+
+    def controller_back(self):
+        if self.confirmation_active: self.close_confirmation()
+        else: self.window.hide_ingame_osd(resume=True)
+
+    def controller_horizontal(self):
+        if self.confirmation_active:
+            self.confirmation_selected = 1 - self.confirmation_selected; self.update()
+
+    def show_confirmation(self, title: str, message: str):
+        self.confirmation_active = True
+        self.confirmation_selected = 0
+        self.confirmation_title = title
+        self.confirmation_message = message
+        self.update()
+
+    def close_confirmation(self):
+        self.confirmation_active = False
+        self.confirmation_selected = 0
+        self.update()
 
     def keyPressEvent(self, event):
         key = event.key()
+        if self.confirmation_active:
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
+                self.confirmation_selected = 1 - self.confirmation_selected
+                self.update()
+            elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+                if self.confirmation_selected == 1:
+                    self.window.close_active_session(force=True)
+                    self.close_confirmation()
+                    self.window.hide_ingame_osd(resume=False)
+                else:
+                    self.close_confirmation()
+            elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
+                self.close_confirmation()
+            event.accept()
+            return
         if key in (Qt.Key.Key_Up, Qt.Key.Key_W):
             self.move_selection(-1)
         elif key in (Qt.Key.Key_Down, Qt.Key.Key_S):
@@ -220,6 +255,61 @@ class InGameOsd(QWidget):
                 painter.setPen(self.text)
             painter.drawText(text_x, yy, option)
 
+        if self.confirmation_active:
+            box_width = min(700, panel.width() - 40)
+            message_width = box_width - 64
+            painter.setFont(self.title_font)
+            title_height = painter.fontMetrics().height()
+            painter.setFont(self.font)
+            message_bounds = painter.boundingRect(
+                QRect(0, 0, message_width, max(120, panel.height())),
+                Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter,
+                self.confirmation_message,
+            )
+            message_height = max(painter.fontMetrics().height(), message_bounds.height())
+            guide_height = painter.fontMetrics().height()
+            box_height = 20 + title_height + 18 + message_height + 18 + 38 + 12 + guide_height + 16
+            box_height = min(max(280, box_height), panel.height() - 24)
+            box = QRect(
+                panel.center().x() - box_width // 2,
+                panel.center().y() - box_height // 2,
+                box_width,
+                box_height,
+            )
+            painter.fillRect(box, QColor(35, 0, 10, 252))
+            painter.setPen(self.light)
+            painter.drawRect(box)
+
+            painter.setFont(self.title_font)
+            painter.setPen(self.text)
+            title_rect = QRect(box.x() + 24, box.y() + 16, box.width() - 48, title_height + 4)
+            painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, self.confirmation_title)
+
+            painter.setFont(self.font)
+            message_top = title_rect.bottom() + 14
+            guide_rect = QRect(box.x() + 16, box.bottom() - guide_height - 10, box.width() - 32, guide_height)
+            button_y = guide_rect.y() - 50
+            message_rect = QRect(box.x() + 32, message_top, box.width() - 64, max(40, button_y - message_top - 14))
+            painter.drawText(message_rect, Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, self.confirmation_message)
+
+            labels = ["No", "Yes"]
+            button_w = min(170, (box.width() - 90) // 2)
+            gap = 22
+            total_width = button_w * 2 + gap
+            start_x = box.center().x() - total_width // 2
+            for i, label in enumerate(labels):
+                r = QRect(start_x + i * (button_w + gap), button_y, button_w, 36)
+                if i == self.confirmation_selected:
+                    painter.fillRect(r, self.light)
+                    painter.setPen(self.dark_text)
+                else:
+                    painter.setPen(self.text)
+                    painter.drawRect(r)
+                painter.drawText(r, Qt.AlignmentFlag.AlignCenter, label)
+
+            painter.setPen(self.text)
+            painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, "D-pad Select   A Confirm   B Back")
+
 
 class GentlemanWindow(QMainWindow):
     api_show_requested = pyqtSignal()
@@ -275,6 +365,21 @@ class GentlemanWindow(QMainWindow):
         self.folder_picker_items: list[str] = []
         self.launcher_form_return_index = 0
         self.mode = "menu"
+        self.overlay = None
+        self.overlay_return_mode = None
+        self.overlay_return_index = 0
+        self.overlay_return_scroll_offset = 0
+        self.text_input_value = ""
+        self.text_input_cursor = 0
+        self.text_input_shift = False
+        self.text_input_caps = False
+        self.text_input_symbols = False
+        self.text_input_keys = []
+        self.file_browser_path = None
+        self.file_browser_items = []
+        self.file_browser_extensions = []
+        self.file_browser_select_folder = False
+        self.file_browser_callback = None
 
         self.menu_items: list[MenuItem] = []
         self.rom_items: list[RomBrowserItem] = []
@@ -395,6 +500,7 @@ class GentlemanWindow(QMainWindow):
             "check_updates_at_launch": True,
             "normalize_arcade_names": True,
             "ingame_osd_enabled": True,
+            "fullscreen_menu_size": 100,
         }
 
     def load_settings(self) -> dict:
@@ -672,7 +778,7 @@ class GentlemanWindow(QMainWindow):
             self.remote_api_server.start()
         except Exception as exc:
             self.remote_api_server = None
-            QMessageBox.warning(self, "Remote API", f"Could not start Remote API:\\n{exc}")
+            self.show_message("Remote API", f"Could not start Remote API:\n{exc}")
 
     def api_status(self) -> dict:
         return {
@@ -1000,15 +1106,9 @@ class GentlemanWindow(QMainWindow):
             elif action == "down":
                 self.move_selection(1)
             elif action == "left":
-                if self.mode == "launcher_form":
-                    self.cycle_launcher_form_value(-1)
-                else:
-                    self.move_selection(-10)
+                self.move_selection(-10)
             elif action == "right":
-                if self.mode == "launcher_form":
-                    self.cycle_launcher_form_value(1)
-                else:
-                    self.move_selection(10)
+                self.move_selection(10)
             elif action == "select":
                 self.activate_selected()
             elif action == "back":
@@ -1119,6 +1219,7 @@ class GentlemanWindow(QMainWindow):
 
         self.settings_items = [
             fullscreen_launch_label,
+            "Menu Size",
             emulators_menu_label,
             recent_menu_label,
             favorites_menu_label,
@@ -1190,8 +1291,10 @@ class GentlemanWindow(QMainWindow):
                 "Cancel",
             ])
         else:
+            if launcher_type == "Standalone Emulator":
+                fields.append("Emulator Name")
+
             fields.extend([
-                "Emulator Name",
                 "System",
                 "Emulator Path",
             ])
@@ -1223,7 +1326,7 @@ class GentlemanWindow(QMainWindow):
             try:
                 data = json.loads(launcher_path.read_text(encoding="utf-8"))
             except Exception as exc:
-                QMessageBox.warning(self, "Load failed", str(exc))
+                self.show_message("Load failed", str(exc))
                 return
 
             launcher_type = self.launcher_type_from_json(str(data.get("type", "standalone")))
@@ -1240,6 +1343,8 @@ class GentlemanWindow(QMainWindow):
                 "extensions": ",".join(data.get("extensions", [])),
                 "arguments": str(data.get("arguments", '"{rom}"')),
             }
+            if launcher_type == "RetroArch":
+                self.launcher_form_data["emulator_name"] = "RetroArch"
         else:
             self.launcher_form_data = {
                 "launcher_name": "",
@@ -1274,6 +1379,11 @@ class GentlemanWindow(QMainWindow):
         current_args = self.launcher_form_data.get("arguments", "")
 
         self.launcher_form_data["type"] = type_name
+
+        if type_name == "RetroArch":
+            self.launcher_form_data["emulator_name"] = "RetroArch"
+        elif old_type == "RetroArch" and self.launcher_form_data.get("emulator_name") == "RetroArch":
+            self.launcher_form_data["emulator_name"] = ""
 
         if not current_args or current_args == old_default:
             self.launcher_form_data["arguments"] = self.default_arguments_for_type(type_name)
@@ -1445,52 +1555,22 @@ class GentlemanWindow(QMainWindow):
         if field in key_map:
             key = key_map[field]
             prompt = field + ":"
-
             if field == "Arguments":
                 launcher_type = self.launcher_form_data.get("type", "Standalone Emulator")
-                if launcher_type == "Application":
-                    prompt = "Optional application arguments. Usually empty."
-                elif launcher_type == "RetroArch":
-                    prompt = 'Arguments. Use {core} and {rom}, for example: -L "{core}" "{rom}"'
-                else:
-                    prompt = 'Arguments. Use {rom} for the selected game, for example: -fullscreen "{rom}"'
-
-            value, ok = QInputDialog.getText(self, field, prompt, text=self.launcher_form_data.get(key, ""))
-            if ok:
-                self.launcher_form_data[key] = value.strip()
-                self.view.update()
+                if launcher_type == "Application": prompt = "Optional application arguments. Usually empty."
+                elif launcher_type == "RetroArch": prompt = 'Arguments. Use {core} and {rom}, for example: -L "{core}" "{rom}"'
+                else: prompt = 'Arguments. Use {rom} for the selected game, for example: -fullscreen "{rom}"'
+            self.open_text_input(field, prompt, self.launcher_form_data.get(key, ""), lambda value, k=key: self.launcher_form_data.__setitem__(k, value.strip()))
             return
-
         if field in ("Emulator Path", "App Path"):
             title = "Select application" if field == "App Path" else "Select emulator executable"
-            path, _ = QFileDialog.getOpenFileName(
-                self,
-                title,
-                str(self.base_dir),
-                "Executables (*.exe);;All files (*.*)",
-            )
-            if path:
-                self.launcher_form_data["emulator"] = path.replace(chr(92), "/")
-                self.view.update()
+            self.open_file_browser(title, self.base_dir, ['.exe'], False, lambda value: self.launcher_form_data.__setitem__('emulator', value))
             return
-
         if field == "RetroArch Core":
-            path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select RetroArch core",
-                str(self.base_dir),
-                "RetroArch cores (*.dll);;All files (*.*)",
-            )
-            if path:
-                self.launcher_form_data["core"] = path.replace(chr(92), "/")
-                self.view.update()
+            self.open_file_browser("Select RetroArch core", self.base_dir, ['.dll'], False, lambda value: self.launcher_form_data.__setitem__('core', value))
             return
-
         if field == "ROM Path":
-            path = QFileDialog.getExistingDirectory(self, "Select ROM folder", str(self.base_dir))
-            if path:
-                self.launcher_form_data["rom_directory"] = path.replace(chr(92), "/")
-                self.view.update()
+            self.open_file_browser("Select ROM folder", self.base_dir, [], True, lambda value: self.launcher_form_data.__setitem__('rom_directory', value))
             return
 
     def launcher_form_safe_filename(self, name: str) -> str:
@@ -1502,25 +1582,25 @@ class GentlemanWindow(QMainWindow):
         data = self.launcher_form_data
 
         launcher_name = data.get("launcher_name", "").strip()
-        emulator_name = data.get("emulator_name", "").strip()
+        launcher_type = data.get("type", "Standalone Emulator")
+        emulator_name = "RetroArch" if launcher_type == "RetroArch" else data.get("emulator_name", "").strip()
         emulator = data.get("emulator", "").strip()
         rom_directory = data.get("rom_directory", "").strip()
-        launcher_type = data.get("type", "Standalone Emulator")
 
         if not launcher_name:
-            QMessageBox.warning(self, "Missing launcher name", "Enter a launcher name.")
+            self.show_message("Missing launcher name", "Enter a launcher name.")
             return
-        if not emulator_name:
-            QMessageBox.warning(self, "Missing emulator name", "Enter an emulator name.")
+        if launcher_type != "RetroArch" and not emulator_name:
+            self.show_message("Missing emulator name", "Enter an emulator name.")
             return
         if not emulator:
-            QMessageBox.warning(self, "Missing executable", "Select an emulator or application path.")
+            self.show_message("Missing executable", "Select an emulator or application path.")
             return
         if launcher_type != "Application" and not rom_directory:
-            QMessageBox.warning(self, "Missing ROM path", "Select a ROM path.")
+            self.show_message("Missing ROM path", "Select a ROM path.")
             return
         if launcher_type == "RetroArch" and not data.get("core", "").strip():
-            QMessageBox.warning(self, "Missing core", "Select a RetroArch core.")
+            self.show_message("Missing core", "Select a RetroArch core.")
             return
 
         if self.launcher_form_mode == "edit" and self.launcher_form_path:
@@ -1530,7 +1610,7 @@ class GentlemanWindow(QMainWindow):
             if folder_value == "__new__":
                 folder_name = data.get("new_folder", "").strip()
                 if not folder_name:
-                    QMessageBox.warning(self, "Missing folder name", "Enter a new folder name.")
+                    self.show_message("Missing folder name", "Enter a new folder name.")
                     return
                 target_folder = self.menu_root / self.launcher_form_safe_filename(folder_name)
             elif folder_value:
@@ -1542,7 +1622,7 @@ class GentlemanWindow(QMainWindow):
             json_path = target_folder / f"{self.launcher_form_safe_filename(launcher_name)}.json"
 
             if json_path.exists():
-                QMessageBox.warning(self, "Already exists", f"{json_path.name} already exists.")
+                self.show_message("Already exists", f"{json_path.name} already exists.")
                 return
 
         extensions = []
@@ -1584,11 +1664,261 @@ class GentlemanWindow(QMainWindow):
             self.selected_index = 0
             self.view.update()
 
+    def show_message(self, title: str, message: str, on_close=None):
+        self.overlay = {"type": "message", "title": title, "message": message, "selected": 0, "on_close": on_close}
+        self.view.update()
+
+    def show_confirmation(self, title: str, message: str, on_yes):
+        self.overlay = {"type": "choice", "title": title, "message": message, "selected": 0, "buttons": [("No", None), ("Yes", on_yes)]}
+        self.view.update()
+
+    def show_choice(self, title: str, message: str, buttons):
+        self.overlay = {"type": "choice", "title": title, "message": message, "selected": 0, "buttons": buttons}
+        self.view.update()
+
+    def show_osd_confirmation(self, title: str, message: str):
+        self.ingame_osd.show_confirmation(title, message)
+
+    def close_overlay(self):
+        callback = self.overlay.get("on_close") if self.overlay else None
+        self.overlay = None
+        self.view.update()
+        if callback:
+            callback()
+
+    def activate_overlay(self):
+        if not self.overlay: return
+        if self.overlay["type"] == "message": self.close_overlay(); return
+        buttons = self.overlay.get("buttons", [])
+        selected = self.overlay.get("selected", 0)
+        callback = buttons[selected][1] if 0 <= selected < len(buttons) else None
+        self.overlay = None; self.view.update()
+        if callback: callback()
+
+    def open_text_input(self, title: str, prompt: str, value: str, callback):
+        self.overlay_return_mode = self.mode
+        self.overlay_return_index = self.selected_index
+        self.overlay_return_scroll_offset = self.view.scroll_offset
+        self.text_input_value = value
+        self.text_input_cursor = len(value)
+        self.text_input_shift = False
+        self.text_input_caps = False
+        self.text_input_symbols = False
+        self.text_input_callback = callback
+        self.text_input_title = title
+        self.text_input_prompt = prompt
+        self.text_keyboard_index = 0
+        self.mode = "text_input"
+        self.rebuild_text_input_keys()
+        self.view.update()
+
+    def rebuild_text_input_keys(self):
+        if self.text_input_symbols:
+            rows = [list('!@#$%^&*()'), list('[]{}<>\\/|'), list(':;\"\'`~+=_-'), ['QWERTY','Space','Backspace','Clear'], ['Cancel','Done']]
+        else:
+            rows = [list('1234567890-=') , list('qwertyuiop[]'), list("asdfghjkl;'"), ['Shift'] + list('zxcvbnm,./'), ['Caps','Symbols','Space','Backspace','Clear'], ['Cancel','Done']]
+        self.text_input_keys = rows
+        self.text_keyboard_row = min(getattr(self, 'text_keyboard_row', 0), len(rows)-1)
+        self.text_keyboard_col = min(getattr(self, 'text_keyboard_col', 0), len(rows[self.text_keyboard_row])-1)
+
+    def text_input_move(self, dx: int, dy: int):
+        rows = self.text_input_keys
+        self.text_keyboard_row = (getattr(self,'text_keyboard_row',0) + dy) % len(rows)
+        self.text_keyboard_col = min(getattr(self,'text_keyboard_col',0), len(rows[self.text_keyboard_row])-1)
+        if dx:
+            self.text_keyboard_col = (self.text_keyboard_col + dx) % len(rows[self.text_keyboard_row])
+        self.view.update()
+
+    def insert_text(self, text: str):
+        self.text_input_value = self.text_input_value[:self.text_input_cursor] + text + self.text_input_value[self.text_input_cursor:]
+        self.text_input_cursor += len(text)
+        if self.text_input_shift:
+            self.text_input_shift = False
+        self.view.update()
+
+    def text_backspace(self):
+        if self.text_input_cursor > 0:
+            self.text_input_value = self.text_input_value[:self.text_input_cursor-1] + self.text_input_value[self.text_input_cursor:]
+            self.text_input_cursor -= 1
+        self.view.update()
+
+    def activate_text_key(self):
+        key = self.text_input_keys[self.text_keyboard_row][self.text_keyboard_col]
+        if len(key) == 1:
+            ch = key
+            if ch.isalpha():
+                upper = self.text_input_caps ^ self.text_input_shift
+                ch = ch.upper() if upper else ch.lower()
+            elif self.text_input_shift:
+                shifted = {'1':'!','2':'@','3':'#','4':'$','5':'%','6':'^','7':'&','8':'*','9':'(','0':')','-':'_','=':'+','[':'{',']':'}',';':':',"'":'\"',',':'<','.':'>','/':'?','`':'~'}
+                ch = shifted.get(ch, ch)
+            self.insert_text(ch)
+        elif key == 'Shift':
+            self.text_input_shift = not self.text_input_shift; self.view.update()
+        elif key == 'Caps':
+            self.text_input_caps = not self.text_input_caps; self.view.update()
+        elif key in ('Symbols','QWERTY'):
+            self.text_input_symbols = not self.text_input_symbols; self.text_keyboard_row = self.text_keyboard_col = 0; self.rebuild_text_input_keys(); self.view.update()
+        elif key == 'Space': self.insert_text(' ')
+        elif key == 'Backspace': self.text_backspace()
+        elif key == 'Clear': self.text_input_value=''; self.text_input_cursor=0; self.view.update()
+        elif key == 'Cancel': self.cancel_text_input()
+        elif key == 'Done': self.finish_text_input()
+
+    def finish_text_input(self):
+        callback = self.text_input_callback
+        value = self.text_input_value
+        self.mode = self.overlay_return_mode or 'launcher_form'
+        self.selected_index = self.overlay_return_index
+        self.view.scroll_offset = self.overlay_return_scroll_offset
+        if callback: callback(value)
+        self.view.ensure_visible()
+        self.view.update()
+
+    def cancel_text_input(self):
+        self.mode = self.overlay_return_mode or 'launcher_form'
+        self.selected_index = self.overlay_return_index
+        self.view.scroll_offset = self.overlay_return_scroll_offset
+        self.view.ensure_visible()
+        self.view.update()
+
+    def list_windows_roots(self):
+        roots = []
+        if platform.system() == 'Windows':
+            for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                root = Path(f'{letter}:\\')
+                if root.exists():
+                    roots.append(root)
+        else:
+            roots = [Path('/')]
+        return roots
+
+    def drive_display_name(self, root: Path) -> str:
+        if platform.system() != 'Windows':
+            return str(root)
+        drive = root.drive or str(root).rstrip('\\/')
+        label = ''
+        try:
+            volume_name = ctypes.create_unicode_buffer(261)
+            file_system_name = ctypes.create_unicode_buffer(261)
+            serial_number = ctypes.c_ulong()
+            maximum_component_length = ctypes.c_ulong()
+            file_system_flags = ctypes.c_ulong()
+            success = ctypes.windll.kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p(str(root)),
+                volume_name,
+                len(volume_name),
+                ctypes.byref(serial_number),
+                ctypes.byref(maximum_component_length),
+                ctypes.byref(file_system_flags),
+                file_system_name,
+                len(file_system_name),
+            )
+            if success:
+                label = volume_name.value.strip()
+        except Exception:
+            label = ''
+        return f'{drive}  {label}' if label else drive
+
+    def open_file_browser(self, title: str, start: Path, extensions, select_folder: bool, callback):
+        self.overlay_return_mode = self.mode
+        self.overlay_return_index = self.selected_index
+        self.overlay_return_scroll_offset = self.view.scroll_offset
+        self.file_browser_title = title
+        self.file_browser_extensions = [x.lower() for x in extensions]
+        self.file_browser_select_folder = select_folder
+        self.file_browser_callback = callback
+        self.file_browser_path = None
+        self.mode = 'file_browser'
+        self.selected_index = 0
+        self.refresh_file_browser()
+
+    def refresh_file_browser(self):
+        try:
+            if self.file_browser_path is None:
+                self.file_browser_items = [
+                    (self.drive_display_name(root), root, True)
+                    for root in self.list_windows_roots()
+                ]
+            else:
+                items = []
+                for child in sorted(
+                    self.file_browser_path.iterdir(),
+                    key=lambda p: (not p.is_dir(), p.name.lower()),
+                ):
+                    try:
+                        if child.is_dir():
+                            items.append((child.name, child, True))
+                        elif not self.file_browser_select_folder and (
+                            not self.file_browser_extensions
+                            or child.suffix.lower() in self.file_browser_extensions
+                        ):
+                            items.append((child.name, child, False))
+                    except OSError:
+                        pass
+                self.file_browser_items = items
+        except Exception as exc:
+            self.file_browser_items = []
+            self.show_message('Open folder failed', str(exc))
+        self.selected_index = 0
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_file_browser(self):
+        can_select_folder = self.file_browser_select_folder and self.file_browser_path is not None
+        if can_select_folder and self.selected_index == len(self.file_browser_items):
+            callback = self.file_browser_callback
+            value = str(self.file_browser_path).replace('\\', '/')
+            self.mode = self.overlay_return_mode
+            self.selected_index = self.overlay_return_index
+            self.view.scroll_offset = self.overlay_return_scroll_offset
+            callback(value)
+            self.view.ensure_visible()
+            self.view.update()
+            return
+        if not self.file_browser_items:
+            return
+        _, path, is_dir = self.file_browser_items[self.selected_index]
+        if is_dir:
+            self.file_browser_path = path
+            self.refresh_file_browser()
+        else:
+            callback = self.file_browser_callback
+            value = str(path).replace('\\', '/')
+            self.mode = self.overlay_return_mode
+            self.selected_index = self.overlay_return_index
+            self.view.scroll_offset = self.overlay_return_scroll_offset
+            callback(value)
+            self.view.ensure_visible()
+            self.view.update()
+
+    def file_browser_back(self):
+        if self.file_browser_path is None:
+            self.cancel_file_browser()
+            return
+        parent = self.file_browser_path.parent
+        if parent == self.file_browser_path:
+            self.file_browser_path = None
+        else:
+            self.file_browser_path = parent
+        self.refresh_file_browser()
+
+    def cancel_file_browser(self):
+        self.mode = self.overlay_return_mode or 'launcher_form'
+        self.selected_index = self.overlay_return_index
+        self.view.scroll_offset = self.overlay_return_scroll_offset
+        self.view.ensure_visible()
+        self.view.update()
+
     def title_path(self) -> str:
+        if self.mode == "text_input": return self.text_input_title
+        if self.mode == "file_browser": return self.file_browser_title
         if self.mode == "system":
             return "Gentleman Menu"
         if self.mode == "settings":
             return "Settings"
+        if self.mode == "menu_size":
+            return "Menu Size"
         if self.mode == "wallpaper":
             return "Wallpapers"
         if self.mode == "support":
@@ -1633,12 +1963,16 @@ class GentlemanWindow(QMainWindow):
         return str(self.current_folder.relative_to(self.menu_root)).replace("\\", "/")
 
     def current_items_count(self) -> int:
+        if self.mode == "text_input": return 1
+        if self.mode == "file_browser": return len(self.file_browser_items) + (1 if self.file_browser_select_folder and self.file_browser_path is not None else 0)
         if self.mode == "system":
             self.update_system_items()
             return len(self.system_items)
         if self.mode == "settings":
             self.update_settings_items()
             return len(self.settings_items)
+        if self.mode == "menu_size":
+            return 3
         if self.mode == "wallpaper":
             return len(self.wallpaper_items)
         if self.mode == "support":
@@ -1676,12 +2010,25 @@ class GentlemanWindow(QMainWindow):
         return len(self.menu_items) + back_count + favorites_count + recent_count + emulator_count
 
     def current_labels(self) -> list[tuple[str, str]]:
+        if self.mode == "text_input": return []
+        if self.mode == "file_browser":
+            labels = [(name, "<DRIVE>" if self.file_browser_path is None else ("<DIR>" if is_dir else "")) for name, _, is_dir in self.file_browser_items]
+            if self.file_browser_select_folder and self.file_browser_path is not None:
+                labels.append(("Select This Folder", ""))
+            return labels
         if self.mode == "system":
             self.update_system_items()
             return [(name, "") for name in self.system_items]
         if self.mode == "settings":
             self.update_settings_items()
             return [(name, "") for name in self.settings_items]
+        if self.mode == "menu_size":
+            selected = int(self.settings.get("fullscreen_menu_size", 100))
+            return [
+                ("100% (Default)" + ("  ✓" if selected == 100 else ""), ""),
+                ("125%" + ("  ✓" if selected == 125 else ""), ""),
+                ("150%" + ("  ✓" if selected == 150 else ""), ""),
+            ]
         if self.mode == "wallpaper":
             return [(name, "") for name in self.wallpaper_items]
         if self.mode == "support":
@@ -1768,6 +2115,10 @@ class GentlemanWindow(QMainWindow):
         self.view.update()
 
     def go_back(self):
+        if self.overlay:
+            self.close_overlay(); return
+        if self.mode == "text_input": self.cancel_text_input(); return
+        if self.mode == "file_browser": self.file_browser_back(); return
         if self.mode == "system":
             self.mode = "menu"
             self.selected_index = 0
@@ -1777,6 +2128,14 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "settings":
             self.mode = "system"
             self.selected_index = 0
+            self.view.update()
+            return
+
+        if self.mode == "menu_size":
+            self.mode = "settings"
+            self.update_settings_items()
+            self.selected_index = min(1, max(0, len(self.settings_items) - 1))
+            self.view.scroll_offset = 0
             self.view.update()
             return
 
@@ -1889,6 +2248,10 @@ class GentlemanWindow(QMainWindow):
         self.refresh_menu()
 
     def activate_selected(self):
+        if self.overlay:
+            self.activate_overlay(); return
+        if self.mode == "text_input": self.activate_text_key(); return
+        if self.mode == "file_browser": self.activate_file_browser(); return
         if self.current_items_count() == 0:
             return
 
@@ -1898,6 +2261,10 @@ class GentlemanWindow(QMainWindow):
 
         if self.mode == "settings":
             self.activate_settings_item(self.settings_items[self.selected_index])
+            return
+
+        if self.mode == "menu_size":
+            self.activate_menu_size_item(self.selected_index)
             return
 
         if self.mode == "wallpaper":
@@ -1974,7 +2341,7 @@ class GentlemanWindow(QMainWindow):
             emulator_path = self.emulator_paths.get(emulator_name, "")
 
             if not emulator_path:
-                QMessageBox.warning(self, "Launch failed", "No emulator path found.")
+                self.show_message("Launch failed", "No emulator path found.")
                 return
 
             try:
@@ -1982,7 +2349,7 @@ class GentlemanWindow(QMainWindow):
                 self.begin_active_session(process, "emulator", emulator_name, "")
             except Exception as exc:
                 self.resume_frontend_input_after_launch()
-                QMessageBox.critical(self, "Launch failed", str(exc))
+                self.show_message("Launch failed", str(exc))
             return
 
         if self.mode == "emulator_launchers":
@@ -2028,7 +2395,7 @@ class GentlemanWindow(QMainWindow):
                 self.update_recent_items()
             except Exception as exc:
                 self.resume_frontend_input_after_launch()
-                QMessageBox.critical(self, "Launch failed", str(exc))
+                self.show_message("Launch failed", str(exc))
             return
 
         menu_index = self.selected_index
@@ -2084,7 +2451,7 @@ class GentlemanWindow(QMainWindow):
 
         launcher_path = self.menu_root / launcher_rel
         if not launcher_path.exists() or not rom.exists():
-            QMessageBox.warning(self, "Recent item unavailable", "The launcher or game file no longer exists.")
+            self.show_message("Recent item unavailable", "The launcher or game file no longer exists.")
             return
 
         try:
@@ -2101,7 +2468,7 @@ class GentlemanWindow(QMainWindow):
             self.view.update()
         except Exception as exc:
             self.resume_frontend_input_after_launch()
-            QMessageBox.critical(self, "Launch failed", str(exc))
+            self.show_message("Launch failed", str(exc))
 
     def open_launcher_item(self, item: MenuItem):
         try:
@@ -2113,7 +2480,7 @@ class GentlemanWindow(QMainWindow):
             self.view.scroll_offset = 0
             self.view.update()
         except Exception as exc:
-            QMessageBox.critical(self, "Launcher error", str(exc))
+            self.show_message("Launcher error", str(exc))
 
     def edit_launcher(self):
         self.open_edit_launcher_browser(self.menu_root)
@@ -2179,117 +2546,46 @@ class GentlemanWindow(QMainWindow):
 
     def on_update_check_result(self, info):
         show_no_update = getattr(self.update_check_worker, "show_no_update", True)
-
         if info.update_available:
             if gentleman_updater_available():
-                while True:
-                    dialog = UpdateAvailableDialog(
-                        info,
-                        "Run Gentleman-Updater",
-                        "Do you want to run Gentleman-Updater now?",
-                        self,
-                    )
-                    dialog.exec()
-
-                    if dialog.selected_action == UpdateAvailableDialog.ACTION_SHOW_CHANGELOG:
-                        self.show_update_changelog(info)
-                        continue
-
-                    if dialog.selected_action == UpdateAvailableDialog.ACTION_UPDATE:
-                        if launch_gentleman_updater():
-                            QApplication.quit()
-                        else:
-                            QMessageBox.warning(
-                                self,
-                                "Updater Failed",
-                                "Gentleman-Updater could not be started.",
-                            )
-
-                    break
-
-                return
-
-            while True:
-                dialog = UpdateAvailableDialog(
-                    info,
-                    "Open Download Page",
-                    "Do you want to open the download page?",
-                    self,
-                )
-                dialog.exec()
-
-                if dialog.selected_action == UpdateAvailableDialog.ACTION_SHOW_CHANGELOG:
-                    self.show_update_changelog(info)
-                    continue
-
-                if dialog.selected_action == UpdateAvailableDialog.ACTION_UPDATE:
-                    open_release_page(info.release_url)
-
-                break
-        elif show_no_update:
-            QMessageBox.information(
-                self,
-                "No Update Available",
-                (
-                    "You are already running the latest version.\n\n"
-                    f"Current version: {info.current_version}"
-                ),
+                update_action=self._run_gentleman_updater; update_label="Run Updater"
+            else:
+                update_action=lambda: open_release_page(info.release_url); update_label="Download"
+            self.show_choice(
+                "Update Available",
+                f"{info.release_name}\n\nA new version of Gentleman is available.",
+                [("Later", None), ("Changelog", lambda: self.show_update_changelog(info)), (update_label, update_action)],
             )
+        elif show_no_update:
+            self.show_message("No Update Available", f"You are already running the latest version.\n\nCurrent version: {info.current_version}")
+
+    def _run_gentleman_updater(self):
+        if launch_gentleman_updater(): QApplication.quit()
+        else: self.show_message("Updater Failed", "Gentleman-Updater could not be started.")
 
     def show_update_changelog(self, info):
         release_body = getattr(info, "release_body", "") or ""
-
-        if not release_body.strip():
-            open_release_page(info.release_url)
-            return
-
-        dialog = ChangelogDialog(info.release_name, release_body, self)
-        dialog.exec()
+        if release_body.strip(): self.show_message(info.release_name, release_body)
+        else: open_release_page(info.release_url)
 
     def on_update_check_error(self, message: str):
-        show_errors = getattr(self.update_check_worker, "show_errors", True)
-
-        if show_errors:
-            QMessageBox.warning(
-                self,
-                "Update Check Failed",
-                f"Unable to check for updates.\n\n{message}",
-            )
+        if getattr(self.update_check_worker, "show_errors", True):
+            self.show_message("Update Check Failed", f"Unable to check for updates.\n\n{message}")
 
     def on_update_check_finished(self):
         self.update_check_worker = None
 
     def clear_recent_items(self):
-        reply = QMessageBox.question(
-            self,
-            "Clear Recent",
-            "Clear all recently launched games?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        self.show_confirmation("Clear Recent", "Clear all recently launched games?", self._confirm_clear_recent)
 
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        self.save_recent_items([])
-        self.update_recent_items()
-        self.view.update()
+    def _confirm_clear_recent(self):
+        self.save_recent_items([]); self.update_recent_items(); self.view.update()
 
     def clear_favorite_items(self):
-        reply = QMessageBox.question(
-            self,
-            "Clear Favorites",
-            "Clear all favorite games?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        self.show_confirmation("Clear Favorites", "Clear all favorite games?", self._confirm_clear_favorites)
 
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        self.save_favorite_items([])
-        self.update_favorite_items()
-        self.view.update()
+    def _confirm_clear_favorites(self):
+        self.save_favorite_items([]); self.update_favorite_items(); self.view.update()
 
     def refresh_settings_menu(self):
         self.save_settings()
@@ -2300,6 +2596,13 @@ class GentlemanWindow(QMainWindow):
         if item.startswith("Fullscreen at Launch:"):
             self.settings["fullscreen_at_launch"] = not self.settings.get("fullscreen_at_launch", False)
             self.refresh_settings_menu()
+        elif item == "Menu Size":
+            self.mode = "menu_size"
+            sizes = [100, 125, 150]
+            current = int(self.settings.get("fullscreen_menu_size", 100))
+            self.selected_index = sizes.index(current) if current in sizes else 0
+            self.view.scroll_offset = 0
+            self.view.update()
         elif item.startswith("Emulators Menu:"):
             self.settings["show_emulators_menu"] = not self.emulators_menu_enabled()
             self.refresh_settings_menu()
@@ -2343,6 +2646,15 @@ class GentlemanWindow(QMainWindow):
             self.settings["swap_controller_xy"] = not self.settings.get("swap_controller_xy", False)
             self.refresh_settings_menu()
 
+    def activate_menu_size_item(self, index: int):
+        sizes = [100, 125, 150]
+        if not (0 <= index < len(sizes)):
+            return
+        self.settings["fullscreen_menu_size"] = sizes[index]
+        self.save_settings()
+        self.view.scroll_offset = 0
+        self.view.update()
+
     def activate_wallpaper_item(self, item: str):
         if item == "Set Wallpaper":
             self.set_wallpaper()
@@ -2359,19 +2671,11 @@ class GentlemanWindow(QMainWindow):
             webbrowser.open("https://buymeacoffee.com/anime0t4ku")
 
     def set_wallpaper(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select wallpaper",
-            str(self.base_dir),
-            "Images (*.png *.jpg *.jpeg *.bmp *.webp);;All files (*.*)",
-        )
-        if not path:
-            return
+        self.open_file_browser("Select wallpaper", self.base_dir, [".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"], False, self._set_wallpaper_path)
 
-        self.settings["wallpaper"] = path.replace("\\", "/")
-        self.save_settings()
-        self.view.reload_wallpaper()
-        self.view.update()
+    def _set_wallpaper_path(self, path):
+        self.settings["wallpaper"] = path
+        self.save_settings(); self.view.reload_wallpaper(); self.view.update()
 
     def open_folder(self, folder: Path):
         try:
@@ -2382,7 +2686,7 @@ class GentlemanWindow(QMainWindow):
             else:
                 subprocess.Popen(["xdg-open", str(folder)])
         except Exception as exc:
-            QMessageBox.warning(self, "Open folder failed", str(exc))
+            self.show_message("Open folder failed", str(exc))
 
     def display_name_for_rom(self, config: LauncherConfig, rom: Path) -> str:
         if self.settings.get("normalize_arcade_names", True) and config.system.strip().lower() == "arcade":
@@ -2752,46 +3056,58 @@ class GentlemanWindow(QMainWindow):
 
     def controller_activate(self):
         self.active_input = "controller"
-        self.activate_selected()
-        self.view.update()
+        self.activate_selected(); self.view.update()
 
     def controller_back(self):
         self.active_input = "controller"
-        self.go_back()
+        if self.mode == "text_input": self.text_backspace()
+        else: self.go_back()
         self.view.update()
 
     def controller_favorite(self):
         self.active_input = "controller"
-        if self.mode == "favorites":
-            self.remove_selected_favorite()
-        else:
-            self.toggle_current_favorite()
+        if self.mode == "text_input": self.insert_text(' ')
+        elif self.mode == "favorites": self.remove_selected_favorite()
+        else: self.toggle_current_favorite()
         self.view.update()
 
-    def controller_move(self, delta: int):
-        self.active_input = "controller"
-        self.move_selection(delta)
+    def controller_shift(self):
+        self.active_input='controller'
+        if self.mode=='text_input': self.text_input_shift=not self.text_input_shift; self.view.update()
+
+    def controller_caps(self):
+        self.active_input='controller'
+        if self.mode=='text_input': self.text_input_caps=not self.text_input_caps; self.view.update()
+
+    def controller_symbols(self):
+        self.active_input='controller'
+        if self.mode=='text_input': self.text_input_symbols=not self.text_input_symbols; self.text_keyboard_row=self.text_keyboard_col=0; self.rebuild_text_input_keys(); self.view.update()
+
+    def controller_done(self):
+        self.active_input='controller'
+        if self.mode=='text_input': self.finish_text_input()
+        else: self.activate_selected()
         self.view.update()
 
     def controller_step(self, action: str):
+        self.active_input = "controller"
+        if self.overlay:
+            if self.overlay.get("type") == "choice" and action in ("left", "right"):
+                count=len(self.overlay.get("buttons", []))
+                if count: self.overlay["selected"]=(self.overlay.get("selected",0)+(-1 if action=="left" else 1))%count; self.view.update()
+            return
+        if self.mode == "text_input":
+            dx = -1 if action == "left" else 1 if action == "right" else 0
+            dy = -1 if action == "up" else 1 if action == "down" else 0
+            self.text_input_move(dx, dy); return
         if action == "up":
-            self.controller_move(-1)
+            self.move_selection(-1)
         elif action == "down":
-            self.controller_move(1)
+            self.move_selection(1)
         elif action == "left":
-            if self.mode == "launcher_form":
-                self.cycle_launcher_form_value(-1)
-                self.active_input = "controller"
-                self.view.update()
-            else:
-                self.controller_move(-10)
+            self.jump_selection(-10)
         elif action == "right":
-            if self.mode == "launcher_form":
-                self.cycle_launcher_form_value(1)
-                self.active_input = "controller"
-                self.view.update()
-            else:
-                self.controller_move(10)
+            self.jump_selection(10)
 
     def handle_controller_repeat(self, active_actions: list[str]):
         now = int(time.monotonic() * 1000)
@@ -2848,15 +3164,19 @@ class GentlemanWindow(QMainWindow):
                 try:
                     hat_y = self.controller.get_hat(0)[1] if self.controller.get_numhats() > 0 else 0
                     axis_y = self.controller.get_axis(1) if self.controller.get_numaxes() > 1 else 0
+                    hat_x = self.controller.get_hat(0)[0] if self.controller.get_numhats() > 0 else 0
+                    axis_x = self.controller.get_axis(0) if self.controller.get_numaxes() > 0 else 0
                     up = hat_y > 0 or axis_y < -0.5
                     down = hat_y < 0 or axis_y > 0.5
+                    horizontal = hat_x != 0 or abs(axis_x) > 0.5
                     accept = self.controller.get_button(0) if self.controller.get_numbuttons() > 0 else False
                     back = self.controller.get_button(1) if self.controller.get_numbuttons() > 1 else False
                     for key, pressed, callback in (
                         ("osd_up", up, lambda: self.ingame_osd.move_selection(-1)),
                         ("osd_down", down, lambda: self.ingame_osd.move_selection(1)),
-                        ("osd_accept", accept, self.ingame_osd.activate_selected),
-                        ("osd_back", back, lambda: self.hide_ingame_osd(resume=True)),
+                        ("osd_horizontal", horizontal, self.ingame_osd.controller_horizontal),
+                        ("osd_accept", accept, self.ingame_osd.controller_accept),
+                        ("osd_back", back, self.ingame_osd.controller_back),
                     ):
                         previous = self.controller_button_state.get(key, False)
                         if pressed and not previous:
@@ -2903,8 +3223,11 @@ class GentlemanWindow(QMainWindow):
                 accept_button: self.controller_activate,
                 back_button: self.controller_back,
                 favorite_button: self.controller_favorite,
+                3 if favorite_button == 2 else 2: self.controller_shift,
+                4: self.controller_caps,
+                5: self.controller_symbols,
                 6: self.controller_back,
-                7: self.controller_activate,
+                7: self.controller_done,
             }
 
             for button, callback in button_actions.items():
@@ -2939,6 +3262,19 @@ class GentlemanWindow(QMainWindow):
         self.view.ensure_visible()
         self.view.update()
 
+    def jump_selection(self, delta: int):
+        count = self.current_items_count()
+        if count <= 0:
+            return
+
+        if self.mode == "about":
+            self.move_selection(delta)
+            return
+
+        self.selected_index = max(0, min(count - 1, self.selected_index + delta))
+        self.view.ensure_visible()
+        self.view.update()
+
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
@@ -2947,41 +3283,39 @@ class GentlemanWindow(QMainWindow):
         QTimer.singleShot(50, self.view.update)
 
     def keyPressEvent(self, event: QKeyEvent):
-        if self.input_suspended_for_launch:
-            self.resume_frontend_input_after_launch()
-
-        self.active_input = "keyboard"
-
-        key = event.key()
-
-        if key in (Qt.Key.Key_Up, Qt.Key.Key_W):
-            self.move_selection(-1)
-        elif key in (Qt.Key.Key_Down, Qt.Key.Key_S):
-            self.move_selection(1)
-        elif key in (Qt.Key.Key_Left, Qt.Key.Key_A):
-            if self.mode == "launcher_form":
-                self.cycle_launcher_form_value(-1)
-            else:
-                self.move_selection(-10)
-        elif key in (Qt.Key.Key_Right, Qt.Key.Key_D):
-            if self.mode == "launcher_form":
-                self.cycle_launcher_form_value(1)
-            else:
-                self.move_selection(10)
-        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
-            self.activate_selected()
-        elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace):
-            self.go_back()
-        elif key == Qt.Key.Key_F5:
-            self.refresh_menu()
+        if self.input_suspended_for_launch: self.resume_frontend_input_after_launch()
+        self.active_input = "keyboard"; key = event.key()
+        if self.overlay:
+            if self.overlay.get("type") == "choice" and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
+                count=len(self.overlay.get("buttons", [])); delta=-1 if key in (Qt.Key.Key_Left,Qt.Key.Key_A) else 1
+                if count: self.overlay["selected"]=(self.overlay.get("selected",0)+delta)%count
+            elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space): self.activate_overlay()
+            elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace): self.close_overlay()
+            self.view.update(); return
+        if self.mode == "text_input":
+            mods=event.modifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_A: self.text_input_value=''; self.text_input_cursor=0
+            elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter): self.finish_text_input()
+            elif key == Qt.Key.Key_Escape: self.cancel_text_input()
+            elif key == Qt.Key.Key_Backspace: self.text_backspace()
+            elif key == Qt.Key.Key_Delete and self.text_input_cursor < len(self.text_input_value): self.text_input_value=self.text_input_value[:self.text_input_cursor]+self.text_input_value[self.text_input_cursor+1:]
+            elif key == Qt.Key.Key_Left: self.text_input_cursor=max(0,self.text_input_cursor-1)
+            elif key == Qt.Key.Key_Right: self.text_input_cursor=min(len(self.text_input_value),self.text_input_cursor+1)
+            elif key == Qt.Key.Key_Home: self.text_input_cursor=0
+            elif key == Qt.Key.Key_End: self.text_input_cursor=len(self.text_input_value)
+            elif event.text() and event.text().isprintable(): self.insert_text(event.text())
+            self.view.update(); return
+        if key in (Qt.Key.Key_Up, Qt.Key.Key_W): self.move_selection(-1)
+        elif key in (Qt.Key.Key_Down, Qt.Key.Key_S): self.move_selection(1)
+        elif key in (Qt.Key.Key_Left, Qt.Key.Key_A): self.jump_selection(-10)
+        elif key in (Qt.Key.Key_Right, Qt.Key.Key_D): self.jump_selection(10)
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space): self.activate_selected()
+        elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace): self.go_back()
+        elif key == Qt.Key.Key_F5: self.refresh_menu()
         elif key == Qt.Key.Key_F:
-            if self.mode == "favorites":
-                self.remove_selected_favorite()
-            else:
-                self.toggle_current_favorite()
-        elif key == Qt.Key.Key_F11:
-            self.toggle_fullscreen()
-
+            if self.mode == "favorites": self.remove_selected_favorite()
+            else: self.toggle_current_favorite()
+        elif key == Qt.Key.Key_F11: self.toggle_fullscreen()
         self.view.update()
 
     def closeEvent(self, event):
@@ -3017,7 +3351,17 @@ class GentlemanView(QWidget):
         self.title_font.setStyleHint(QFont.StyleHint.Monospace)
 
         self.wallpaper = QPixmap()
+        self.wallpaper_movie = None
         self.reload_wallpaper()
+
+        self.wallpaper_preview_timer = QTimer(self)
+        self.wallpaper_preview_timer.setSingleShot(True)
+        self.wallpaper_preview_timer.setInterval(200)
+        self.wallpaper_preview_timer.timeout.connect(self.load_pending_wallpaper_preview)
+        self.wallpaper_preview_pending_path = None
+        self.wallpaper_preview_current_path = None
+        self.wallpaper_preview_pixmap = QPixmap()
+        self.wallpaper_preview_cache = {}
 
         self.logo = QPixmap(str(self.window.assets_dir / "logo.png"))
 
@@ -3036,11 +3380,26 @@ class GentlemanView(QWidget):
         }
 
     def reload_wallpaper(self):
+        if self.wallpaper_movie is not None:
+            self.wallpaper_movie.stop()
+            self.wallpaper_movie.deleteLater()
+            self.wallpaper_movie = None
+
         wallpaper_path = self.window.settings.get("wallpaper", "")
-        if wallpaper_path and Path(wallpaper_path).exists():
-            self.wallpaper = QPixmap(wallpaper_path)
-        else:
-            self.wallpaper = QPixmap()
+        path = Path(wallpaper_path) if wallpaper_path else None
+        if path and path.exists() and path.suffix.lower() == ".gif":
+            movie = QMovie(str(path))
+            movie.setCacheMode(QMovie.CacheMode.CacheAll)
+            movie.frameChanged.connect(lambda _frame: self.update())
+            if movie.isValid():
+                self.wallpaper_movie = movie
+                self.wallpaper = QPixmap()
+                movie.start()
+                return
+            movie.deleteLater()
+
+        self.wallpaper_movie = None
+        self.wallpaper = QPixmap(str(path)) if path and path.exists() else QPixmap()
 
     def ensure_visible(self):
         visible_rows = self.visible_rows()
@@ -3053,16 +3412,114 @@ class GentlemanView(QWidget):
 
         self.scroll_offset = max(0, self.scroll_offset)
 
+    def effective_menu_scale(self) -> float:
+        if not self.window.isFullScreen():
+            return 1.0
+        size = int(self.window.settings.get("fullscreen_menu_size", 100))
+        if size not in (100, 125, 150):
+            size = 100
+        return size / 100.0
+
     def menu_panel_size(self) -> tuple[int, int]:
-        panel_w = min(620, self.width() - 160)
-        panel_h = min(430, self.height() - 200)
-        return panel_w, panel_h
+        scale = self.effective_menu_scale()
+        panel_w = min(round(620 * scale), max(620, self.width() - 80))
+        panel_h = min(round(430 * scale), max(430, self.height() - 120))
+        panel_w = min(panel_w, self.width() - 40)
+        panel_h = min(panel_h, self.height() - 100)
+        return max(480, panel_w), max(320, panel_h)
+
+    def is_wallpaper_browser(self) -> bool:
+        return self.window.mode == "file_browser" and self.window.file_browser_title == "Select wallpaper"
 
     def menu_panel_rect(self) -> QRect:
         panel_w, panel_h = self.menu_panel_size()
         x = (self.width() - panel_w) // 2
         y = (self.height() - panel_h) // 2
         return QRect(x, y, panel_w, panel_h)
+
+    def selected_wallpaper_preview_path(self):
+        if not self.is_wallpaper_browser():
+            return None
+        index = self.window.selected_index
+        if not (0 <= index < len(self.window.file_browser_items)):
+            return None
+        _name, path, is_dir = self.window.file_browser_items[index]
+        if is_dir or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}:
+            return None
+        return path
+
+    def request_wallpaper_preview(self, path):
+        path = Path(path) if path is not None else None
+        if path == self.wallpaper_preview_pending_path:
+            return
+        self.wallpaper_preview_pending_path = path
+        self.wallpaper_preview_current_path = None
+        self.wallpaper_preview_pixmap = QPixmap()
+        self.wallpaper_preview_timer.stop()
+        if path is None:
+            self.update()
+            return
+        cached = self.wallpaper_preview_cache.get(str(path))
+        if cached is not None:
+            self.wallpaper_preview_current_path = path
+            self.wallpaper_preview_pixmap = cached
+            self.update()
+            return
+        self.wallpaper_preview_timer.start()
+
+    def load_pending_wallpaper_preview(self):
+        path = self.wallpaper_preview_pending_path
+        if path is None or not path.exists():
+            return
+        preview = QPixmap(str(path))
+        if preview.isNull():
+            return
+        self.wallpaper_preview_cache[str(path)] = preview
+        while len(self.wallpaper_preview_cache) > 8:
+            self.wallpaper_preview_cache.pop(next(iter(self.wallpaper_preview_cache)))
+        if path == self.wallpaper_preview_pending_path:
+            self.wallpaper_preview_current_path = path
+            self.wallpaper_preview_pixmap = preview
+            self.update()
+
+    def wallpaper_preview_rect(self) -> QRect:
+        panel = self.menu_panel_rect()
+        width = 280
+        height = 220
+        gap = 24
+        margin = 24
+        right_x = panel.right() + gap
+        left_x = panel.x() - gap - width
+        if right_x + width <= self.width() - margin:
+            x = right_x
+        elif left_x >= margin:
+            x = left_x
+        else:
+            x = max(margin, self.width() - margin - width)
+        y = panel.y() + (panel.height() - height) // 2
+        y = max(margin, min(y, self.height() - margin - height))
+        return QRect(x, y, width, height)
+
+    def draw_wallpaper_preview(self, painter: QPainter):
+        path = self.selected_wallpaper_preview_path()
+        if path != self.wallpaper_preview_pending_path:
+            self.request_wallpaper_preview(path)
+        if path is None or path != self.wallpaper_preview_current_path or self.wallpaper_preview_pixmap.isNull():
+            return
+        rect = self.wallpaper_preview_rect()
+        preview = self.wallpaper_preview_pixmap
+        painter.fillRect(rect, QColor(45, 0, 12, 245))
+        painter.setPen(self.light)
+        painter.drawRect(rect)
+        inner = rect.adjusted(8, 8, -8, -8)
+        scaled = preview.scaled(
+            inner.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = inner.x() + (inner.width() - scaled.width()) // 2
+        y = inner.y() + (inner.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
 
     def top_bar_rect(self) -> QRect:
         panel_rect = self.menu_panel_rect()
@@ -3073,7 +3530,12 @@ class GentlemanView(QWidget):
 
     def visible_rows(self) -> int:
         _, panel_h = self.menu_panel_size()
-        reserved_height = 114 if self.window.mode == "system" else 30
+        if self.window.mode == "system":
+            reserved_height = 114
+        elif self.window.mode == "menu_size":
+            reserved_height = 92
+        else:
+            reserved_height = 30
         return max(1, (panel_h - reserved_height) // 28)
 
     def paintEvent(self, event):
@@ -3081,11 +3543,12 @@ class GentlemanView(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.fillRect(self.rect(), self.bg)
 
-        if not self.wallpaper.isNull():
+        wallpaper_frame = self.wallpaper_movie.currentPixmap() if self.wallpaper_movie is not None else self.wallpaper
+        if not wallpaper_frame.isNull():
             target_size = self.size()
             target_size.setWidth(target_size.width() + 2)
             target_size.setHeight(target_size.height() + 2)
-            scaled = self.wallpaper.scaled(
+            scaled = wallpaper_frame.scaled(
                 target_size,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
@@ -3100,6 +3563,116 @@ class GentlemanView(QWidget):
         self.draw_logo(painter)
         self.draw_top_bar(painter)
         self.draw_panel(painter)
+        self.draw_wallpaper_preview(painter)
+        if self.window.mode == "text_input": self.draw_text_input(painter)
+        if self.window.overlay: self.draw_overlay(painter)
+
+    def draw_overlay(self, painter):
+        ov = self.window.overlay
+        labels = ["OK"] if ov.get("type") == "message" else [item[0] for item in ov.get("buttons", [])]
+        box_width = min(760, self.width() - 100)
+        content_width = box_width - 72
+
+        painter.setFont(self.title_font)
+        title_height = painter.fontMetrics().height()
+        painter.setFont(self.font)
+        message_bounds = painter.boundingRect(
+            QRect(0, 0, content_width, max(160, self.height() - 220)),
+            Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter,
+            ov.get("message", ""),
+        )
+        message_height = max(painter.fontMetrics().height(), message_bounds.height())
+        guide_height = painter.fontMetrics().height()
+        button_rows = max(1, (len(labels) + 2) // 3)
+        button_area_height = button_rows * 44
+        box_height = 22 + title_height + 18 + message_height + 20 + button_area_height + 12 + guide_height + 18
+        box_height = min(max(300, box_height), self.height() - 80)
+        box = QRect(
+            self.width() // 2 - box_width // 2,
+            self.height() // 2 - box_height // 2,
+            box_width,
+            box_height,
+        )
+
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 150))
+        painter.fillRect(box, QColor(45, 0, 12, 252))
+        painter.setPen(self.light)
+        painter.drawRect(box)
+
+        painter.setFont(self.title_font)
+        painter.setPen(self.text)
+        title_rect = QRect(box.x() + 24, box.y() + 18, box.width() - 48, title_height + 4)
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, ov.get("title", ""))
+
+        painter.setFont(self.font)
+        guide_rect = QRect(box.x() + 16, box.bottom() - guide_height - 10, box.width() - 32, guide_height)
+        button_area_bottom = guide_rect.y() - 12
+        button_area_top = button_area_bottom - button_area_height
+        message_rect = QRect(
+            box.x() + 36,
+            title_rect.bottom() + 14,
+            box.width() - 72,
+            max(40, button_area_top - title_rect.bottom() - 28),
+        )
+        painter.drawText(
+            message_rect,
+            Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+            ov.get("message", ""),
+        )
+
+        columns = min(3, max(1, len(labels)))
+        gap = 12
+        button_w = min(190, (box.width() - 72 - gap * (columns - 1)) // columns)
+        row_width = columns * button_w + gap * (columns - 1)
+        start_x = box.center().x() - row_width // 2
+        for i, label in enumerate(labels):
+            row = i // columns
+            col = i % columns
+            r = QRect(start_x + col * (button_w + gap), button_area_top + row * 44, button_w, 36)
+            if i == ov.get("selected", 0):
+                painter.fillRect(r, self.light)
+                painter.setPen(self.dark_text)
+            else:
+                painter.setPen(self.text)
+                painter.drawRect(r)
+            painter.drawText(r, Qt.AlignmentFlag.AlignCenter, label)
+
+        painter.setPen(self.text)
+        painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, "D-pad Select   A Confirm   B Back")
+
+    def display_text_key(self, key: str) -> str:
+        if len(key) != 1 or self.window.text_input_symbols:
+            return key
+        if key.isalpha():
+            return key.upper() if (self.window.text_input_caps ^ self.window.text_input_shift) else key.lower()
+        if self.window.text_input_shift:
+            shifted = {'1':'!','2':'@','3':'#','4':'$','5':'%','6':'^','7':'&','8':'*','9':'(','0':')','-':'_','=':'+','[':'{',']':'}',';':':',"'":'"',',':'<','.':'>','/':'?','`':'~'}
+            return shifted.get(key, key)
+        return key
+
+    def draw_text_input(self, painter):
+        painter.fillRect(self.rect(), QColor(0,0,0,175)); box=QRect(70,70,self.width()-140,self.height()-140); painter.fillRect(box,QColor(45,0,12,252)); painter.setPen(self.light); painter.drawRect(box)
+        painter.setFont(self.title_font); painter.setPen(self.text); painter.drawText(box.x()+28,box.y()+40,self.window.text_input_title)
+        painter.setFont(self.font); painter.drawText(box.x()+28,box.y()+76,self.window.text_input_prompt)
+        field=QRect(box.x()+28,box.y()+95,box.width()-56,48); painter.fillRect(field,QColor(20,0,6,245)); painter.setPen(self.light); painter.drawRect(field)
+        value=self.window.text_input_value; cursor=self.window.text_input_cursor; display=value[:cursor]+'|' + value[cursor:]; painter.setPen(self.text); painter.drawText(field.adjusted(12,0,-12,0),Qt.AlignmentFlag.AlignVCenter,display)
+        rows=self.window.text_input_keys; y=box.y()+175
+        for ri,row in enumerate(rows):
+            labels=[self.display_text_key(k) for k in row]
+            widths=[max(54, painter.fontMetrics().horizontalAdvance(label)+28) for label in labels]
+            gap=8; total=sum(widths)+gap*(len(row)-1); x=box.center().x()-total//2
+            for ci,(k,label,w) in enumerate(zip(row,labels,widths)):
+                r=QRect(x,y,w,38)
+                active=(ri==self.window.text_keyboard_row and ci==self.window.text_keyboard_col)
+                toggled=(k=='Shift' and self.window.text_input_shift) or (k=='Caps' and self.window.text_input_caps)
+                if active: painter.fillRect(r,self.light); painter.setPen(self.dark_text)
+                else:
+                    painter.setPen(self.light if toggled else self.text)
+                    painter.drawRect(r)
+                painter.drawText(r,Qt.AlignmentFlag.AlignCenter,label); x+=w+gap
+            y+=48
+        guide="D-pad Navigate   A Select   B Backspace   X Space   Y Shift   LB Caps Lock   RB Symbols   Start Done"
+        painter.setPen(self.text); painter.drawText(box.adjusted(18,0,-18,-14),Qt.AlignmentFlag.AlignBottom|Qt.AlignmentFlag.AlignHCenter,guide)
 
     def draw_logo(self, painter: QPainter):
         if not self.window.settings.get("show_logo", True):
@@ -3265,6 +3838,11 @@ class GentlemanView(QWidget):
             painter.drawText(text_x, row_y, f"IP: {self.window.local_ip_address}")
             painter.drawText(text_x, row_y + 28, f"Version: {APP_VERSION}")
             row_y += 84
+        elif self.window.mode == "menu_size":
+            painter.setPen(self.text)
+            painter.drawText(text_x, row_y, "Menu size applies in fullscreen mode.")
+            painter.drawText(text_x, row_y + 28, "Windowed mode always uses 100%.")
+            row_y += 70
 
         if not labels:
             painter.setPen(self.text)
