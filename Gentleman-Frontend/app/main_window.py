@@ -310,6 +310,7 @@ class GentlemanWindow(QMainWindow):
         self.keyboard_osd_latched = False
         self.ingame_osd = InGameOsd(self)
         self.suspended_session_processes = []
+        self.dolphin_osd_fullscreen_toggled = False
         self.local_ip_address = self.resolve_local_ip_address()
 
         self.controller_available = False
@@ -2489,20 +2490,128 @@ class GentlemanWindow(QMainWindow):
             self.clear_active_session()
         return {"ok": True, "action": "force_close" if force else "close", "session": self.active_session_snapshot()}
 
+    def is_dolphin_session(self) -> bool:
+        session = self.active_session_snapshot()
+        emulator = str(session.get("emulator") or "").strip().lower()
+        return "dolphin" in emulator
+
+    def foreground_session_window_is_fullscreen(self) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+
+            window_pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            session_pid = self.active_session_snapshot().get("pid")
+            if not session_pid:
+                return False
+
+            valid_pids = {int(session_pid)}
+            if psutil is not None:
+                try:
+                    root = psutil.Process(int(session_pid))
+                    valid_pids.update(child.pid for child in root.children(recursive=True))
+                except Exception:
+                    pass
+            if int(window_pid.value) not in valid_pids:
+                return False
+
+            class Rect(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_ulong),
+                    ("rcMonitor", Rect),
+                    ("rcWork", Rect),
+                    ("dwFlags", ctypes.c_ulong),
+                ]
+
+            window_rect = Rect()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+                return False
+            monitor = user32.MonitorFromWindow(hwnd, 2)
+            if not monitor:
+                return False
+            monitor_info = MonitorInfo()
+            monitor_info.cbSize = ctypes.sizeof(MonitorInfo)
+            if not user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
+                return False
+
+            tolerance = 2
+            screen = monitor_info.rcMonitor
+            return (
+                abs(window_rect.left - screen.left) <= tolerance
+                and abs(window_rect.top - screen.top) <= tolerance
+                and abs(window_rect.right - screen.right) <= tolerance
+                and abs(window_rect.bottom - screen.bottom) <= tolerance
+            )
+        except Exception:
+            return False
+
+    def send_alt_enter(self):
+        if os.name != "nt":
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(0x12, 0, 0, 0)
+            user32.keybd_event(0x0D, 0, 0, 0)
+            user32.keybd_event(0x0D, 0, 2, 0)
+            user32.keybd_event(0x12, 0, 2, 0)
+        except Exception:
+            pass
+
+    def finish_show_ingame_osd(self):
+        if not self.active_session_snapshot().get("running") or self.ingame_osd.isVisible():
+            return
+        self.ingame_osd.show_osd()
+
     def show_ingame_osd(self):
         if not self.ingame_osd_enabled():
             return
         if not self.active_session_snapshot().get("running") or self.ingame_osd.isVisible():
             return
+
+        if self.is_dolphin_session():
+            self.dolphin_osd_fullscreen_toggled = self.foreground_session_window_is_fullscreen()
+            if self.dolphin_osd_fullscreen_toggled:
+                self.send_alt_enter()
+                QTimer.singleShot(450, self.finish_show_ingame_osd)
+            else:
+                self.finish_show_ingame_osd()
+            return
+
         self.suspend_active_session_processes()
         self.ingame_osd.show_osd()
 
     def hide_ingame_osd(self, resume: bool):
         self.ingame_osd.hide()
+        dolphin_session = self.is_dolphin_session()
         if resume:
             self.resume_active_session_processes()
         else:
             self.suspended_session_processes = []
+
+        if dolphin_session:
+            should_restore_fullscreen = (
+                resume
+                and self.dolphin_osd_fullscreen_toggled
+                and self.active_session_snapshot().get("running")
+            )
+            self.dolphin_osd_fullscreen_toggled = False
+            if should_restore_fullscreen:
+                QTimer.singleShot(200, self.send_alt_enter)
+            return
+
         if resume and self.active_session_snapshot().get("running"):
             try:
                 if os.name == "nt":
@@ -2970,10 +3079,14 @@ class GentlemanView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.fillRect(self.rect(), self.bg)
 
         if not self.wallpaper.isNull():
+            target_size = self.size()
+            target_size.setWidth(target_size.width() + 2)
+            target_size.setHeight(target_size.height() + 2)
             scaled = self.wallpaper.scaled(
-                self.size(),
+                target_size,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
