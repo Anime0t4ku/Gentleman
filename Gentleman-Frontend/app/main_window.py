@@ -3608,7 +3608,11 @@ class GentlemanView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(self.rect(), self.bg)
+        background_overscan = 8
+        painter.fillRect(
+            QRect(-background_overscan, -background_overscan, self.width() + background_overscan * 2, self.height() + background_overscan * 2),
+            self.bg,
+        )
 
         wallpaper_frame = self.wallpaper_movie.currentPixmap() if self.wallpaper_movie is not None else self.wallpaper
         if not wallpaper_frame.isNull():
@@ -3797,14 +3801,24 @@ class GentlemanView(QWidget):
         self.static_noise = QPixmap.fromImage(image.copy())
         self.static_noise_frame += 1
 
+        overscan = 8
+        target_w = max(1, self.width() + overscan * 2)
+        target_h = max(1, self.height() + overscan * 2)
         scaled = self.static_noise.scaled(
-            self.size(),
+            target_w,
+            target_h,
             Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.FastTransformation,
         )
 
-        painter.drawPixmap(0, 0, scaled)
-        painter.fillRect(self.rect(), QColor(30, 0, 10, 45))
+        painter.save()
+        painter.setClipRect(self.rect())
+        painter.drawPixmap(-overscan, -overscan, scaled)
+        painter.fillRect(
+            QRect(-overscan, -overscan, self.width() + overscan * 2, self.height() + overscan * 2),
+            QColor(30, 0, 10, 45),
+        )
+        painter.restore()
 
     def network_icon(self) -> str:
         try:
