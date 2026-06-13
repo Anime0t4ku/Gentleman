@@ -21,6 +21,10 @@ class LauncherConfig:
     working_directory: str = ""
     system: str = ""
     emulator_name: str = ""
+    shortcut_path: str = ""
+    shortcut_directory: str = ""
+    link_path: str = ""
+    link_directory: str = ""
 
 
 @dataclass
@@ -41,19 +45,40 @@ class RomBrowserItem:
 
 def load_launcher(path: Path) -> LauncherConfig:
     data = json.loads(path.read_text(encoding="utf-8"))
+    launcher_type = str(data.get("type", "standalone")).strip().lower()
+
+    if launcher_type == "link":
+        launcher_type = "shortcut"
+    elif launcher_type == "link_folder":
+        launcher_type = "shortcut_folder"
+
+    shortcut_path = str(
+        data.get("shortcut_path", data.get("link_path", data.get("emulator", "")))
+    ).strip()
+    shortcut_directory = str(
+        data.get("shortcut_directory", data.get("link_directory", data.get("rom_directory", "")))
+    ).strip()
+
+    raw_extensions = data.get("extensions", [])
+    if launcher_type == "shortcut_folder" and not raw_extensions:
+        raw_extensions = [".lnk"]
 
     return LauncherConfig(
         path=path,
-        launcher_type=data.get("type", "standalone"),
-        emulator=data.get("emulator", ""),
-        rom_directory=data.get("rom_directory", ""),
-        extensions=[ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in data.get("extensions", [])],
+        launcher_type=launcher_type,
+        emulator=data.get("emulator", shortcut_path if launcher_type == "shortcut" else ""),
+        rom_directory=data.get("rom_directory", shortcut_directory if launcher_type == "shortcut_folder" else ""),
+        extensions=[ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in raw_extensions],
         arguments=data.get("arguments", "\"{rom}\""),
         recursive=bool(data.get("recursive", True)),
         core=data.get("core", ""),
         working_directory=data.get("working_directory", ""),
         system=str(data.get("system", "")),
         emulator_name=str(data.get("emulator_name", "")).strip(),
+        shortcut_path=shortcut_path,
+        shortcut_directory=shortcut_directory,
+        link_path=shortcut_path,
+        link_directory=shortcut_directory,
     )
 
 
@@ -133,6 +158,20 @@ def launch_external_process(command: str, cwd: str | None = None) -> subprocess.
         env=external_process_env(),
         creationflags=creationflags,
     )
+
+
+def launch_link_shortcut(shortcut: Path) -> subprocess.Popen:
+    shortcut_path = str(shortcut)
+    cwd = str(shortcut.parent)
+
+    if os.name == "nt":
+        command = f'start "" "{shortcut_path}"'
+    elif sys.platform == "darwin":
+        command = f'open "{shortcut_path}"'
+    else:
+        command = f'xdg-open "{shortcut_path}"'
+
+    return launch_external_process(command, cwd)
 
 
 def build_command(config: LauncherConfig, rom: Path) -> tuple[str, str]:

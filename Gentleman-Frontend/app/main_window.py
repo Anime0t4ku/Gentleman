@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 from app.app_info import APP_NAME, APP_VERSION, ABOUT_LINES
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
 from core.arcade_names import ArcadeNameDatabase
-from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, LauncherConfig, RomBrowserItem
+from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, launch_link_shortcut, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
 from core.remote_api import GentlemanApiServer
 from core.updater import (
@@ -58,6 +58,40 @@ class UpdateCheckWorker(QThread):
             self.result.emit(info)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+class RomFolderScanWorker(QThread):
+    result = pyqtSignal(object)
+
+    def __init__(self, request_id: int, cache_key: tuple, signature: tuple | None, launcher: LauncherConfig, folder: Path, arcade_names: dict[str, str] | None):
+        super().__init__()
+        self.request_id = request_id
+        self.cache_key = cache_key
+        self.signature = signature
+        self.launcher = launcher
+        self.folder = folder
+        self.arcade_names = arcade_names
+
+    def run(self):
+        try:
+            items = scan_rom_folder(self.launcher, self.folder, self.arcade_names)
+            self.result.emit({
+                "request_id": self.request_id,
+                "cache_key": self.cache_key,
+                "signature": self.signature,
+                "folder": self.folder,
+                "items": items,
+                "error": "",
+            })
+        except Exception as exc:
+            self.result.emit({
+                "request_id": self.request_id,
+                "cache_key": self.cache_key,
+                "signature": self.signature,
+                "folder": self.folder,
+                "items": [],
+                "error": str(exc),
+            })
 
 
 def resource_path(relative_path: str) -> Path:
@@ -384,12 +418,19 @@ class GentlemanWindow(QMainWindow):
 
         self.menu_items: list[MenuItem] = []
         self.rom_items: list[RomBrowserItem] = []
+        self.rom_labels: list[tuple[str, str]] = []
+        self.rom_folder_cache: dict[tuple, dict] = {}
+        self.rom_scan_worker: RomFolderScanWorker | None = None
+        self.retired_rom_scan_workers: list[RomFolderScanWorker] = []
+        self.rom_scan_request_id = 0
+        self.rom_loading = False
         self.emulator_items: list[str] = []
         self.emulator_launchers: dict[str, list[MenuItem]] = {}
         self.emulator_paths: dict[str, str] = {}
         self.current_emulator: str | None = None
         self.recent_items: list[dict] = []
         self.favorite_items: list[dict] = []
+        self.favorite_item_keys: set[tuple[str, str]] = set()
         self.system_items = []
         self.update_system_items()
         self.settings_items = []
@@ -416,6 +457,7 @@ class GentlemanWindow(QMainWindow):
         self.suspended_session_processes = []
         self.dolphin_osd_fullscreen_toggled = False
         self.local_ip_address = self.resolve_local_ip_address()
+        self.cached_network_icon = "lan" if self.local_ip_address != "Not connected" else "wifi"
 
         self.controller_available = False
         self.controller = None
@@ -477,10 +519,11 @@ class GentlemanWindow(QMainWindow):
 
     def refresh_local_ip_address(self):
         address = self.resolve_local_ip_address()
-        if address != self.local_ip_address:
+        icon = "lan" if address != "Not connected" else "wifi"
+        if address != self.local_ip_address or icon != self.cached_network_icon:
             self.local_ip_address = address
-            if self.mode == "system":
-                self.view.update()
+            self.cached_network_icon = icon
+            self.view.update()
 
     def default_settings(self) -> dict:
         return {
@@ -543,6 +586,8 @@ class GentlemanWindow(QMainWindow):
         return bool(self.settings.get("normalize_arcade_names", True))
 
     def arcade_names_for_launcher(self, launcher: LauncherConfig) -> dict[str, str] | None:
+        if launcher.launcher_type == "shortcut_folder":
+            return None
         if not self.arcade_name_normalization_enabled():
             return None
         if launcher.system.strip().lower() != "arcade":
@@ -555,6 +600,140 @@ class GentlemanWindow(QMainWindow):
             folder,
             self.arcade_names_for_launcher(launcher),
         )
+
+    def rom_folder_signature(self, folder: Path) -> tuple | None:
+        try:
+            stat = folder.stat()
+            return (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)), stat.st_size)
+        except OSError:
+            return None
+
+    def rom_cache_key(self, launcher: LauncherConfig, folder: Path) -> tuple:
+        try:
+            launcher_path = str(launcher.path.resolve()).replace(chr(92), "/").lower()
+        except Exception:
+            launcher_path = str(launcher.path).replace(chr(92), "/").lower()
+
+        try:
+            folder_path = str(folder.resolve()).replace(chr(92), "/").lower()
+        except Exception:
+            folder_path = str(folder).replace(chr(92), "/").lower()
+
+        return (
+            launcher_path,
+            folder_path,
+            tuple(sorted(ext.lower() for ext in launcher.extensions)),
+            bool(self.arcade_name_normalization_enabled()),
+            launcher.system.strip().lower(),
+        )
+
+    def set_rom_items(self, items: list[RomBrowserItem]):
+        self.rom_items = items
+        self.rom_labels = [("...", "<DIR>")] + [(item.display_name, item.marker) for item in items]
+        self.rom_loading = False
+
+    def clear_rom_items(self):
+        self.rom_items = []
+        self.rom_labels = []
+        self.rom_loading = False
+
+    def show_rom_loading(self):
+        self.rom_items = []
+        self.rom_labels = [("Loading folder...", "")]
+        self.rom_loading = True
+
+    def open_rom_folder(self, launcher: LauncherConfig, folder: Path, reset_selection: bool = True):
+        self.current_launcher = launcher
+        self.current_rom_folder = folder
+        self.mode = "roms"
+
+        cache_key = self.rom_cache_key(launcher, folder)
+        signature = self.rom_folder_signature(folder)
+        cached = self.rom_folder_cache.get(cache_key)
+
+        if cached and cached.get("signature") == signature:
+            self.set_rom_items(cached.get("items", []))
+            if reset_selection:
+                self.reset_selection_to_first_real_entry()
+            self.view.update()
+            return
+
+        self.rom_scan_request_id += 1
+        request_id = self.rom_scan_request_id
+
+        if self.rom_scan_worker is not None and self.rom_scan_worker.isRunning():
+            old_worker = self.rom_scan_worker
+            try:
+                old_worker.result.disconnect()
+            except TypeError:
+                pass
+            try:
+                old_worker.finished.disconnect()
+            except TypeError:
+                pass
+            old_worker.finished.connect(lambda worker=old_worker: self.cleanup_retired_rom_scan_worker(worker))
+            self.retired_rom_scan_workers.append(old_worker)
+
+        self.show_rom_loading()
+        if reset_selection:
+            self.selected_index = 0
+            self.view.scroll_offset = 0
+        self.view.update()
+
+        self.rom_scan_worker = RomFolderScanWorker(
+            request_id,
+            cache_key,
+            signature,
+            launcher,
+            folder,
+            self.arcade_names_for_launcher(launcher),
+        )
+        self.rom_scan_worker.result.connect(self.on_rom_folder_scan_result)
+        self.rom_scan_worker.finished.connect(self.on_rom_folder_scan_finished)
+        self.rom_scan_worker.start()
+
+    def on_rom_folder_scan_result(self, result: object):
+        if not isinstance(result, dict):
+            return
+
+        if result.get("request_id") != self.rom_scan_request_id:
+            return
+
+        folder = result.get("folder")
+        if self.mode != "roms" or self.current_rom_folder is None or Path(folder) != self.current_rom_folder:
+            return
+
+        items = result.get("items", [])
+        if not isinstance(items, list):
+            items = []
+
+        cache_key = result.get("cache_key")
+        if isinstance(cache_key, tuple):
+            self.rom_folder_cache[cache_key] = {
+                "signature": result.get("signature"),
+                "items": items,
+                "scanned_at": time.monotonic(),
+            }
+            while len(self.rom_folder_cache) > 32:
+                self.rom_folder_cache.pop(next(iter(self.rom_folder_cache)))
+
+        self.set_rom_items(items)
+        self.reset_selection_to_first_real_entry()
+        self.view.update()
+
+        error = str(result.get("error", "")).strip()
+        if error:
+            self.show_message("ROM Browser", error)
+
+    def on_rom_folder_scan_finished(self):
+        self.rom_scan_worker = None
+
+    def cleanup_retired_rom_scan_worker(self, worker: RomFolderScanWorker):
+        if worker in self.retired_rom_scan_workers:
+            self.retired_rom_scan_workers.remove(worker)
+
+    def invalidate_rom_folder_cache(self):
+        self.rom_folder_cache.clear()
 
     def emulators_menu_enabled(self) -> bool:
         return bool(self.settings.get("show_emulators_menu", True))
@@ -635,6 +814,7 @@ class GentlemanWindow(QMainWindow):
 
     def update_favorite_items(self):
         self.favorite_items = self.load_favorite_items()
+        self.favorite_item_keys = {self.item_identity_key(item) for item in self.favorite_items}
 
     def remove_selected_favorite(self):
         if self.mode != "favorites" or self.selected_index == 0:
@@ -683,12 +863,7 @@ class GentlemanWindow(QMainWindow):
         if not item:
             return False
 
-        favorites = self.load_favorite_items()
-        return any(
-            favorite.get("launcher") == item.get("launcher")
-            and favorite.get("rom") == item.get("rom")
-            for favorite in favorites
-        )
+        return self.item_identity_key(item) in self.favorite_item_keys
 
     def toggle_current_favorite(self):
         item = self.favorite_item_from_current_selection()
@@ -1073,6 +1248,17 @@ class GentlemanWindow(QMainWindow):
             "items": items,
         }
 
+    def launch_application_config(self, config: LauncherConfig):
+        command = f'"{config.emulator}" {config.arguments}'.strip()
+        return launch_external_process(command, str(Path(config.emulator).parent))
+
+    def launch_shortcut_path(self, path: Path):
+        return launch_link_shortcut(path)
+
+    def launch_shortcut_config(self, config: LauncherConfig):
+        shortcut_path = Path(config.shortcut_path or config.emulator)
+        return self.launch_shortcut_path(shortcut_path)
+
     def api_launch(self, payload: dict) -> dict:
         launcher = str(payload.get("launcher", ""))
         game = str(payload.get("game", payload.get("rom", "")))
@@ -1081,14 +1267,28 @@ class GentlemanWindow(QMainWindow):
         config = load_launcher(launcher_path)
 
         if config.launcher_type == "application":
-            process = launch_external_process(f'"{config.emulator}" {config.arguments}'.strip(), str(Path(config.emulator).parent))
+            process = self.launch_application_config(config)
             self.begin_active_session(process, "application", config.emulator_name or launcher_path.stem, "")
             return {"ok": True, "launched": "application", "launcher": launcher, "session": self.active_session_snapshot()}
 
+        if config.launcher_type == "shortcut":
+            shortcut_path = Path(config.shortcut_path or config.emulator)
+            if not shortcut_path.exists():
+                raise ValueError("Shortcut file not found")
+            process = self.launch_shortcut_path(shortcut_path)
+            self.begin_active_session(process, "application", launcher_path.stem, config.system or "Shortcut")
+            return {"ok": True, "launched": "shortcut", "launcher": launcher, "session": self.active_session_snapshot()}
+
         rom_path = self.api_safe_rom_path(config, game)
         display_name = self.display_name_for_rom(config, rom_path)
-        process = launch_rom(config, rom_path)
-        self.begin_active_session(process, "game", display_name, config.emulator_name or launcher_path.stem)
+
+        if config.launcher_type == "shortcut_folder":
+            process = self.launch_shortcut_path(rom_path)
+            self.begin_active_session(process, "game", display_name, config.system or launcher_path.stem)
+        else:
+            process = launch_rom(config, rom_path)
+            self.begin_active_session(process, "game", display_name, config.emulator_name or launcher_path.stem)
+
         self.add_recent_game(launcher_path, rom_path)
         self.update_recent_items()
 
@@ -1291,13 +1491,17 @@ class GentlemanWindow(QMainWindow):
         ]
 
     def launcher_type_values(self) -> list[str]:
-        return ["Standalone Emulator", "RetroArch", "Application"]
+        return ["Standalone Emulator", "RetroArch", "Application", "Shortcut", "Shortcut Folder"]
 
     def launcher_type_to_json(self, type_name: str) -> str:
         if type_name == "RetroArch":
             return "retroarch"
         if type_name == "Application":
             return "application"
+        if type_name == "Shortcut":
+            return "shortcut"
+        if type_name == "Shortcut Folder":
+            return "shortcut_folder"
         return "standalone"
 
     def launcher_type_from_json(self, type_name: str) -> str:
@@ -1305,6 +1509,10 @@ class GentlemanWindow(QMainWindow):
             return "RetroArch"
         if type_name == "application":
             return "Application"
+        if type_name in ("shortcut", "link"):
+            return "Shortcut"
+        if type_name in ("shortcut_folder", "link_folder"):
+            return "Shortcut Folder"
         if type_name == "custom":
             return "Standalone Emulator"
         return "Standalone Emulator"
@@ -1343,6 +1551,20 @@ class GentlemanWindow(QMainWindow):
                 "Application Name",
                 "App Path",
                 "Arguments",
+                "Save",
+                "Cancel",
+            ])
+        elif launcher_type == "Shortcut":
+            fields.extend([
+                "System",
+                "Shortcut Path",
+                "Save",
+                "Cancel",
+            ])
+        elif launcher_type == "Shortcut Folder":
+            fields.extend([
+                "System",
+                "Shortcut Folder",
                 "Save",
                 "Cancel",
             ])
@@ -1393,14 +1615,16 @@ class GentlemanWindow(QMainWindow):
                 "emulator_name": str(data.get("emulator_name", "")),
                 "system": str(data.get("system", "")),
                 "type": launcher_type,
-                "emulator": str(data.get("emulator", "")),
+                "emulator": str(data.get("emulator", data.get("shortcut_path", data.get("link_path", "")))),
                 "core": str(data.get("core", "")),
-                "rom_directory": str(data.get("rom_directory", "")),
+                "rom_directory": str(data.get("rom_directory", data.get("shortcut_directory", data.get("link_directory", "")))),
                 "extensions": ",".join(data.get("extensions", [])),
                 "arguments": str(data.get("arguments", '"{rom}"')),
             }
             if launcher_type == "RetroArch":
                 self.launcher_form_data["emulator_name"] = "RetroArch"
+            if launcher_type == "Application":
+                self.launcher_form_data["system"] = "Application"
         else:
             self.launcher_form_data = {
                 "launcher_name": "",
@@ -1425,7 +1649,7 @@ class GentlemanWindow(QMainWindow):
     def default_arguments_for_type(self, type_name: str) -> str:
         if type_name == "RetroArch":
             return '-L "{core}" "{rom}"'
-        if type_name == "Application":
+        if type_name in ("Application", "Shortcut", "Shortcut Folder"):
             return ""
         return '"{rom}"'
 
@@ -1440,6 +1664,11 @@ class GentlemanWindow(QMainWindow):
             self.launcher_form_data["emulator_name"] = "RetroArch"
         elif old_type == "RetroArch" and self.launcher_form_data.get("emulator_name") == "RetroArch":
             self.launcher_form_data["emulator_name"] = ""
+
+        if type_name == "Application":
+            self.launcher_form_data["system"] = "Application"
+        elif old_type == "Application" and self.launcher_form_data.get("system") == "Application":
+            self.launcher_form_data["system"] = ""
 
         if not current_args or current_args == old_default:
             self.launcher_form_data["arguments"] = self.default_arguments_for_type(type_name)
@@ -1463,6 +1692,10 @@ class GentlemanWindow(QMainWindow):
             return self.launcher_form_data.get("emulator", "")
         if field == "App Path":
             return self.launcher_form_data.get("emulator", "")
+        if field == "Shortcut Path":
+            return self.launcher_form_data.get("emulator", "")
+        if field == "Shortcut Folder":
+            return self.launcher_form_data.get("rom_directory", "")
         if field == "RetroArch Core":
             return self.launcher_form_data.get("core", "")
         if field == "ROM Path":
@@ -1475,17 +1708,29 @@ class GentlemanWindow(QMainWindow):
 
     def cycle_launcher_form_value(self, delta: int):
         if not self.launcher_form_fields:
-            return
+            return False
 
         field = self.launcher_form_fields[self.selected_index]
 
-        if field == "Save Folder":
-            self.open_folder_picker()
-            return
+        if field != "Type":
+            return False
 
-        if field == "Type":
-            self.open_type_picker()
-            return
+        values = self.launcher_type_values()
+        if not values:
+            return False
+
+        current = self.launcher_form_data.get("type", "Standalone Emulator")
+        try:
+            current_index = values.index(current)
+        except ValueError:
+            current_index = 0
+
+        self.set_launcher_type(values[(current_index + delta) % len(values)])
+        self.update_launcher_form_fields()
+        self.selected_index = min(self.selected_index, max(0, len(self.launcher_form_fields) - 1))
+        self.view.ensure_visible()
+        self.view.update()
+        return True
 
     def open_folder_picker(self):
         self.rebuild_launcher_form_folders()
@@ -1545,7 +1790,10 @@ class GentlemanWindow(QMainWindow):
         self.view.update()
 
     def open_system_picker(self):
-        self.system_picker_items = ["Custom / Unknown"] + ZAPAROO_SYSTEM_NAMES
+        system_names = list(ZAPAROO_SYSTEM_NAMES)
+        if "Application" not in system_names:
+            system_names.append("Application")
+        self.system_picker_items = ["Custom / Unknown"] + sorted(system_names, key=str.lower)
         self.launcher_form_return_index = self.selected_index
 
         current = self.launcher_form_data.get("system", "")
@@ -1618,15 +1866,29 @@ class GentlemanWindow(QMainWindow):
                 else: prompt = 'Arguments. Use {rom} for the selected game, for example: -fullscreen "{rom}"'
             self.open_text_input(field, prompt, self.launcher_form_data.get(key, ""), lambda value, k=key: self.launcher_form_data.__setitem__(k, value.strip()))
             return
-        if field in ("Emulator Path", "App Path"):
-            title = "Select application" if field == "App Path" else "Select emulator executable"
-            self.open_file_browser(title, self.base_dir, ['.exe'], False, lambda value: self.launcher_form_data.__setitem__('emulator', value))
+        if field in ("Emulator Path", "App Path", "Shortcut Path"):
+            if field == "App Path":
+                title = "Select application"
+                extensions = ['.exe']
+            elif field == "Shortcut Path":
+                title = "Select Windows shortcut"
+                extensions = ['.lnk']
+            elif self.launcher_form_data.get("type") == "RetroArch":
+                title = "Select RetroArch executable"
+                extensions = ['.exe']
+            else:
+                title = "Select emulator executable"
+                extensions = ['.exe']
+            self.open_file_browser(title, self.base_dir, extensions, False, lambda value: self.launcher_form_data.__setitem__('emulator', value))
             return
         if field == "RetroArch Core":
             self.open_file_browser("Select RetroArch core", self.base_dir, ['.dll'], False, lambda value: self.launcher_form_data.__setitem__('core', value))
             return
         if field == "ROM Path":
             self.open_file_browser("Select ROM folder", self.base_dir, [], True, lambda value: self.launcher_form_data.__setitem__('rom_directory', value))
+            return
+        if field == "Shortcut Folder":
+            self.open_file_browser("Select shortcut folder", self.base_dir, [], True, lambda value: self.launcher_form_data.__setitem__('rom_directory', value))
             return
 
     def launcher_form_safe_filename(self, name: str) -> str:
@@ -1643,21 +1905,41 @@ class GentlemanWindow(QMainWindow):
         emulator = data.get("emulator", "").strip()
         rom_directory = data.get("rom_directory", "").strip()
 
+        if launcher_type == "Application":
+            data["system"] = "Application"
+
         if not launcher_name:
             self.show_message("Missing launcher name", "Enter a launcher name.")
             return
-        if launcher_type != "RetroArch" and not emulator_name:
-            self.show_message("Missing emulator name", "Enter an emulator name.")
-            return
-        if not emulator:
-            self.show_message("Missing executable", "Select an emulator or application path.")
-            return
-        if launcher_type != "Application" and not rom_directory:
-            self.show_message("Missing ROM path", "Select a ROM path.")
-            return
-        if launcher_type == "RetroArch" and not data.get("core", "").strip():
-            self.show_message("Missing core", "Select a RetroArch core.")
-            return
+
+        if launcher_type == "Application":
+            if not emulator_name:
+                self.show_message("Missing application name", "Enter an application name.")
+                return
+            if not emulator:
+                self.show_message("Missing application", "Select an application path.")
+                return
+        elif launcher_type == "Shortcut":
+            if not emulator:
+                self.show_message("Missing shortcut", "Select a Windows shortcut.")
+                return
+        elif launcher_type == "Shortcut Folder":
+            if not rom_directory:
+                self.show_message("Missing shortcut folder", "Select a shortcut folder.")
+                return
+        else:
+            if launcher_type != "RetroArch" and not emulator_name:
+                self.show_message("Missing emulator name", "Enter an emulator name.")
+                return
+            if not emulator:
+                self.show_message("Missing executable", "Select an emulator path.")
+                return
+            if not rom_directory:
+                self.show_message("Missing ROM path", "Select a ROM path.")
+                return
+            if launcher_type == "RetroArch" and not data.get("core", "").strip():
+                self.show_message("Missing core", "Select a RetroArch core.")
+                return
 
         if self.launcher_form_mode == "edit" and self.launcher_form_path:
             json_path = self.launcher_form_path
@@ -1690,19 +1972,36 @@ class GentlemanWindow(QMainWindow):
                 ext = "." + ext
             extensions.append(ext)
 
-        output = {
-            "type": self.launcher_type_to_json(data.get("type", "Standalone Emulator")),
-            "emulator_name": emulator_name,
-            "system": data.get("system", ""),
-            "emulator": emulator,
-            "rom_directory": rom_directory,
-            "extensions": extensions,
-            "arguments": data.get("arguments", "").strip() or '"{rom}"',
-            "recursive": True,
-        }
+        json_type = self.launcher_type_to_json(launcher_type)
 
-        if data.get("type") == "RetroArch":
-            output["core"] = data.get("core", "").strip()
+        if launcher_type == "Shortcut":
+            output = {
+                "type": json_type,
+                "system": data.get("system", ""),
+                "shortcut_path": emulator,
+            }
+        elif launcher_type == "Shortcut Folder":
+            output = {
+                "type": json_type,
+                "system": data.get("system", ""),
+                "shortcut_directory": rom_directory,
+                "extensions": [".lnk"],
+                "recursive": True,
+            }
+        else:
+            output = {
+                "type": json_type,
+                "emulator_name": emulator_name,
+                "system": "Application" if launcher_type == "Application" else data.get("system", ""),
+                "emulator": emulator,
+                "rom_directory": "" if launcher_type == "Application" else rom_directory,
+                "extensions": [] if launcher_type == "Application" else extensions,
+                "arguments": data.get("arguments", "").strip() if launcher_type == "Application" else data.get("arguments", "").strip() or '"{rom}"',
+                "recursive": True,
+            }
+
+            if launcher_type == "RetroArch":
+                output["core"] = data.get("core", "").strip()
 
         json_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
@@ -2058,7 +2357,7 @@ class GentlemanWindow(QMainWindow):
                 return 1
             return len(self.emulator_launchers.get(self.current_emulator, [])) + 1
         if self.mode == "roms":
-            return len(self.rom_items) + 1
+            return len(self.rom_labels)
 
         back_count = 1 if self.current_folder != self.menu_root else 0
         favorites_count = 1 if self.current_folder == self.menu_root and self.favorites_menu_enabled() else 0
@@ -2103,11 +2402,13 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "launcher_form":
             self.update_launcher_form_fields()
             labels = []
+            launcher_type = self.launcher_form_data.get("type", "Standalone Emulator")
             for field in self.launcher_form_fields:
+                display_field = "RetroArch Path" if field == "Emulator Path" and launcher_type == "RetroArch" else field
                 if field in ("Save", "Cancel"):
                     labels.append((field, ""))
                 else:
-                    labels.append((f"{field}: {self.launcher_form_value(field)}", ""))
+                    labels.append((f"{display_field}: {self.launcher_form_value(field)}", ""))
             return labels
         if self.mode == "system_picker":
             return [(name, "") for name in self.system_picker_items]
@@ -2137,7 +2438,7 @@ class GentlemanWindow(QMainWindow):
             launchers = self.emulator_launchers.get(self.current_emulator or "", [])
             return [("...", "<DIR>")] + [(item.name, "<DIR>") for item in launchers]
         if self.mode == "roms":
-            return [("...", "<DIR>")] + [(item.display_name, item.marker) for item in self.rom_items]
+            return self.rom_labels
 
         labels = []
         if self.current_folder == self.menu_root and self.favorites_menu_enabled():
@@ -2159,7 +2460,7 @@ class GentlemanWindow(QMainWindow):
         self.current_launcher = None
         self.current_rom_folder = None
         self.current_emulator = None
-        self.rom_items = []
+        self.clear_rom_items()
         self.menu_items = scan_menu_folder(self.current_folder)
         self.update_favorite_items()
         self.update_recent_items()
@@ -2289,16 +2590,14 @@ class GentlemanWindow(QMainWindow):
                 current = self.current_rom_folder.resolve()
 
                 if current != rom_root and rom_root in current.parents:
-                    self.current_rom_folder = self.current_rom_folder.parent
-                    self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
-                    self.reset_selection_to_first_real_entry()
-                    self.view.update()
+                    self.open_rom_folder(self.current_launcher, self.current_rom_folder.parent)
                     return
 
             self.mode = "menu"
             self.current_launcher = None
             self.current_rom_folder = None
-            self.rom_items = []
+            self.clear_rom_items()
+            self.rom_scan_request_id += 1
             self.selected_index = 0
             self.view.update()
             return
@@ -2429,6 +2728,9 @@ class GentlemanWindow(QMainWindow):
             return
 
         if self.mode == "roms":
+            if self.rom_loading:
+                return
+
             if self.selected_index == 0:
                 self.go_back()
                 return
@@ -2439,19 +2741,22 @@ class GentlemanWindow(QMainWindow):
             selected = self.rom_items[self.selected_index - 1]
 
             if selected.is_dir:
-                self.current_rom_folder = selected.path
-                self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
-                self.reset_selection_to_first_real_entry()
-                self.view.update()
+                self.open_rom_folder(self.current_launcher, selected.path)
                 return
 
             try:
-                process = launch_rom(self.current_launcher, selected.path)
+                if self.current_launcher.launcher_type == "shortcut_folder":
+                    process = self.launch_shortcut_path(selected.path)
+                    emulator_name = self.current_launcher.system or self.current_launcher.path.stem
+                else:
+                    process = launch_rom(self.current_launcher, selected.path)
+                    emulator_name = self.current_launcher.emulator_name or self.current_launcher.path.stem
+
                 self.begin_active_session(
                     process,
                     "game",
                     selected.display_name,
-                    self.current_launcher.emulator_name or self.current_launcher.path.stem,
+                    emulator_name,
                 )
                 self.add_recent_game(self.current_launcher.path, selected.path)
                 self.update_recent_items()
@@ -2515,12 +2820,18 @@ class GentlemanWindow(QMainWindow):
 
         try:
             launcher = load_launcher(launcher_path)
-            process = launch_rom(launcher, rom)
+            if launcher.launcher_type == "shortcut_folder":
+                process = self.launch_shortcut_path(rom)
+                emulator_name = launcher.system or launcher.path.stem
+            else:
+                process = launch_rom(launcher, rom)
+                emulator_name = launcher.emulator_name or launcher.path.stem
+
             self.begin_active_session(
                 process,
                 "game",
                 self.display_name_for_rom(launcher, rom),
-                launcher.emulator_name or launcher.path.stem,
+                emulator_name,
             )
             self.add_recent_game(launcher_path, rom)
             self.update_recent_items()
@@ -2531,12 +2842,23 @@ class GentlemanWindow(QMainWindow):
 
     def open_launcher_item(self, item: MenuItem):
         try:
-            self.current_launcher = load_launcher(item.path)
-            self.current_rom_folder = Path(self.current_launcher.rom_directory)
-            self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
-            self.mode = "roms"
-            self.reset_selection_to_first_real_entry()
-            self.view.update()
+            launcher = load_launcher(item.path)
+
+            if launcher.launcher_type == "application":
+                process = self.launch_application_config(launcher)
+                self.begin_active_session(process, "application", launcher.emulator_name or item.name, "")
+                return
+
+            if launcher.launcher_type == "shortcut":
+                shortcut_path = Path(launcher.shortcut_path or launcher.emulator)
+                if not shortcut_path.exists():
+                    self.show_message("Launch failed", "Shortcut file not found.")
+                    return
+                process = self.launch_shortcut_path(shortcut_path)
+                self.begin_active_session(process, "application", item.name, launcher.system or "Shortcut")
+                return
+
+            self.open_rom_folder(launcher, Path(launcher.rom_directory))
         except Exception as exc:
             self.show_message("Launcher error", str(exc))
 
@@ -2677,8 +2999,9 @@ class GentlemanWindow(QMainWindow):
             self.refresh_settings_menu()
         elif item.startswith("Arcade ROM Names:"):
             self.settings["normalize_arcade_names"] = not self.arcade_name_normalization_enabled()
+            self.invalidate_rom_folder_cache()
             if self.current_launcher and self.current_rom_folder:
-                self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
+                self.open_rom_folder(self.current_launcher, self.current_rom_folder)
             self.update_recent_items()
             self.update_favorite_items()
             self.refresh_settings_menu()
@@ -3230,10 +3553,10 @@ class GentlemanWindow(QMainWindow):
             self.move_selection(-1)
         elif action == "down":
             self.move_selection(1)
-        elif action == "left":
-            self.jump_selection(-10)
-        elif action == "right":
-            self.jump_selection(10)
+        elif action in ("left", "right"):
+            if self.mode == "launcher_form" and self.cycle_launcher_form_value(-1 if action == "left" else 1):
+                return
+            self.jump_selection(-10 if action == "left" else 10)
 
     def set_controller_active_input(self):
         if self.active_input != "controller":
@@ -3555,8 +3878,12 @@ class GentlemanWindow(QMainWindow):
             self.view.update(); return
         if key in (Qt.Key.Key_Up, Qt.Key.Key_W): self.move_selection(-1)
         elif key in (Qt.Key.Key_Down, Qt.Key.Key_S): self.move_selection(1)
-        elif key in (Qt.Key.Key_Left, Qt.Key.Key_A): self.jump_selection(-10)
-        elif key in (Qt.Key.Key_Right, Qt.Key.Key_D): self.jump_selection(10)
+        elif key in (Qt.Key.Key_Left, Qt.Key.Key_A):
+            if not (self.mode == "launcher_form" and self.cycle_launcher_form_value(-1)):
+                self.jump_selection(-10)
+        elif key in (Qt.Key.Key_Right, Qt.Key.Key_D):
+            if not (self.mode == "launcher_form" and self.cycle_launcher_form_value(1)):
+                self.jump_selection(10)
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space): self.activate_selected()
         elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace): self.go_back()
         elif key == Qt.Key.Key_F5: self.refresh_menu()
@@ -3600,6 +3927,8 @@ class GentlemanView(QWidget):
 
         self.wallpaper = QPixmap()
         self.wallpaper_movie = None
+        self.scaled_wallpaper = QPixmap()
+        self.scaled_wallpaper_cache_key = None
         self.reload_wallpaper()
 
         self.wallpaper_preview_timer = QTimer(self)
@@ -3642,12 +3971,16 @@ class GentlemanView(QWidget):
             if movie.isValid():
                 self.wallpaper_movie = movie
                 self.wallpaper = QPixmap()
+                self.scaled_wallpaper = QPixmap()
+                self.scaled_wallpaper_cache_key = None
                 movie.start()
                 return
             movie.deleteLater()
 
         self.wallpaper_movie = None
         self.wallpaper = QPixmap(str(path)) if path and path.exists() else QPixmap()
+        self.scaled_wallpaper = QPixmap()
+        self.scaled_wallpaper_cache_key = None
 
     def ensure_visible(self):
         visible_rows = self.visible_rows()
@@ -3808,12 +4141,24 @@ class GentlemanView(QWidget):
             )
             scaled_w = max(viewport_w + overscan * 2, math.ceil(source_w * scale))
             scaled_h = max(viewport_h + overscan * 2, math.ceil(source_h * scale))
-            scaled = wallpaper_frame.scaled(
-                scaled_w,
-                scaled_h,
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            if self.wallpaper_movie is not None:
+                scaled = wallpaper_frame.scaled(
+                    scaled_w,
+                    scaled_h,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            else:
+                cache_key = (viewport_w, viewport_h, scaled_w, scaled_h, self.wallpaper.cacheKey())
+                if self.scaled_wallpaper_cache_key != cache_key or self.scaled_wallpaper.isNull():
+                    self.scaled_wallpaper = wallpaper_frame.scaled(
+                        scaled_w,
+                        scaled_h,
+                        Qt.AspectRatioMode.IgnoreAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    self.scaled_wallpaper_cache_key = cache_key
+                scaled = self.scaled_wallpaper
             x = (viewport_w - scaled.width()) // 2
             y = (viewport_h - scaled.height()) // 2
             painter.save()
@@ -4002,11 +4347,7 @@ class GentlemanView(QWidget):
         painter.restore()
 
     def network_icon(self) -> str:
-        try:
-            socket.create_connection(("8.8.8.8", 53), timeout=0.2).close()
-            return "lan"
-        except Exception:
-            return "wifi"
+        return self.window.cached_network_icon
 
     def bluetooth_icon(self) -> str:
         return "bluetooth"
