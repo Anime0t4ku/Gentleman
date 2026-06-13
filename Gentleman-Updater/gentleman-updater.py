@@ -230,8 +230,50 @@ def make_executable(path):
     )
 
 
+def bring_window_to_front_once(hwnd):
+    if platform.system().lower() != "windows" or not hwnd:
+        return
+
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        hwnd = int(hwnd)
+        hwnd_topmost = -1
+        hwnd_notopmost = -2
+        swp_nosize = 0x0001
+        swp_nomove = 0x0002
+        swp_showwindow = 0x0040
+        flags = swp_nosize | swp_nomove | swp_showwindow
+
+        user32.ShowWindow(hwnd, 5)
+        user32.AllowSetForegroundWindow(-1)
+
+        current_thread = kernel32.GetCurrentThreadId()
+        foreground_hwnd = user32.GetForegroundWindow()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+        window_thread = user32.GetWindowThreadProcessId(hwnd, None)
+
+        if foreground_thread:
+            user32.AttachThreadInput(current_thread, foreground_thread, True)
+        user32.AttachThreadInput(current_thread, window_thread, True)
+
+        user32.SetWindowPos(hwnd, hwnd_topmost, 0, 0, 0, 0, flags)
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+        user32.SetActiveWindow(hwnd)
+        user32.SetFocus(hwnd)
+        user32.SetWindowPos(hwnd, hwnd_notopmost, 0, 0, 0, 0, flags)
+
+        user32.AttachThreadInput(current_thread, window_thread, False)
+        if foreground_thread:
+            user32.AttachThreadInput(current_thread, foreground_thread, False)
+    except Exception:
+        pass
+
+
 def bring_process_to_front(pid, timeout_ms=1800):
-    if platform.system().lower() != "windows":
+    if platform.system().lower() != "windows" or not pid:
         return
 
     try:
@@ -262,11 +304,7 @@ def bring_process_to_front(pid, timeout_ms=1800):
 
         hwnd = hwnd_holder["hwnd"]
         if hwnd:
-            try:
-                user32.ShowWindow(hwnd, 5)
-                user32.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
+            bring_window_to_front_once(hwnd)
             return
 
         time.sleep(0.1)
@@ -578,7 +616,9 @@ class UpdaterWindow(QWidget):
         self.controller_timer.timeout.connect(self.poll_controller)
         self.controller_timer.start(33)
 
-        QTimer.singleShot(120, self.request_initial_focus)
+        QTimer.singleShot(0, self.request_initial_focus)
+        QTimer.singleShot(150, self.request_initial_focus)
+        QTimer.singleShot(400, self.request_initial_focus)
 
         if self.auto_update_mode:
             self.append_log(f"{UPDATE_NOW_FILE} found. Starting automatic update check...")
@@ -737,15 +777,13 @@ class UpdaterWindow(QWidget):
         self.update()
 
     def request_initial_focus(self):
+        self.showNormal()
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
         if platform.system().lower() == "windows":
-            try:
-                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
-            except Exception:
-                pass
+            bring_window_to_front_once(int(self.winId()))
 
     def keyPressEvent(self, event: QKeyEvent):
         self.active_input = "keyboard"
