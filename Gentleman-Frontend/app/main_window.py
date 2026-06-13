@@ -428,6 +428,9 @@ class GentlemanWindow(QMainWindow):
         self.emulator_launchers: dict[str, list[MenuItem]] = {}
         self.emulator_paths: dict[str, str] = {}
         self.current_emulator: str | None = None
+        self.game_system_items: list[str] = []
+        self.game_system_launchers: dict[str, list[MenuItem]] = {}
+        self.current_game_system: str | None = None
         self.recent_items: list[dict] = []
         self.favorite_items: list[dict] = []
         self.favorite_item_keys: set[tuple[str, str]] = set()
@@ -533,6 +536,7 @@ class GentlemanWindow(QMainWindow):
             "wallpaper_folder": "",
             "fullscreen_at_launch": False,
             "show_emulators_menu": True,
+            "show_systems_menu": False,
             "show_recent_menu": True,
             "show_favorites_menu": True,
             "show_logo": True,
@@ -738,6 +742,9 @@ class GentlemanWindow(QMainWindow):
     def emulators_menu_enabled(self) -> bool:
         return bool(self.settings.get("show_emulators_menu", True))
 
+    def systems_menu_enabled(self) -> bool:
+        return bool(self.settings.get("show_systems_menu", False))
+
     def recent_menu_enabled(self) -> bool:
         return bool(self.settings.get("show_recent_menu", True))
 
@@ -935,6 +942,35 @@ class GentlemanWindow(QMainWindow):
 
     def update_recent_items(self):
         self.recent_items = self.load_recent_items()
+
+    def update_game_system_items(self):
+        systems: dict[str, list[MenuItem]] = {}
+
+        for launcher_path in self.menu_root.rglob("*.json"):
+            try:
+                launcher = load_launcher(launcher_path)
+            except Exception:
+                continue
+
+            system_name = launcher.system.strip()
+            if not system_name:
+                continue
+
+            try:
+                rel_path = launcher_path.relative_to(self.menu_root)
+            except ValueError:
+                rel_path = launcher_path
+
+            launcher_item = MenuItem(rel_path.stem, launcher_path, "launcher")
+            systems.setdefault(system_name, []).append(launcher_item)
+
+        self.game_system_items = []
+        self.game_system_launchers = {}
+
+        for system_name in sorted(systems.keys(), key=str.lower):
+            launchers = sorted(systems[system_name], key=lambda item: item.name.lower())
+            self.game_system_items.append(system_name)
+            self.game_system_launchers[system_name] = launchers
 
     def update_emulator_items(self):
         emulators: dict[str, list[MenuItem]] = {}
@@ -1428,6 +1464,11 @@ class GentlemanWindow(QMainWindow):
             self.emulators_menu_enabled(),
         )
 
+        systems_menu_label = self.setting_state_label(
+            "Systems Menu",
+            self.systems_menu_enabled(),
+        )
+
         recent_menu_label = self.setting_state_label(
             "Recent Menu",
             self.recent_menu_enabled(),
@@ -1476,6 +1517,7 @@ class GentlemanWindow(QMainWindow):
         self.settings_items = [
             fullscreen_launch_label,
             "Menu Size",
+            systems_menu_label,
             emulators_menu_label,
             recent_menu_label,
             favorites_menu_label,
@@ -1491,12 +1533,12 @@ class GentlemanWindow(QMainWindow):
         ]
 
     def launcher_type_values(self) -> list[str]:
-        return ["Standalone Emulator", "RetroArch", "Application", "Shortcut", "Shortcut Folder"]
+        return ["Standalone Emulator", "RetroArch", "Application", "PC Game", "Shortcut", "Shortcut Folder"]
 
     def launcher_type_to_json(self, type_name: str) -> str:
         if type_name == "RetroArch":
             return "retroarch"
-        if type_name == "Application":
+        if type_name in ("Application", "PC Game"):
             return "application"
         if type_name == "Shortcut":
             return "shortcut"
@@ -1546,10 +1588,10 @@ class GentlemanWindow(QMainWindow):
         if self.launcher_form_data.get("folder") == "__new__":
             fields.append("New Folder Name")
 
-        if launcher_type == "Application":
+        if launcher_type in ("Application", "PC Game"):
             fields.extend([
-                "Application Name",
-                "App Path",
+                "Application Name" if launcher_type == "Application" else "Game Name",
+                "App Path" if launcher_type == "Application" else "Game Path",
                 "Arguments",
                 "Save",
                 "Cancel",
@@ -1623,8 +1665,13 @@ class GentlemanWindow(QMainWindow):
             }
             if launcher_type == "RetroArch":
                 self.launcher_form_data["emulator_name"] = "RetroArch"
+            if launcher_type == "Application" and self.launcher_form_data.get("system") == "PC":
+                launcher_type = "PC Game"
+                self.launcher_form_data["type"] = "PC Game"
             if launcher_type == "Application":
                 self.launcher_form_data["system"] = "Application"
+            elif launcher_type == "PC Game":
+                self.launcher_form_data["system"] = "PC"
         else:
             self.launcher_form_data = {
                 "launcher_name": "",
@@ -1649,7 +1696,7 @@ class GentlemanWindow(QMainWindow):
     def default_arguments_for_type(self, type_name: str) -> str:
         if type_name == "RetroArch":
             return '-L "{core}" "{rom}"'
-        if type_name in ("Application", "Shortcut", "Shortcut Folder"):
+        if type_name in ("Application", "PC Game", "Shortcut", "Shortcut Folder"):
             return ""
         return '"{rom}"'
 
@@ -1667,7 +1714,11 @@ class GentlemanWindow(QMainWindow):
 
         if type_name == "Application":
             self.launcher_form_data["system"] = "Application"
+        elif type_name == "PC Game":
+            self.launcher_form_data["system"] = "PC"
         elif old_type == "Application" and self.launcher_form_data.get("system") == "Application":
+            self.launcher_form_data["system"] = ""
+        elif old_type == "PC Game" and self.launcher_form_data.get("system") == "PC":
             self.launcher_form_data["system"] = ""
 
         if not current_args or current_args == old_default:
@@ -1682,7 +1733,7 @@ class GentlemanWindow(QMainWindow):
             return self.launcher_form_data.get("new_folder", "")
         if field == "Emulator Name":
             return self.launcher_form_data.get("emulator_name", "")
-        if field == "Application Name":
+        if field in ("Application Name", "Game Name"):
             return self.launcher_form_data.get("emulator_name", "")
         if field == "System":
             return self.launcher_form_data.get("system", "") or "Custom / Unknown"
@@ -1690,7 +1741,7 @@ class GentlemanWindow(QMainWindow):
             return self.launcher_form_data.get("type", "Standalone Emulator")
         if field == "Emulator Path":
             return self.launcher_form_data.get("emulator", "")
-        if field == "App Path":
+        if field in ("App Path", "Game Path"):
             return self.launcher_form_data.get("emulator", "")
         if field == "Shortcut Path":
             return self.launcher_form_data.get("emulator", "")
@@ -1852,6 +1903,7 @@ class GentlemanWindow(QMainWindow):
             "New Folder Name": "new_folder",
             "Emulator Name": "emulator_name",
             "Application Name": "emulator_name",
+            "Game Name": "emulator_name",
             "Extensions": "extensions",
             "Arguments": "arguments",
         }
@@ -1862,13 +1914,17 @@ class GentlemanWindow(QMainWindow):
             if field == "Arguments":
                 launcher_type = self.launcher_form_data.get("type", "Standalone Emulator")
                 if launcher_type == "Application": prompt = "Optional application arguments. Usually empty."
+                elif launcher_type == "PC Game": prompt = "Optional PC game arguments. Usually empty."
                 elif launcher_type == "RetroArch": prompt = 'Arguments. Use {core} and {rom}, for example: -L "{core}" "{rom}"'
                 else: prompt = 'Arguments. Use {rom} for the selected game, for example: -fullscreen "{rom}"'
             self.open_text_input(field, prompt, self.launcher_form_data.get(key, ""), lambda value, k=key: self.launcher_form_data.__setitem__(k, value.strip()))
             return
-        if field in ("Emulator Path", "App Path", "Shortcut Path"):
+        if field in ("Emulator Path", "App Path", "Game Path", "Shortcut Path"):
             if field == "App Path":
                 title = "Select application"
+                extensions = ['.exe']
+            elif field == "Game Path":
+                title = "Select PC game"
                 extensions = ['.exe']
             elif field == "Shortcut Path":
                 title = "Select Windows shortcut"
@@ -1907,17 +1963,25 @@ class GentlemanWindow(QMainWindow):
 
         if launcher_type == "Application":
             data["system"] = "Application"
+        elif launcher_type == "PC Game":
+            data["system"] = "PC"
 
         if not launcher_name:
             self.show_message("Missing launcher name", "Enter a launcher name.")
             return
 
-        if launcher_type == "Application":
+        if launcher_type in ("Application", "PC Game"):
             if not emulator_name:
-                self.show_message("Missing application name", "Enter an application name.")
+                if launcher_type == "PC Game":
+                    self.show_message("Missing game name", "Enter a game name.")
+                else:
+                    self.show_message("Missing application name", "Enter an application name.")
                 return
             if not emulator:
-                self.show_message("Missing application", "Select an application path.")
+                if launcher_type == "PC Game":
+                    self.show_message("Missing game", "Select a PC game path.")
+                else:
+                    self.show_message("Missing application", "Select an application path.")
                 return
         elif launcher_type == "Shortcut":
             if not emulator:
@@ -1992,11 +2056,11 @@ class GentlemanWindow(QMainWindow):
             output = {
                 "type": json_type,
                 "emulator_name": emulator_name,
-                "system": "Application" if launcher_type == "Application" else data.get("system", ""),
+                "system": "Application" if launcher_type == "Application" else ("PC" if launcher_type == "PC Game" else data.get("system", "")),
                 "emulator": emulator,
-                "rom_directory": "" if launcher_type == "Application" else rom_directory,
-                "extensions": [] if launcher_type == "Application" else extensions,
-                "arguments": data.get("arguments", "").strip() if launcher_type == "Application" else data.get("arguments", "").strip() or '"{rom}"',
+                "rom_directory": "" if launcher_type in ("Application", "PC Game") else rom_directory,
+                "extensions": [] if launcher_type in ("Application", "PC Game") else extensions,
+                "arguments": data.get("arguments", "").strip() if launcher_type in ("Application", "PC Game") else data.get("arguments", "").strip() or '"{rom}"',
                 "recursive": True,
             }
 
@@ -2019,8 +2083,8 @@ class GentlemanWindow(QMainWindow):
             self.selected_index = 0
             self.view.update()
 
-    def show_message(self, title: str, message: str, on_close=None):
-        self.overlay = {"type": "message", "title": title, "message": message, "selected": 0, "on_close": on_close}
+    def show_message(self, title: str, message: str, on_close=None, scrollable: bool = False):
+        self.overlay = {"type": "message", "title": title, "message": message, "selected": 0, "on_close": on_close, "scrollable": scrollable, "scroll_offset": 0}
         self.view.update()
 
     def show_confirmation(self, title: str, message: str, on_yes):
@@ -2298,6 +2362,10 @@ class GentlemanWindow(QMainWindow):
             return "Favorites"
         if self.mode == "recent":
             return "Recent"
+        if self.mode == "systems":
+            return "Systems"
+        if self.mode == "system_launchers":
+            return self.current_game_system or "Systems"
         if self.mode == "emulators":
             return "Emulators"
         if self.mode == "emulator_launchers":
@@ -2350,6 +2418,12 @@ class GentlemanWindow(QMainWindow):
             return len(self.favorite_items) + 1
         if self.mode == "recent":
             return len(self.recent_items) + 1
+        if self.mode == "systems":
+            return len(self.game_system_items) + 1
+        if self.mode == "system_launchers":
+            if not self.current_game_system:
+                return 1
+            return len(self.game_system_launchers.get(self.current_game_system, [])) + 1
         if self.mode == "emulators":
             return len(self.emulator_items) + 1
         if self.mode == "emulator_launchers":
@@ -2362,8 +2436,9 @@ class GentlemanWindow(QMainWindow):
         back_count = 1 if self.current_folder != self.menu_root else 0
         favorites_count = 1 if self.current_folder == self.menu_root and self.favorites_menu_enabled() else 0
         recent_count = 1 if self.current_folder == self.menu_root and self.recent_menu_enabled() else 0
+        systems_count = 1 if self.current_folder == self.menu_root and self.systems_menu_enabled() else 0
         emulator_count = 1 if self.current_folder == self.menu_root and self.emulators_menu_enabled() else 0
-        return len(self.menu_items) + back_count + favorites_count + recent_count + emulator_count
+        return len(self.menu_items) + back_count + favorites_count + recent_count + systems_count + emulator_count
 
     def first_real_list_index(self) -> int:
         labels = self.current_labels()
@@ -2432,6 +2507,11 @@ class GentlemanWindow(QMainWindow):
             return [("...", "<DIR>")] + [(self.display_name_for_saved_game_item(item), "") for item in self.favorite_items]
         if self.mode == "recent":
             return [("...", "<DIR>")] + [(self.display_name_for_saved_game_item(item), "") for item in self.recent_items]
+        if self.mode == "systems":
+            return [("...", "<DIR>")] + [(name, "") for name in self.game_system_items]
+        if self.mode == "system_launchers":
+            launchers = self.game_system_launchers.get(self.current_game_system or "", [])
+            return [("...", "<DIR>")] + [(item.name, "<DIR>") for item in launchers]
         if self.mode == "emulators":
             return [("...", "<DIR>")] + [(name, "") for name in self.emulator_items]
         if self.mode == "emulator_launchers":
@@ -2445,6 +2525,8 @@ class GentlemanWindow(QMainWindow):
             labels.append(("Favorites", "<DIR>"))
         if self.current_folder == self.menu_root and self.recent_menu_enabled():
             labels.append(("Recent", "<DIR>"))
+        if self.current_folder == self.menu_root and self.systems_menu_enabled():
+            labels.append(("Systems", "<DIR>"))
         if self.current_folder == self.menu_root and self.emulators_menu_enabled():
             labels.append(("Emulators", "<DIR>"))
 
@@ -2460,10 +2542,12 @@ class GentlemanWindow(QMainWindow):
         self.current_launcher = None
         self.current_rom_folder = None
         self.current_emulator = None
+        self.current_game_system = None
         self.clear_rom_items()
         self.menu_items = scan_menu_folder(self.current_folder)
         self.update_favorite_items()
         self.update_recent_items()
+        self.update_game_system_items()
         self.update_emulator_items()
         self.reset_selection_to_first_real_entry()
         self.view.update()
@@ -2568,6 +2652,19 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "recent":
             self.mode = "menu"
             self.selected_index = 0
+            self.view.update()
+            return
+
+        if self.mode == "systems":
+            self.mode = "menu"
+            self.selected_index = 0
+            self.view.update()
+            return
+
+        if self.mode == "system_launchers":
+            self.mode = "systems"
+            self.current_game_system = None
+            self.reset_selection_to_first_real_entry()
             self.view.update()
             return
 
@@ -2694,6 +2791,30 @@ class GentlemanWindow(QMainWindow):
             self.launch_recent_item(self.recent_items[recent_index])
             return
 
+        if self.mode == "systems":
+            if self.selected_index == 0:
+                self.go_back()
+                return
+
+            self.current_game_system = self.game_system_items[self.selected_index - 1]
+            self.mode = "system_launchers"
+            self.reset_selection_to_first_real_entry()
+            self.view.update()
+            return
+
+        if self.mode == "system_launchers":
+            if self.selected_index == 0:
+                self.go_back()
+                return
+
+            launchers = self.game_system_launchers.get(self.current_game_system or "", [])
+            if self.selected_index - 1 >= len(launchers):
+                return
+
+            item = launchers[self.selected_index - 1]
+            self.open_launcher_item(item)
+            return
+
         if self.mode == "emulators":
             if self.selected_index == 0:
                 self.go_back()
@@ -2781,6 +2902,15 @@ class GentlemanWindow(QMainWindow):
                 if menu_index == 0:
                     self.update_recent_items()
                     self.mode = "recent"
+                    self.reset_selection_to_first_real_entry()
+                    self.view.update()
+                    return
+                menu_index -= 1
+
+            if self.systems_menu_enabled():
+                if menu_index == 0:
+                    self.update_game_system_items()
+                    self.mode = "systems"
                     self.reset_selection_to_first_real_entry()
                     self.view.update()
                     return
@@ -2929,17 +3059,23 @@ class GentlemanWindow(QMainWindow):
     def on_update_check_result(self, info):
         show_no_update = getattr(self.update_check_worker, "show_no_update", True)
         if info.update_available:
-            if gentleman_updater_available():
-                update_action=self._run_gentleman_updater; update_label="Run Updater"
-            else:
-                update_action=lambda: open_release_page(info.release_url); update_label="Download"
-            self.show_choice(
-                "Update Available",
-                f"{info.release_name}\n\nA new version of Gentleman is available.",
-                [("Later", None), ("Changelog", lambda: self.show_update_changelog(info)), (update_label, update_action)],
-            )
+            self.show_update_available_choice(info)
         elif show_no_update:
             self.show_message("No Update Available", f"You are already running the latest version.\n\nCurrent version: {info.current_version}")
+
+    def show_update_available_choice(self, info):
+        if gentleman_updater_available():
+            update_action = self._run_gentleman_updater
+            update_label = "Run Updater"
+        else:
+            update_action = lambda: open_release_page(info.release_url)
+            update_label = "Download"
+
+        self.show_choice(
+            "Update Available",
+            f"{info.release_name}\n\nA new version of Gentleman is available.",
+            [("Later", None), ("Release Notes", lambda: self.show_update_changelog(info)), (update_label, update_action)],
+        )
 
     def _run_gentleman_updater(self):
         if launch_gentleman_updater(): QApplication.quit()
@@ -2947,8 +3083,11 @@ class GentlemanWindow(QMainWindow):
 
     def show_update_changelog(self, info):
         release_body = getattr(info, "release_body", "") or ""
-        if release_body.strip(): self.show_message(info.release_name, release_body)
-        else: open_release_page(info.release_url)
+        if release_body.strip():
+            self.show_message(info.release_name, release_body, on_close=lambda: self.show_update_available_choice(info), scrollable=True)
+        else:
+            open_release_page(info.release_url)
+            self.show_update_available_choice(info)
 
     def on_update_check_error(self, message: str):
         if getattr(self.update_check_worker, "show_errors", True):
@@ -2985,6 +3124,9 @@ class GentlemanWindow(QMainWindow):
             self.selected_index = sizes.index(current) if current in sizes else 0
             self.view.scroll_offset = 0
             self.view.update()
+        elif item.startswith("Systems Menu:"):
+            self.settings["show_systems_menu"] = not self.systems_menu_enabled()
+            self.refresh_settings_menu()
         elif item.startswith("Emulators Menu:"):
             self.settings["show_emulators_menu"] = not self.emulators_menu_enabled()
             self.refresh_settings_menu()
@@ -3544,6 +3686,9 @@ class GentlemanWindow(QMainWindow):
             if self.overlay.get("type") == "choice" and action in ("left", "right"):
                 count=len(self.overlay.get("buttons", []))
                 if count: self.overlay["selected"]=(self.overlay.get("selected",0)+(-1 if action=="left" else 1))%count; self.view.update()
+            elif self.overlay.get("scrollable") and action in ("up", "down"):
+                self.overlay["scroll_offset"] = max(0, self.overlay.get("scroll_offset", 0) + (-48 if action == "up" else 48))
+                self.view.update()
             return
         if self.mode == "text_input":
             dx = -1 if action == "left" else 1 if action == "right" else 0
@@ -3860,6 +4005,9 @@ class GentlemanWindow(QMainWindow):
             if self.overlay.get("type") == "choice" and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
                 count=len(self.overlay.get("buttons", [])); delta=-1 if key in (Qt.Key.Key_Left,Qt.Key.Key_A) else 1
                 if count: self.overlay["selected"]=(self.overlay.get("selected",0)+delta)%count
+            elif self.overlay.get("scrollable") and key in (Qt.Key.Key_Up, Qt.Key.Key_W, Qt.Key.Key_Down, Qt.Key.Key_S):
+                delta = -48 if key in (Qt.Key.Key_Up, Qt.Key.Key_W) else 48
+                self.overlay["scroll_offset"] = max(0, self.overlay.get("scroll_offset", 0) + delta)
             elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space): self.activate_overlay()
             elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace): self.close_overlay()
             self.view.update(); return
@@ -4179,23 +4327,28 @@ class GentlemanView(QWidget):
     def draw_overlay(self, painter):
         ov = self.window.overlay
         labels = ["OK"] if ov.get("type") == "message" else [item[0] for item in ov.get("buttons", [])]
-        box_width = min(760, self.width() - 100)
+        box_width = min(820, self.width() - 80)
         content_width = box_width - 72
 
         painter.setFont(self.title_font)
         title_height = painter.fontMetrics().height()
         painter.setFont(self.font)
-        message_bounds = painter.boundingRect(
-            QRect(0, 0, content_width, max(160, self.height() - 220)),
-            Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter,
-            ov.get("message", ""),
-        )
-        message_height = max(painter.fontMetrics().height(), message_bounds.height())
         guide_height = painter.fontMetrics().height()
         button_rows = max(1, (len(labels) + 2) // 3)
         button_area_height = button_rows * 44
-        box_height = 22 + title_height + 18 + message_height + 20 + button_area_height + 12 + guide_height + 18
-        box_height = min(max(300, box_height), self.height() - 80)
+
+        if ov.get("scrollable"):
+            box_height = min(max(420, self.height() - 100), self.height() - 60)
+        else:
+            message_bounds = painter.boundingRect(
+                QRect(0, 0, content_width, max(160, self.height() - 220)),
+                Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter,
+                ov.get("message", ""),
+            )
+            message_height = max(painter.fontMetrics().height(), message_bounds.height())
+            box_height = 22 + title_height + 18 + message_height + 20 + button_area_height + 12 + guide_height + 18
+            box_height = min(max(300, box_height), self.height() - 80)
+
         box = QRect(
             self.width() // 2 - box_width // 2,
             self.height() // 2 - box_height // 2,
@@ -4223,15 +4376,41 @@ class GentlemanView(QWidget):
             box.width() - 72,
             max(40, button_area_top - title_rect.bottom() - 28),
         )
-        painter.drawText(
-            message_rect,
-            Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-            ov.get("message", ""),
-        )
+
+        message = ov.get("message", "")
+        if ov.get("scrollable"):
+            full_bounds = painter.boundingRect(
+                QRect(0, 0, message_rect.width(), 100000),
+                Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                message,
+            )
+            max_scroll = max(0, full_bounds.height() - message_rect.height() + 12)
+            scroll_offset = min(max(0, ov.get("scroll_offset", 0)), max_scroll)
+            ov["scroll_offset"] = scroll_offset
+            painter.save()
+            painter.setClipRect(message_rect)
+            draw_rect = QRect(message_rect.x(), message_rect.y() - scroll_offset, message_rect.width(), full_bounds.height() + 12)
+            painter.drawText(draw_rect, Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, message)
+            painter.restore()
+            if max_scroll > 0:
+                scroll_track = QRect(message_rect.right() + 8, message_rect.y(), 4, message_rect.height())
+                thumb_height = max(28, int(message_rect.height() * (message_rect.height() / (full_bounds.height() + 1))))
+                thumb_y = scroll_track.y() + int((scroll_track.height() - thumb_height) * (scroll_offset / max_scroll)) if max_scroll else scroll_track.y()
+                painter.setPen(self.light)
+                painter.drawRect(scroll_track)
+                painter.fillRect(QRect(scroll_track.x(), thumb_y, scroll_track.width(), thumb_height), self.light)
+        else:
+            painter.drawText(
+                message_rect,
+                Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                message,
+            )
 
         columns = min(3, max(1, len(labels)))
         gap = 12
-        button_w = min(190, (box.width() - 72 - gap * (columns - 1)) // columns)
+        available_width = box.width() - 72 - gap * (columns - 1)
+        label_width = max((painter.fontMetrics().horizontalAdvance(label) for label in labels), default=0)
+        button_w = min(240, max(140, label_width + 52, available_width // columns))
         row_width = columns * button_w + gap * (columns - 1)
         start_x = box.center().x() - row_width // 2
         for i, label in enumerate(labels):
@@ -4247,7 +4426,10 @@ class GentlemanView(QWidget):
             painter.drawText(r, Qt.AlignmentFlag.AlignCenter, label)
 
         painter.setPen(self.text)
-        painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, "D-pad Select   A Confirm   B Back")
+        guide = "D-pad Select   A Confirm   B Back"
+        if ov.get("scrollable"):
+            guide = "Up/Down Scroll   A Close   B Back"
+        painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, guide)
 
     def display_text_key(self, key: str) -> str:
         if len(key) != 1 or self.window.text_input_symbols:
