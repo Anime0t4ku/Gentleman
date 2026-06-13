@@ -1,3 +1,4 @@
+import ctypes
 import json
 import math
 import os
@@ -411,6 +412,48 @@ class UpdateWorker(QThread):
                     shutil.copyfileobj(source, target)
 
 
+XINPUT_GAMEPAD_DPAD_UP = 0x0001
+XINPUT_GAMEPAD_DPAD_DOWN = 0x0002
+XINPUT_GAMEPAD_DPAD_LEFT = 0x0004
+XINPUT_GAMEPAD_DPAD_RIGHT = 0x0008
+XINPUT_GAMEPAD_START = 0x0010
+XINPUT_GAMEPAD_BACK = 0x0020
+XINPUT_GAMEPAD_A = 0x1000
+XINPUT_GAMEPAD_B = 0x2000
+
+
+class XINPUT_GAMEPAD(ctypes.Structure):
+    _fields_ = [
+        ("wButtons", ctypes.c_ushort),
+        ("bLeftTrigger", ctypes.c_ubyte),
+        ("bRightTrigger", ctypes.c_ubyte),
+        ("sThumbLX", ctypes.c_short),
+        ("sThumbLY", ctypes.c_short),
+        ("sThumbRX", ctypes.c_short),
+        ("sThumbRY", ctypes.c_short),
+    ]
+
+
+class XINPUT_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwPacketNumber", ctypes.c_ulong),
+        ("Gamepad", XINPUT_GAMEPAD),
+    ]
+
+
+def load_xinput():
+    if platform.system().lower() != "windows":
+        return None
+
+    for dll_name in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+        try:
+            return ctypes.windll.LoadLibrary(dll_name)
+        except Exception:
+            continue
+
+    return None
+
+
 class UpdaterWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -426,8 +469,12 @@ class UpdaterWindow(QWidget):
         self.selected_index = 0
         self.overlay = None
         self.active_input = "controller"
-        self.static_noise = QPixmap()
-        self.static_noise_frame = 0
+
+        self.xinput = load_xinput()
+        self.xinput_index = None
+        self.xinput_button_state = {}
+        self.xinput_repeat_action = None
+        self.xinput_repeat_next_ms = 0
 
         self.controller_available = False
         self.controller = None
@@ -448,6 +495,7 @@ class UpdaterWindow(QWidget):
             self.platform_name = self.platform_info["name"]
 
         self.setWindowTitle(APP_NAME)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setMinimumSize(780, 520)
         self.resize(960, 640)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -673,56 +721,22 @@ class UpdaterWindow(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.fillRect(self.rect(), self.bg)
-        self.draw_static_noise(painter)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 70))
         self.draw_top_bar(painter)
         self.draw_panel(painter)
         if self.overlay:
             self.draw_overlay(painter)
 
     def draw_static_noise(self, painter):
-        noise_w = 220
-        noise_h = 124
-        data = bytearray(os.urandom(noise_w * noise_h))
-        for index, value in enumerate(data):
-            data[index] = 55 + (value % 120)
-
-        image = QImage(
-            bytes(data),
-            noise_w,
-            noise_h,
-            noise_w,
-            QImage.Format.Format_Grayscale8,
-        )
-        self.static_noise = QPixmap.fromImage(image.copy())
-        self.static_noise_frame += 1
-
-        overscan = 8
-        target_w = max(1, self.width() + overscan * 2)
-        target_h = max(1, self.height() + overscan * 2)
-        scaled = self.static_noise.scaled(
-            target_w,
-            target_h,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        painter.drawPixmap(-overscan, -overscan, scaled)
-        painter.fillRect(self.rect(), QColor(30, 0, 10, 65))
+        return
 
     def draw_top_bar(self, painter):
         bar = self.top_bar_rect()
         painter.fillRect(bar, self.light)
         painter.setFont(self.title_font)
         painter.setPen(self.dark_text)
-        painter.drawText(bar.x() + 18, bar.y() + 31, "Gentleman")
-
-        painter.setFont(self.small_font)
-        input_text = "GAMEPAD" if self.active_input == "controller" else "KEYBOARD"
-        status_text = f"UPDATER   {input_text}"
-        painter.drawText(bar.x() + 190, bar.y() + 29, status_text)
+        painter.drawText(bar.x() + 18, bar.y() + 31, "Gentleman Updater")
 
         time_text = datetime.now().strftime("%H:%M")
-        painter.setFont(self.title_font)
         time_width = painter.fontMetrics().horizontalAdvance(time_text)
         painter.drawText(bar.right() - 18 - time_width, bar.y() + 31, time_text)
 
@@ -976,7 +990,7 @@ class UpdaterWindow(QWidget):
             return True
         if any(x != 0 or y != 0 for x, y in hats):
             return True
-        return any(abs(value) > 0.55 for value in axes.values())
+        return abs(axes.get(0, 0.0)) > 0.55 or abs(axes.get(1, 0.0)) > 0.55
 
     def controller_direction_state(self, buttons, axes, hats):
         state = {"up": False, "down": False, "left": False, "right": False}
@@ -1051,7 +1065,102 @@ class UpdaterWindow(QWidget):
             self.controller_repeat_next_ms = now + 90
             self.move_selection(-1 if action == "up" else 1)
 
+    def read_xinput_state(self):
+        if self.xinput is None:
+            return None
+
+        for index in range(4):
+            state = XINPUT_STATE()
+            try:
+                result = self.xinput.XInputGetState(index, ctypes.byref(state))
+            except Exception:
+                return None
+
+            if result == 0:
+                self.xinput_index = index
+                return state
+
+        self.xinput_index = None
+        self.xinput_button_state.clear()
+        self.xinput_repeat_action = None
+        self.xinput_repeat_next_ms = 0
+        return None
+
+    def xinput_direction_state(self, state):
+        gamepad = state.Gamepad
+        buttons = gamepad.wButtons
+        directions = {
+            "up": bool(buttons & XINPUT_GAMEPAD_DPAD_UP),
+            "down": bool(buttons & XINPUT_GAMEPAD_DPAD_DOWN),
+            "left": bool(buttons & XINPUT_GAMEPAD_DPAD_LEFT),
+            "right": bool(buttons & XINPUT_GAMEPAD_DPAD_RIGHT),
+        }
+
+        deadzone = 9000
+        if gamepad.sThumbLX < -deadzone:
+            directions["left"] = True
+        elif gamepad.sThumbLX > deadzone:
+            directions["right"] = True
+
+        if gamepad.sThumbLY > deadzone:
+            directions["up"] = True
+        elif gamepad.sThumbLY < -deadzone:
+            directions["down"] = True
+
+        return directions
+
+    def xinput_buttons(self, state):
+        buttons = state.Gamepad.wButtons
+        return {
+            "accept": bool(buttons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START)),
+            "back": bool(buttons & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_BACK)),
+        }
+
+    def poll_xinput_controller(self):
+        state = self.read_xinput_state()
+        if state is None:
+            return False
+
+        self.controller_available = True
+        self.active_input = "controller"
+
+        directions = self.xinput_direction_state(state)
+        active_actions = self.controller_active_actions(directions)
+
+        now = int(time.monotonic() * 1000)
+        if not active_actions:
+            self.xinput_repeat_action = None
+            self.xinput_repeat_next_ms = 0
+        else:
+            action = active_actions[0]
+            if action != self.xinput_repeat_action:
+                self.xinput_repeat_action = action
+                self.xinput_repeat_next_ms = now + 350
+                self.move_selection(-1 if action == "up" else 1)
+            elif now >= self.xinput_repeat_next_ms:
+                self.xinput_repeat_next_ms = now + 90
+                self.move_selection(-1 if action == "up" else 1)
+
+        buttons = self.xinput_buttons(state)
+        for name, pressed in buttons.items():
+            previous = self.xinput_button_state.get(name, False)
+            if pressed and not previous:
+                if name == "accept":
+                    self.activate_selected()
+                elif name == "back" and self.update_state != UpdateState.RUNNING:
+                    if self.overlay and self.update_state == UpdateState.IDLE:
+                        self.close_overlay()
+                    else:
+                        QApplication.quit()
+            self.xinput_button_state[name] = pressed
+
+        return True
+
     def poll_controller(self):
+        xinput_handled = self.poll_xinput_controller()
+        if xinput_handled:
+            return
+
         if pygame is None:
             return
 
