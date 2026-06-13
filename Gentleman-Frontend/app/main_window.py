@@ -565,6 +565,58 @@ class GentlemanWindow(QMainWindow):
     def favorites_menu_enabled(self) -> bool:
         return bool(self.settings.get("show_favorites_menu", True))
 
+    def item_identity_key(self, item: dict) -> tuple[str, str]:
+        launcher = str(item.get("launcher", "")).replace(chr(92), "/").strip().lower()
+        rom = str(item.get("rom", "")).replace(chr(92), "/").strip().lower()
+
+        try:
+            rom = str(Path(rom).resolve()).replace(chr(92), "/").lower()
+        except Exception:
+            pass
+
+        return launcher, rom
+
+    def dedupe_game_items(self, items: list[dict]) -> list[dict]:
+        deduped: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            key = self.item_identity_key(item)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            deduped.append(item)
+
+        return deduped
+
+    def display_name_for_saved_game_item(self, item: dict) -> str:
+        launcher_rel = str(item.get("launcher", ""))
+        rom = Path(str(item.get("rom", "")))
+
+        try:
+            launcher_path = self.menu_root / launcher_rel
+            if launcher_path.exists():
+                launcher = load_launcher(launcher_path)
+                return self.display_name_for_rom(launcher, rom)
+        except Exception:
+            pass
+
+        stored_name = str(item.get("name", "")).strip()
+        if stored_name:
+            return Path(stored_name).stem
+
+        return rom.stem or "Unknown"
+
+    def sorted_favorite_items(self, items: list[dict]) -> list[dict]:
+        return sorted(
+            self.dedupe_game_items(items),
+            key=lambda item: self.display_name_for_saved_game_item(item).lower(),
+        )
+
     def load_favorite_items(self) -> list[dict]:
         if not self.favorites_path.exists():
             return []
@@ -572,14 +624,14 @@ class GentlemanWindow(QMainWindow):
         try:
             data = json.loads(self.favorites_path.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                return data
+                return self.sorted_favorite_items(data)
         except Exception:
             pass
 
         return []
 
     def save_favorite_items(self, items: list[dict]):
-        self.favorites_path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        self.favorites_path.write_text(json.dumps(self.sorted_favorite_items(items), indent=2), encoding="utf-8")
 
     def update_favorite_items(self):
         self.favorite_items = self.load_favorite_items()
@@ -621,7 +673,7 @@ class GentlemanWindow(QMainWindow):
             launcher_rel = str(self.current_launcher.path).replace(chr(92), "/")
 
         return {
-            "name": selected.path.name,
+            "name": self.display_name_for_rom(self.current_launcher, selected.path),
             "launcher": launcher_rel,
             "rom": str(selected.path).replace(chr(92), "/"),
         }
@@ -646,15 +698,16 @@ class GentlemanWindow(QMainWindow):
         favorites = self.load_favorite_items()
         updated = []
         removed = False
+        item_key = self.item_identity_key(item)
 
         for favorite in favorites:
-            if favorite.get("launcher") == item.get("launcher") and favorite.get("rom") == item.get("rom"):
+            if self.item_identity_key(favorite) == item_key:
                 removed = True
                 continue
             updated.append(favorite)
 
         if not removed:
-            updated.insert(0, item)
+            updated.append(item)
 
         self.save_favorite_items(updated)
         self.update_favorite_items()
@@ -667,14 +720,14 @@ class GentlemanWindow(QMainWindow):
         try:
             data = json.loads(self.recent_path.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                return data
+                return self.dedupe_game_items(data)
         except Exception:
             pass
 
         return []
 
     def save_recent_items(self, items: list[dict]):
-        self.recent_path.write_text(json.dumps(items[:50], indent=2), encoding="utf-8")
+        self.recent_path.write_text(json.dumps(self.dedupe_game_items(items)[:50], indent=2), encoding="utf-8")
 
     def add_recent_game(self, launcher_path: Path, rom_path: Path):
         try:
@@ -682,8 +735,14 @@ class GentlemanWindow(QMainWindow):
         except ValueError:
             launcher_rel = str(launcher_path).replace(chr(92), "/")
 
-        game_name = rom_path.name
         game_path = str(rom_path).replace(chr(92), "/")
+        game_name = rom_path.stem
+
+        try:
+            launcher = load_launcher(launcher_path)
+            game_name = self.display_name_for_rom(launcher, rom_path)
+        except Exception:
+            pass
 
         item = {
             "name": game_name,
@@ -691,13 +750,10 @@ class GentlemanWindow(QMainWindow):
             "rom": game_path,
         }
 
-        items = self.load_recent_items()
+        item_key = self.item_identity_key(item)
         items = [
-            existing for existing in items
-            if not (
-                existing.get("launcher") == item["launcher"]
-                and existing.get("rom") == item["rom"]
-            )
+            existing for existing in self.load_recent_items()
+            if self.item_identity_key(existing) != item_key
         ]
         items.insert(0, item)
         self.save_recent_items(items)
@@ -2010,6 +2066,16 @@ class GentlemanWindow(QMainWindow):
         emulator_count = 1 if self.current_folder == self.menu_root and self.emulators_menu_enabled() else 0
         return len(self.menu_items) + back_count + favorites_count + recent_count + emulator_count
 
+    def first_real_list_index(self) -> int:
+        labels = self.current_labels()
+        if len(labels) > 1 and labels[0][0] == "...":
+            return 1
+        return 0
+
+    def reset_selection_to_first_real_entry(self):
+        self.selected_index = self.first_real_list_index()
+        self.view.scroll_offset = 0
+
     def current_labels(self) -> list[tuple[str, str]]:
         if self.mode == "text_input": return []
         if self.mode == "file_browser":
@@ -2062,9 +2128,9 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "about":
             return [(line, "") for line in ABOUT_LINES]
         if self.mode == "favorites":
-            return [("...", "<DIR>")] + [(item.get("name", "Unknown"), "") for item in self.favorite_items]
+            return [("...", "<DIR>")] + [(self.display_name_for_saved_game_item(item), "") for item in self.favorite_items]
         if self.mode == "recent":
-            return [("...", "<DIR>")] + [(item.get("name", "Unknown"), "") for item in self.recent_items]
+            return [("...", "<DIR>")] + [(self.display_name_for_saved_game_item(item), "") for item in self.recent_items]
         if self.mode == "emulators":
             return [("...", "<DIR>")] + [(name, "") for name in self.emulator_items]
         if self.mode == "emulator_launchers":
@@ -2098,15 +2164,14 @@ class GentlemanWindow(QMainWindow):
         self.update_favorite_items()
         self.update_recent_items()
         self.update_emulator_items()
-        self.selected_index = min(self.selected_index, max(0, self.current_items_count() - 1))
+        self.reset_selection_to_first_real_entry()
         self.view.update()
 
     def open_edit_launcher_browser(self, folder: Path | None = None):
         self.current_edit_folder = folder or self.menu_root
         self.edit_launcher_items = scan_menu_folder(self.current_edit_folder)
         self.mode = "edit_launchers"
-        self.selected_index = 0
-        self.view.scroll_offset = 0
+        self.reset_selection_to_first_real_entry()
         self.view.update()
 
     def open_system_menu(self):
@@ -2214,7 +2279,7 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "emulator_launchers":
             self.mode = "emulators"
             self.current_emulator = None
-            self.selected_index = 0
+            self.reset_selection_to_first_real_entry()
             self.view.update()
             return
 
@@ -2226,8 +2291,7 @@ class GentlemanWindow(QMainWindow):
                 if current != rom_root and rom_root in current.parents:
                     self.current_rom_folder = self.current_rom_folder.parent
                     self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
-                    self.selected_index = 0
-                    self.view.scroll_offset = 0
+                    self.reset_selection_to_first_real_entry()
                     self.view.update()
                     return
 
@@ -2244,8 +2308,6 @@ class GentlemanWindow(QMainWindow):
             return
 
         self.current_folder = self.current_folder.parent
-        self.selected_index = 0
-        self.view.scroll_offset = 0
         self.refresh_menu()
 
     def activate_selected(self):
@@ -2379,8 +2441,7 @@ class GentlemanWindow(QMainWindow):
             if selected.is_dir:
                 self.current_rom_folder = selected.path
                 self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
-                self.selected_index = 0
-                self.view.scroll_offset = 0
+                self.reset_selection_to_first_real_entry()
                 self.view.update()
                 return
 
@@ -2406,8 +2467,7 @@ class GentlemanWindow(QMainWindow):
                 if menu_index == 0:
                     self.update_favorite_items()
                     self.mode = "favorites"
-                    self.selected_index = 0
-                    self.view.scroll_offset = 0
+                    self.reset_selection_to_first_real_entry()
                     self.view.update()
                     return
                 menu_index -= 1
@@ -2416,8 +2476,7 @@ class GentlemanWindow(QMainWindow):
                 if menu_index == 0:
                     self.update_recent_items()
                     self.mode = "recent"
-                    self.selected_index = 0
-                    self.view.scroll_offset = 0
+                    self.reset_selection_to_first_real_entry()
                     self.view.update()
                     return
                 menu_index -= 1
@@ -2426,8 +2485,7 @@ class GentlemanWindow(QMainWindow):
                 if menu_index == 0:
                     self.update_emulator_items()
                     self.mode = "emulators"
-                    self.selected_index = 0
-                    self.view.scroll_offset = 0
+                    self.reset_selection_to_first_real_entry()
                     self.view.update()
                     return
                 menu_index -= 1
@@ -2477,8 +2535,7 @@ class GentlemanWindow(QMainWindow):
             self.current_rom_folder = Path(self.current_launcher.rom_directory)
             self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
             self.mode = "roms"
-            self.selected_index = 0
-            self.view.scroll_offset = 0
+            self.reset_selection_to_first_real_entry()
             self.view.update()
         except Exception as exc:
             self.show_message("Launcher error", str(exc))
@@ -2622,6 +2679,8 @@ class GentlemanWindow(QMainWindow):
             self.settings["normalize_arcade_names"] = not self.arcade_name_normalization_enabled()
             if self.current_launcher and self.current_rom_folder:
                 self.rom_items = self.scan_launcher_folder(self.current_launcher, self.current_rom_folder)
+            self.update_recent_items()
+            self.update_favorite_items()
             self.refresh_settings_menu()
         elif item == "Clear Recent":
             self.clear_recent_items()
@@ -3176,6 +3235,124 @@ class GentlemanWindow(QMainWindow):
         elif action == "right":
             self.jump_selection(10)
 
+    def set_controller_active_input(self):
+        if self.active_input != "controller":
+            self.active_input = "controller"
+            self.view.update()
+
+    def set_keyboard_active_input(self):
+        if self.active_input != "keyboard":
+            self.active_input = "keyboard"
+            self.view.update()
+
+    def read_controller_buttons(self) -> dict[int, bool]:
+        buttons = {}
+        if self.controller is None:
+            return buttons
+
+        try:
+            for index in range(self.controller.get_numbuttons()):
+                buttons[index] = bool(self.controller.get_button(index))
+        except Exception:
+            return {}
+
+        return buttons
+
+    def read_controller_axes(self) -> dict[int, float]:
+        axes = {}
+        if self.controller is None:
+            return axes
+
+        try:
+            for index in range(self.controller.get_numaxes()):
+                axes[index] = float(self.controller.get_axis(index))
+        except Exception:
+            return {}
+
+        return axes
+
+    def read_controller_hats(self) -> list[tuple[int, int]]:
+        hats = []
+        if self.controller is None:
+            return hats
+
+        try:
+            for index in range(self.controller.get_numhats()):
+                hats.append(self.controller.get_hat(index))
+        except Exception:
+            return []
+
+        return hats
+
+    def controller_any_input_active(self, buttons: dict[int, bool], axes: dict[int, float], hats: list[tuple[int, int]]) -> bool:
+        if any(buttons.values()):
+            return True
+        if any(x != 0 or y != 0 for x, y in hats):
+            return True
+
+        # Only the main left-stick axes are treated as active input here.
+        # Many Bluetooth controllers expose trigger/rest axes as -1.0 or 1.0,
+        # which made the app immediately switch back to the gamepad icon after
+        # keyboard input even when the controller was untouched.
+        return abs(axes.get(0, 0.0)) > 0.5 or abs(axes.get(1, 0.0)) > 0.5
+
+    def controller_direction_state(self, buttons: dict[int, bool], axes: dict[int, float], hats: list[tuple[int, int]]) -> dict[str, bool]:
+        state = {"up": False, "down": False, "left": False, "right": False}
+
+        for hat_x, hat_y in hats:
+            if hat_y > 0:
+                state["up"] = True
+            elif hat_y < 0:
+                state["down"] = True
+
+            if hat_x < 0:
+                state["left"] = True
+            elif hat_x > 0:
+                state["right"] = True
+
+        if any(state.values()):
+            return state
+
+        dpad_button_sets = (
+            {"up": 11, "down": 12, "left": 13, "right": 14},
+            {"up": 13, "down": 14, "left": 11, "right": 12},
+            {"up": 12, "down": 13, "left": 14, "right": 15},
+        )
+        for mapping in dpad_button_sets:
+            mapped_state = {"up": False, "down": False, "left": False, "right": False}
+            for direction, button in mapping.items():
+                if buttons.get(button, False):
+                    mapped_state[direction] = True
+
+            if any(mapped_state.values()):
+                return mapped_state
+
+        value = axes.get(0, 0.0)
+        if value < -0.5:
+            state["left"] = True
+        elif value > 0.5:
+            state["right"] = True
+
+        value = axes.get(1, 0.0)
+        if value < -0.5:
+            state["up"] = True
+        elif value > 0.5:
+            state["down"] = True
+
+        return state
+
+    def controller_active_actions(self, directions: dict[str, bool]) -> list[str]:
+        active_actions = []
+        if directions.get("up"):
+            active_actions.append("up")
+        elif directions.get("down"):
+            active_actions.append("down")
+        elif directions.get("left"):
+            active_actions.append("left")
+        elif directions.get("right"):
+            active_actions.append("right")
+        return active_actions
+
     def handle_controller_repeat(self, active_actions: list[str]):
         now = int(time.monotonic() * 1000)
 
@@ -3207,9 +3384,17 @@ class GentlemanWindow(QMainWindow):
             return
 
         device_changed = False
+        controller_event_seen = False
         for event in events:
             if event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
                 device_changed = True
+            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION):
+                controller_event_seen = True
+            elif event.type == pygame.JOYAXISMOTION and abs(getattr(event, "value", 0.0)) > 0.5:
+                controller_event_seen = True
+
+        if controller_event_seen:
+            self.set_controller_active_input()
 
         if device_changed:
             self.controller = None
@@ -3221,6 +3406,20 @@ class GentlemanWindow(QMainWindow):
         if not self.controller_available or self.controller is None:
             return
 
+        try:
+            buttons = self.read_controller_buttons()
+            axes = self.read_controller_axes()
+            hats = self.read_controller_hats()
+            directions = self.controller_direction_state(buttons, axes, hats)
+
+            if self.controller_any_input_active(buttons, axes, hats):
+                self.set_controller_active_input()
+        except Exception:
+            self.controller = None
+            self.controller_available = False
+            self.refresh_controller(force=True)
+            return
+
         if self.input_suspended_for_launch:
             self.poll_ingame_osd_shortcuts()
             if not self.ingame_osd.isVisible():
@@ -3229,15 +3428,11 @@ class GentlemanWindow(QMainWindow):
             self.controller_repeat_next_ms = 0
             if self.ingame_osd.isVisible():
                 try:
-                    hat_y = self.controller.get_hat(0)[1] if self.controller.get_numhats() > 0 else 0
-                    axis_y = self.controller.get_axis(1) if self.controller.get_numaxes() > 1 else 0
-                    hat_x = self.controller.get_hat(0)[0] if self.controller.get_numhats() > 0 else 0
-                    axis_x = self.controller.get_axis(0) if self.controller.get_numaxes() > 0 else 0
-                    up = hat_y > 0 or axis_y < -0.5
-                    down = hat_y < 0 or axis_y > 0.5
-                    horizontal = hat_x != 0 or abs(axis_x) > 0.5
-                    accept = self.controller.get_button(0) if self.controller.get_numbuttons() > 0 else False
-                    back = self.controller.get_button(1) if self.controller.get_numbuttons() > 1 else False
+                    up = directions.get("up", False)
+                    down = directions.get("down", False)
+                    horizontal = directions.get("left", False) or directions.get("right", False)
+                    accept = buttons.get(0, False)
+                    back = buttons.get(1, False)
                     for key, pressed, callback in (
                         ("osd_up", up, lambda: self.ingame_osd.move_selection(-1)),
                         ("osd_down", down, lambda: self.ingame_osd.move_selection(1)),
@@ -3254,23 +3449,7 @@ class GentlemanWindow(QMainWindow):
             return
 
         try:
-            hat_x = 0
-            hat_y = 0
-            if self.controller.get_numhats() > 0:
-                hat_x, hat_y = self.controller.get_hat(0)
-
-            axis_x = self.controller.get_axis(0) if self.controller.get_numaxes() > 0 else 0
-            axis_y = self.controller.get_axis(1) if self.controller.get_numaxes() > 1 else 0
-
-            active_actions = []
-            if hat_y > 0 or axis_y < -0.5:
-                active_actions.append("up")
-            elif hat_y < 0 or axis_y > 0.5:
-                active_actions.append("down")
-            elif hat_x < 0 or axis_x < -0.5:
-                active_actions.append("left")
-            elif hat_x > 0 or axis_x > 0.5:
-                active_actions.append("right")
+            active_actions = self.controller_active_actions(directions)
 
             self.handle_controller_repeat(active_actions)
 
@@ -3298,16 +3477,17 @@ class GentlemanWindow(QMainWindow):
             }
 
             for button, callback in button_actions.items():
-                if button >= self.controller.get_numbuttons():
-                    continue
-
-                pressed = bool(self.controller.get_button(button))
+                pressed = buttons.get(button, False)
                 previous = self.controller_button_state.get(button, False)
 
                 if pressed and not previous:
                     callback()
 
                 self.controller_button_state[button] = pressed
+
+            for button, pressed in buttons.items():
+                if button not in button_actions:
+                    self.controller_button_state[button] = pressed
         except Exception:
             self.controller = None
             self.controller_available = False
@@ -3351,7 +3531,8 @@ class GentlemanWindow(QMainWindow):
 
     def keyPressEvent(self, event: QKeyEvent):
         if self.input_suspended_for_launch: self.resume_frontend_input_after_launch()
-        self.active_input = "keyboard"; key = event.key()
+        self.set_keyboard_active_input()
+        key = event.key()
         if self.overlay:
             if self.overlay.get("type") == "choice" and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
                 count=len(self.overlay.get("buttons", [])); delta=-1 if key in (Qt.Key.Key_Left,Qt.Key.Key_A) else 1
