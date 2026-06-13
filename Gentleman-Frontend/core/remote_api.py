@@ -70,6 +70,10 @@ class GentlemanApiServer:
                         self._send_json(app.api_games(launcher, folder))
                         return
 
+                    if parsed.path == "/api/launchers":
+                        self._send_json(app.api_launchers())
+                        return
+
                     if parsed.path == "/api/systems":
                         self._send_json(app.api_systems())
                         return

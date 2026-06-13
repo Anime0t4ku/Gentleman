@@ -430,6 +430,7 @@ class GentlemanWindow(QMainWindow):
         self.current_emulator: str | None = None
         self.game_system_items: list[str] = []
         self.game_system_launchers: dict[str, list[MenuItem]] = {}
+        self.game_system_games: dict[str, list[dict]] = {}
         self.current_game_system: str | None = None
         self.recent_items: list[dict] = []
         self.favorite_items: list[dict] = []
@@ -972,6 +973,100 @@ class GentlemanWindow(QMainWindow):
             self.game_system_items.append(system_name)
             self.game_system_launchers[system_name] = launchers
 
+    def scan_cached_rom_folder_sync(self, launcher: LauncherConfig, folder: Path) -> list[RomBrowserItem]:
+        cache_key = self.rom_cache_key(launcher, folder)
+        signature = self.rom_folder_signature(folder)
+        cached = self.rom_folder_cache.get(cache_key)
+
+        if cached and cached.get("signature") == signature:
+            items = cached.get("items", [])
+            if isinstance(items, list):
+                return items
+
+        items = self.scan_launcher_folder(launcher, folder)
+        self.rom_folder_cache[cache_key] = {
+            "signature": signature,
+            "items": items,
+            "scanned_at": time.monotonic(),
+        }
+        while len(self.rom_folder_cache) > 64:
+            self.rom_folder_cache.pop(next(iter(self.rom_folder_cache)))
+        return items
+
+    def collect_system_games_for_launcher(self, launcher_item: MenuItem) -> list[dict]:
+        try:
+            launcher = load_launcher(launcher_item.path)
+        except Exception:
+            return []
+
+        if launcher.launcher_type in {"application", "shortcut"}:
+            return [{
+                "name": launcher.emulator_name or launcher_item.name,
+                "launcher_item": launcher_item,
+                "launcher": launcher,
+                "rom": None,
+            }]
+
+        root = Path(launcher.rom_directory)
+        if not root.is_dir():
+            return []
+
+        games: list[dict] = []
+        folders_to_scan = [root]
+        visited: set[str] = set()
+
+        while folders_to_scan:
+            folder = folders_to_scan.pop(0)
+            try:
+                folder_key = str(folder.resolve()).replace(chr(92), "/").lower()
+            except Exception:
+                folder_key = str(folder).replace(chr(92), "/").lower()
+
+            if folder_key in visited:
+                continue
+            visited.add(folder_key)
+
+            for rom_item in self.scan_cached_rom_folder_sync(launcher, folder):
+                if rom_item.is_dir:
+                    if launcher.recursive:
+                        folders_to_scan.append(rom_item.path)
+                    continue
+
+                games.append({
+                    "name": rom_item.display_name,
+                    "launcher_item": launcher_item,
+                    "launcher": launcher,
+                    "rom": rom_item.path,
+                })
+
+        return games
+
+    def update_current_system_game_items(self):
+        system_name = self.current_game_system or ""
+        games: list[dict] = []
+
+        for launcher_item in self.game_system_launchers.get(system_name, []):
+            games.extend(self.collect_system_games_for_launcher(launcher_item))
+
+        deduped: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for game in games:
+            launcher = game.get("launcher")
+            rom = game.get("rom")
+            launcher_path = getattr(launcher, "path", game.get("launcher_item", MenuItem("", Path(), "launcher")).path)
+            rom_path = rom if rom is not None else launcher_path
+            key = (
+                str(launcher_path).replace(chr(92), "/").lower(),
+                str(rom_path).replace(chr(92), "/").lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(game)
+
+        deduped.sort(key=lambda item: str(item.get("name", "")).lower())
+        self.game_system_games[system_name] = deduped
+
     def update_emulator_items(self):
         emulators: dict[str, list[MenuItem]] = {}
 
@@ -1144,29 +1239,23 @@ class GentlemanWindow(QMainWindow):
         ))
         return launchers
 
+    def api_launchers(self) -> dict:
+        return {"launchers": self.api_all_launchers()}
+
     def api_systems(self) -> dict:
-        systems: dict[str, dict] = {}
+        systems: dict[str, str] = {}
 
         for launcher in self.api_all_launchers():
             system = str(launcher.get("system", "")).strip()
             if not system:
                 continue
-
-            if system not in systems:
-                systems[system] = {
-                    "system": system,
-                    "launchers": [],
-                }
-
-            systems[system]["launchers"].append({
-                "name": launcher.get("name", ""),
-                "path": launcher.get("path", ""),
-                "emulator_name": launcher.get("emulator_name", ""),
-                "launcher_type": launcher.get("launcher_type", ""),
-            })
+            systems.setdefault(system.lower(), system)
 
         return {
-            "systems": [systems[key] for key in sorted(systems.keys(), key=str.lower)]
+            "systems": [
+                {"system": systems[key]}
+                for key in sorted(systems.keys(), key=lambda value: systems[value].lower())
+            ]
         }
 
     def api_find_launchers_by_system(self, system: str) -> list[dict]:
@@ -1184,38 +1273,138 @@ class GentlemanWindow(QMainWindow):
 
         return matches
 
-    def api_games_by_system(self, system: str, launcher: str = "", folder: str = "") -> dict:
+    def api_system_game_entries(self, system: str, launcher_filter: str = "") -> tuple[str, list[dict], list[dict]]:
         launchers = self.api_find_launchers_by_system(system)
+        selected_launcher = str(launcher_filter or "").strip().replace(chr(92), "/")
 
-        if not launcher and len(launchers) > 1:
-            return {
-                "system": system,
-                "needs_launcher": True,
-                "launchers": launchers,
-                "items": [],
-            }
+        if selected_launcher:
+            launchers = [
+                launcher for launcher in launchers
+                if str(launcher.get("path", "")).replace(chr(92), "/").lower() == selected_launcher.lower()
+            ]
+            if not launchers:
+                raise ValueError("Launcher not found for system")
 
-        selected_launcher = launcher or str(launchers[0].get("path", ""))
-        result = self.api_games(selected_launcher, folder)
-        result["system"] = system
-        result["selected_launcher"] = selected_launcher
+        resolved_system = str(launchers[0].get("system", system)).strip() or system
+        entries: list[dict] = []
+        seen: set[tuple[str, str]] = set()
 
-        if len(launchers) > 1:
-            result["launchers"] = launchers
+        for launcher_meta in launchers:
+            launcher_rel = str(launcher_meta.get("path", "")).strip().replace(chr(92), "/")
+            try:
+                launcher_path = self.api_safe_launcher_path(launcher_rel)
+                config = load_launcher(launcher_path)
+            except Exception:
+                continue
 
-        return result
+            launcher_name = str(launcher_meta.get("name", "") or launcher_path.stem)
+
+            if config.launcher_type in {"application", "shortcut"}:
+                entry_name = config.emulator_name or launcher_name
+                key = (launcher_rel.lower(), "")
+                if key not in seen:
+                    seen.add(key)
+                    entries.append({
+                        "name": entry_name,
+                        "type": "application" if config.launcher_type == "application" else "shortcut",
+                        "launcher": launcher_rel,
+                        "launcher_name": launcher_name,
+                        "system": resolved_system,
+                        "path": "",
+                        "game": "",
+                    })
+                continue
+
+            root = Path(config.rom_directory)
+            if not root.is_dir():
+                continue
+
+            folders_to_scan = [root]
+            visited: set[str] = set()
+
+            while folders_to_scan:
+                folder = folders_to_scan.pop(0)
+                try:
+                    folder_key = str(folder.resolve()).replace(chr(92), "/").lower()
+                except Exception:
+                    folder_key = str(folder).replace(chr(92), "/").lower()
+
+                if folder_key in visited:
+                    continue
+                visited.add(folder_key)
+
+                for rom_item in self.scan_cached_rom_folder_sync(config, folder):
+                    if rom_item.is_dir:
+                        if config.recursive:
+                            folders_to_scan.append(rom_item.path)
+                        continue
+
+                    try:
+                        rel = str(rom_item.path.resolve().relative_to(root.resolve())).replace(chr(92), "/")
+                    except ValueError:
+                        rel = rom_item.name
+
+                    key = (launcher_rel.lower(), rel.lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    entries.append({
+                        "name": rom_item.display_name,
+                        "type": "game",
+                        "launcher": launcher_rel,
+                        "launcher_name": launcher_name,
+                        "system": resolved_system,
+                        "path": rel,
+                        "game": rel,
+                    })
+
+        entries.sort(key=lambda item: (
+            str(item.get("name", "")).lower(),
+            str(item.get("launcher_name", "")).lower(),
+            str(item.get("path", "")).lower(),
+        ))
+        return resolved_system, launchers, entries
+
+    def api_games_by_system(self, system: str, launcher: str = "", folder: str = "") -> dict:
+        resolved_system, launchers, items = self.api_system_game_entries(system, launcher)
+        return {
+            "system": resolved_system,
+            "view": "flat",
+            "items": items,
+            "launchers": launchers,
+        }
 
     def api_launch_by_system(self, payload: dict) -> dict:
         system = str(payload.get("system", "")).strip()
         launcher = str(payload.get("launcher", "")).strip()
-        game = str(payload.get("game", payload.get("rom", ""))).strip()
-
-        launchers = self.api_find_launchers_by_system(system)
+        game = str(payload.get("game", payload.get("rom", ""))).strip().replace(chr(92), "/")
 
         if not launcher:
-            if len(launchers) > 1:
-                raise ValueError("Multiple launchers found for system, pass launcher from /api/systems or /api/games-by-system")
-            launcher = str(launchers[0].get("path", ""))
+            _, _, items = self.api_system_game_entries(system)
+            matches = []
+            requested = game.lower()
+
+            for item in items:
+                item_path = str(item.get("path", item.get("game", ""))).strip().replace(chr(92), "/")
+                item_game = str(item.get("game", item_path)).strip().replace(chr(92), "/")
+                item_name = str(item.get("name", "")).strip()
+                if not requested:
+                    if not item_path and item.get("type") in {"application", "shortcut"}:
+                        matches.append(item)
+                elif requested in {item_path.lower(), item_game.lower(), item_name.lower()}:
+                    matches.append(item)
+
+            if len(matches) == 1:
+                launcher = str(matches[0].get("launcher", ""))
+                game = str(matches[0].get("path", matches[0].get("game", ""))).strip().replace(chr(92), "/")
+            elif len(matches) > 1:
+                raise ValueError("Multiple games matched for system, pass launcher and game from /api/games-by-system")
+            else:
+                launchers = self.api_find_launchers_by_system(system)
+                if len(launchers) == 1:
+                    launcher = str(launchers[0].get("path", ""))
+                else:
+                    raise ValueError("Game not found for system, pass launcher and game from /api/games-by-system")
 
         return self.api_launch({
             "launcher": launcher,
@@ -2423,7 +2612,7 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "system_launchers":
             if not self.current_game_system:
                 return 1
-            return len(self.game_system_launchers.get(self.current_game_system, [])) + 1
+            return len(self.game_system_games.get(self.current_game_system, [])) + 1
         if self.mode == "emulators":
             return len(self.emulator_items) + 1
         if self.mode == "emulator_launchers":
@@ -2510,8 +2699,8 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "systems":
             return [("...", "<DIR>")] + [(name, "") for name in self.game_system_items]
         if self.mode == "system_launchers":
-            launchers = self.game_system_launchers.get(self.current_game_system or "", [])
-            return [("...", "<DIR>")] + [(item.name, "<DIR>") for item in launchers]
+            games = self.game_system_games.get(self.current_game_system or "", [])
+            return [("...", "<DIR>")] + [(str(item.get("name", "")), "") for item in games]
         if self.mode == "emulators":
             return [("...", "<DIR>")] + [(name, "") for name in self.emulator_items]
         if self.mode == "emulator_launchers":
@@ -2797,6 +2986,7 @@ class GentlemanWindow(QMainWindow):
                 return
 
             self.current_game_system = self.game_system_items[self.selected_index - 1]
+            self.update_current_system_game_items()
             self.mode = "system_launchers"
             self.reset_selection_to_first_real_entry()
             self.view.update()
@@ -2807,12 +2997,12 @@ class GentlemanWindow(QMainWindow):
                 self.go_back()
                 return
 
-            launchers = self.game_system_launchers.get(self.current_game_system or "", [])
-            if self.selected_index - 1 >= len(launchers):
+            games = self.game_system_games.get(self.current_game_system or "", [])
+            game_index = self.selected_index - 1
+            if game_index < 0 or game_index >= len(games):
                 return
 
-            item = launchers[self.selected_index - 1]
-            self.open_launcher_item(item)
+            self.launch_system_game_item(games[game_index])
             return
 
         if self.mode == "emulators":
@@ -2938,6 +3128,55 @@ class GentlemanWindow(QMainWindow):
             return
 
         self.open_launcher_item(item)
+
+    def launch_system_game_item(self, item: dict):
+        launcher = item.get("launcher")
+        launcher_item = item.get("launcher_item")
+        rom = item.get("rom")
+
+        if not isinstance(launcher, LauncherConfig):
+            if isinstance(launcher_item, MenuItem):
+                self.open_launcher_item(launcher_item)
+            return
+
+        try:
+            if launcher.launcher_type == "application":
+                process = self.launch_application_config(launcher)
+                self.begin_active_session(process, "application", str(item.get("name", launcher.path.stem)), "")
+                return
+
+            if launcher.launcher_type == "shortcut":
+                shortcut_path = Path(launcher.shortcut_path or launcher.emulator)
+                if not shortcut_path.exists():
+                    self.show_message("Launch failed", "Shortcut file not found.")
+                    return
+                process = self.launch_shortcut_path(shortcut_path)
+                self.begin_active_session(process, "application", str(item.get("name", launcher.path.stem)), launcher.system or "Shortcut")
+                return
+
+            if rom is None:
+                return
+
+            rom_path = Path(rom)
+            if launcher.launcher_type == "shortcut_folder":
+                process = self.launch_shortcut_path(rom_path)
+                emulator_name = launcher.system or launcher.path.stem
+            else:
+                process = launch_rom(launcher, rom_path)
+                emulator_name = launcher.emulator_name or launcher.path.stem
+
+            self.begin_active_session(
+                process,
+                "game",
+                str(item.get("name", rom_path.stem)),
+                emulator_name,
+            )
+            self.add_recent_game(launcher.path, rom_path)
+            self.update_recent_items()
+            self.view.update()
+        except Exception as exc:
+            self.resume_frontend_input_after_launch()
+            self.show_message("Launch failed", str(exc))
 
     def launch_recent_item(self, item: dict):
         launcher_rel = str(item.get("launcher", ""))
