@@ -237,9 +237,60 @@ def launch_gentleman(base_path, platform_info):
         raise FileNotFoundError(f"{platform_info['target_exe']} was not found.")
 
     if platform_info["name"] == "Windows":
-        subprocess.Popen([str(target_path)], cwd=str(base_path), close_fds=True)
-    else:
-        subprocess.Popen([str(target_path)], cwd=str(base_path), start_new_session=True)
+        return subprocess.Popen([str(target_path)], cwd=str(base_path), close_fds=True)
+
+    return subprocess.Popen([str(target_path)], cwd=str(base_path), start_new_session=True)
+
+
+def focus_windows_process(pid, delay_seconds=0.8):
+    if platform.system().lower() != "windows" or not pid:
+        return
+
+    try:
+        time.sleep(delay_seconds)
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnds = []
+
+        enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def enum_proc(hwnd, lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            found_pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
+            if found_pid.value == pid:
+                hwnds.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(enum_proc_type(enum_proc), 0)
+        if not hwnds:
+            return
+
+        hwnd = hwnds[0]
+        user32.AllowSetForegroundWindow(pid)
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)
+        else:
+            user32.ShowWindow(hwnd, 5)
+
+        current_thread = kernel32.GetCurrentThreadId()
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        foreground_hwnd = user32.GetForegroundWindow()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+
+        if foreground_thread:
+            user32.AttachThreadInput(current_thread, foreground_thread, True)
+        user32.AttachThreadInput(current_thread, target_thread, True)
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+        user32.SetActiveWindow(hwnd)
+        user32.AttachThreadInput(current_thread, target_thread, False)
+        if foreground_thread:
+            user32.AttachThreadInput(current_thread, foreground_thread, False)
+    except Exception:
+        pass
 
 
 class UpdateWorker(QThread):
@@ -455,6 +506,12 @@ def load_xinput():
 
 
 class UpdaterWindow(QWidget):
+    WINDOW_WIDTH = 700
+    TOP_BAR_HEIGHT = 44
+    MENU_GAP = 16
+    PANEL_HEIGHT = 460
+    WINDOW_HEIGHT = TOP_BAR_HEIGHT + MENU_GAP + PANEL_HEIGHT
+
     def __init__(self):
         super().__init__()
 
@@ -496,8 +553,8 @@ class UpdaterWindow(QWidget):
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setMinimumSize(780, 520)
-        self.resize(960, 640)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setFixedSize(self.WINDOW_WIDTH, self.WINDOW_HEIGHT)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.bg = QColor(0, 0, 0)
@@ -534,11 +591,47 @@ class UpdaterWindow(QWidget):
         else:
             self.append_log("Ready.")
 
+        QTimer.singleShot(0, self.force_window_focus)
+        QTimer.singleShot(250, self.force_window_focus)
+
+    def force_window_focus(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+        if platform.system().lower() != "windows":
+            return
+
+        try:
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            user32.ShowWindow(hwnd, 5)
+            user32.AllowSetForegroundWindow(-1)
+
+            current_thread = kernel32.GetCurrentThreadId()
+            foreground_hwnd = user32.GetForegroundWindow()
+            foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
+            window_thread = user32.GetWindowThreadProcessId(hwnd, None)
+
+            if foreground_thread:
+                user32.AttachThreadInput(current_thread, foreground_thread, True)
+            user32.AttachThreadInput(current_thread, window_thread, True)
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.AttachThreadInput(current_thread, window_thread, False)
+            if foreground_thread:
+                user32.AttachThreadInput(current_thread, foreground_thread, False)
+        except Exception:
+            pass
+
     def menu_items(self):
         if self.update_state == UpdateState.RUNNING:
             return []
         if self.update_state in (UpdateState.DONE, UpdateState.FAILED):
-            return [("Exit & Open Gentleman", "open"), ("Exit", "exit")]
+            return [("Open Gentleman", "open"), ("Exit", "exit")]
         return [("Check and Update", "update"), ("Exit", "exit")]
 
     def title_path(self):
@@ -601,7 +694,7 @@ class UpdaterWindow(QWidget):
         self.show_overlay(
             "Update Complete",
             f"{message}\n\nWhat would you like to do next?",
-            [("Exit & Open Gentleman", "open"), ("Exit", "exit")],
+            [("Open Gentleman", "open"), ("Exit", "exit")],
         )
         self.update()
 
@@ -648,7 +741,8 @@ class UpdaterWindow(QWidget):
 
         if action == "open":
             try:
-                launch_gentleman(self.base_path, self.platform_info)
+                process = launch_gentleman(self.base_path, self.platform_info)
+                focus_windows_process(getattr(process, "pid", None), delay_seconds=0.7)
             except Exception as exc:
                 self.append_log(f"Could not open Gentleman: {exc}")
                 self.show_overlay("Could Not Open Gentleman", str(exc), [("Exit", "exit")])
@@ -703,19 +797,13 @@ class UpdaterWindow(QWidget):
         self.update()
 
     def menu_panel_size(self):
-        panel_w = min(700, max(620, self.width() - 120))
-        panel_h = min(460, max(390, self.height() - 150))
-        panel_w = min(panel_w, self.width() - 40)
-        panel_h = min(panel_h, self.height() - 100)
-        return max(520, panel_w), max(340, panel_h)
+        return self.WINDOW_WIDTH, self.PANEL_HEIGHT
 
     def menu_panel_rect(self):
-        panel_w, panel_h = self.menu_panel_size()
-        return QRect((self.width() - panel_w) // 2, (self.height() - panel_h) // 2, panel_w, panel_h)
+        return QRect(0, self.TOP_BAR_HEIGHT + self.MENU_GAP, self.WINDOW_WIDTH, self.PANEL_HEIGHT)
 
     def top_bar_rect(self):
-        panel = self.menu_panel_rect()
-        return QRect(panel.x(), max(16, panel.y() - 78), panel.width(), 44)
+        return QRect(0, 0, self.WINDOW_WIDTH, self.TOP_BAR_HEIGHT)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -795,7 +883,7 @@ class UpdaterWindow(QWidget):
             button_w = 300
             total_w = len(items) * button_w + (len(items) - 1) * button_gap
             start_x = x + side_w + ((w - side_w) - total_w) // 2
-            painter.setFont(self.font)
+            painter.setFont(self.small_font if any(len(label) > 14 for label, _action in items) else self.font)
             for index, (label, action) in enumerate(items):
                 rect = QRect(start_x + index * (button_w + button_gap), menu_y, button_w, 34)
                 if index == self.selected_index:
@@ -888,7 +976,7 @@ class UpdaterWindow(QWidget):
             total_w = columns * button_w + gap * (columns - 1)
             start_x = box.center().x() - total_w // 2
             button_y = box.y() + box.height() - 82
-            painter.setFont(self.font)
+            painter.setFont(self.small_font if any(len(label) > 14 for label in labels) else self.font)
             for index, label in enumerate(labels):
                 rect = QRect(start_x + index * (button_w + gap), button_y, button_w, 36)
                 if index == ov.get("selected", 0):
