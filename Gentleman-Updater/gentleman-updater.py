@@ -230,6 +230,48 @@ def make_executable(path):
     )
 
 
+def bring_process_to_front(pid, timeout_ms=1800):
+    if platform.system().lower() != "windows":
+        return
+
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return
+
+    hwnd_holder = {"hwnd": None}
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def enum_callback(hwnd, lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+
+        process_id = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+
+        if process_id.value == pid:
+            hwnd_holder["hwnd"] = hwnd
+            return False
+
+        return True
+
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    while time.monotonic() < deadline:
+        hwnd_holder["hwnd"] = None
+        user32.EnumWindows(enum_callback, 0)
+
+        hwnd = hwnd_holder["hwnd"]
+        if hwnd:
+            try:
+                user32.ShowWindow(hwnd, 5)
+                user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            return
+
+        time.sleep(0.1)
+
+
 def launch_gentleman(base_path, platform_info):
     target_path = base_path / platform_info["target_exe"]
 
@@ -237,60 +279,12 @@ def launch_gentleman(base_path, platform_info):
         raise FileNotFoundError(f"{platform_info['target_exe']} was not found.")
 
     if platform_info["name"] == "Windows":
-        return subprocess.Popen([str(target_path)], cwd=str(base_path), close_fds=True)
+        process = subprocess.Popen([str(target_path)], cwd=str(base_path), close_fds=True)
+        bring_process_to_front(process.pid)
+        return process
 
-    return subprocess.Popen([str(target_path)], cwd=str(base_path), start_new_session=True)
-
-
-def focus_windows_process(pid, delay_seconds=0.8):
-    if platform.system().lower() != "windows" or not pid:
-        return
-
-    try:
-        time.sleep(delay_seconds)
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        hwnds = []
-
-        enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-
-        def enum_proc(hwnd, lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            found_pid = ctypes.c_ulong()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
-            if found_pid.value == pid:
-                hwnds.append(hwnd)
-                return False
-            return True
-
-        user32.EnumWindows(enum_proc_type(enum_proc), 0)
-        if not hwnds:
-            return
-
-        hwnd = hwnds[0]
-        user32.AllowSetForegroundWindow(pid)
-        if user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, 9)
-        else:
-            user32.ShowWindow(hwnd, 5)
-
-        current_thread = kernel32.GetCurrentThreadId()
-        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-        foreground_hwnd = user32.GetForegroundWindow()
-        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
-
-        if foreground_thread:
-            user32.AttachThreadInput(current_thread, foreground_thread, True)
-        user32.AttachThreadInput(current_thread, target_thread, True)
-        user32.SetForegroundWindow(hwnd)
-        user32.BringWindowToTop(hwnd)
-        user32.SetActiveWindow(hwnd)
-        user32.AttachThreadInput(current_thread, target_thread, False)
-        if foreground_thread:
-            user32.AttachThreadInput(current_thread, foreground_thread, False)
-    except Exception:
-        pass
+    process = subprocess.Popen([str(target_path)], cwd=str(base_path), start_new_session=True)
+    return process
 
 
 class UpdateWorker(QThread):
@@ -506,12 +500,6 @@ def load_xinput():
 
 
 class UpdaterWindow(QWidget):
-    WINDOW_WIDTH = 700
-    TOP_BAR_HEIGHT = 44
-    MENU_GAP = 16
-    PANEL_HEIGHT = 460
-    WINDOW_HEIGHT = TOP_BAR_HEIGHT + MENU_GAP + PANEL_HEIGHT
-
     def __init__(self):
         super().__init__()
 
@@ -551,10 +539,15 @@ class UpdaterWindow(QWidget):
             }
             self.platform_name = self.platform_info["name"]
 
+        self.window_w = 712
+        self.top_bar_h = 64
+        self.panel_h = 462
+        self.window_h = self.top_bar_h + self.panel_h
+
         self.setWindowTitle(APP_NAME)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.setFixedSize(self.WINDOW_WIDTH, self.WINDOW_HEIGHT)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(self.window_w, self.window_h)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.bg = QColor(0, 0, 0)
@@ -585,47 +578,13 @@ class UpdaterWindow(QWidget):
         self.controller_timer.timeout.connect(self.poll_controller)
         self.controller_timer.start(33)
 
+        QTimer.singleShot(120, self.request_initial_focus)
+
         if self.auto_update_mode:
             self.append_log(f"{UPDATE_NOW_FILE} found. Starting automatic update check...")
             QTimer.singleShot(250, self.start_update)
         else:
             self.append_log("Ready.")
-
-        QTimer.singleShot(0, self.force_window_focus)
-        QTimer.singleShot(250, self.force_window_focus)
-
-    def force_window_focus(self):
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-
-        if platform.system().lower() != "windows":
-            return
-
-        try:
-            hwnd = int(self.winId())
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            user32.ShowWindow(hwnd, 5)
-            user32.AllowSetForegroundWindow(-1)
-
-            current_thread = kernel32.GetCurrentThreadId()
-            foreground_hwnd = user32.GetForegroundWindow()
-            foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, None) if foreground_hwnd else 0
-            window_thread = user32.GetWindowThreadProcessId(hwnd, None)
-
-            if foreground_thread:
-                user32.AttachThreadInput(current_thread, foreground_thread, True)
-            user32.AttachThreadInput(current_thread, window_thread, True)
-            user32.SetForegroundWindow(hwnd)
-            user32.BringWindowToTop(hwnd)
-            user32.SetActiveWindow(hwnd)
-            user32.AttachThreadInput(current_thread, window_thread, False)
-            if foreground_thread:
-                user32.AttachThreadInput(current_thread, foreground_thread, False)
-        except Exception:
-            pass
 
     def menu_items(self):
         if self.update_state == UpdateState.RUNNING:
@@ -741,8 +700,7 @@ class UpdaterWindow(QWidget):
 
         if action == "open":
             try:
-                process = launch_gentleman(self.base_path, self.platform_info)
-                focus_windows_process(getattr(process, "pid", None), delay_seconds=0.7)
+                launch_gentleman(self.base_path, self.platform_info)
             except Exception as exc:
                 self.append_log(f"Could not open Gentleman: {exc}")
                 self.show_overlay("Could Not Open Gentleman", str(exc), [("Exit", "exit")])
@@ -778,6 +736,17 @@ class UpdaterWindow(QWidget):
         self.selected_index = (self.selected_index + delta) % len(items)
         self.update()
 
+    def request_initial_focus(self):
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+
+        if platform.system().lower() == "windows":
+            try:
+                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+            except Exception:
+                pass
+
     def keyPressEvent(self, event: QKeyEvent):
         self.active_input = "keyboard"
         key = event.key()
@@ -797,18 +766,17 @@ class UpdaterWindow(QWidget):
         self.update()
 
     def menu_panel_size(self):
-        return self.WINDOW_WIDTH, self.PANEL_HEIGHT
+        return self.window_w, self.panel_h
 
     def menu_panel_rect(self):
-        return QRect(0, self.TOP_BAR_HEIGHT + self.MENU_GAP, self.WINDOW_WIDTH, self.PANEL_HEIGHT)
+        return QRect(0, self.top_bar_h, self.window_w, self.panel_h)
 
     def top_bar_rect(self):
-        return QRect(0, 0, self.WINDOW_WIDTH, self.TOP_BAR_HEIGHT)
+        return QRect(0, 0, self.window_w, self.top_bar_h)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(self.rect(), self.bg)
         self.draw_top_bar(painter)
         self.draw_panel(painter)
         if self.overlay:
@@ -822,11 +790,11 @@ class UpdaterWindow(QWidget):
         painter.fillRect(bar, self.light)
         painter.setFont(self.title_font)
         painter.setPen(self.dark_text)
-        painter.drawText(bar.x() + 18, bar.y() + 31, "Gentleman Updater")
+        painter.drawText(bar.x() + 18, bar.y() + 40, "Gentleman Updater")
 
         time_text = datetime.now().strftime("%H:%M")
         time_width = painter.fontMetrics().horizontalAdvance(time_text)
-        painter.drawText(bar.right() - 18 - time_width, bar.y() + 31, time_text)
+        painter.drawText(bar.right() - 18 - time_width, bar.y() + 40, time_text)
 
     def draw_panel(self, painter):
         panel = self.menu_panel_rect()
@@ -850,20 +818,8 @@ class UpdaterWindow(QWidget):
 
         text_x = x + side_w + 22
         right_x = x + w - 34
-        row_y = y + 34
+        row_y = y + 26
 
-        painter.setFont(self.title_font)
-        painter.setPen(self.text)
-        painter.drawText(text_x, row_y, "Gentleman Updater")
-
-        painter.setFont(self.small_font)
-        row_y += 34
-        painter.setPen(self.dim_text)
-        painter.drawText(text_x, row_y, f"Platform: {self.platform_name}")
-        row_y += 24
-        painter.drawText(text_x, row_y, "Controller-first update utility")
-
-        row_y += 28
         self.draw_progress_bar(painter, QRect(text_x, row_y, right_x - text_x, 24))
 
         row_y += 44
@@ -873,17 +829,18 @@ class UpdaterWindow(QWidget):
         painter.drawText(QRect(text_x, row_y, right_x - text_x, 24), Qt.AlignmentFlag.AlignLeft, status)
 
         row_y += 34
-        log_rect = QRect(text_x, row_y, right_x - text_x, max(100, h - (row_y - y) - 104))
+        items = self.menu_items()
+        button_area_h = 96 if items else 42
+        log_rect = QRect(text_x, row_y, right_x - text_x, max(180, h - (row_y - y) - button_area_h))
         self.draw_log(painter, log_rect)
 
-        items = self.menu_items()
         if items:
             menu_y = y + h - 72
             button_gap = 18
             button_w = 300
             total_w = len(items) * button_w + (len(items) - 1) * button_gap
             start_x = x + side_w + ((w - side_w) - total_w) // 2
-            painter.setFont(self.small_font if any(len(label) > 14 for label, _action in items) else self.font)
+            painter.setFont(self.font)
             for index, (label, action) in enumerate(items):
                 rect = QRect(start_x + index * (button_w + button_gap), menu_y, button_w, 34)
                 if index == self.selected_index:
@@ -976,7 +933,7 @@ class UpdaterWindow(QWidget):
             total_w = columns * button_w + gap * (columns - 1)
             start_x = box.center().x() - total_w // 2
             button_y = box.y() + box.height() - 82
-            painter.setFont(self.small_font if any(len(label) > 14 for label in labels) else self.font)
+            painter.setFont(self.font)
             for index, label in enumerate(labels):
                 rect = QRect(start_x + index * (button_w + gap), button_y, button_w, 36)
                 if index == ov.get("selected", 0):
