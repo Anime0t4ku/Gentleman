@@ -5330,11 +5330,36 @@ class GentlemanView(QWidget):
         _, panel_h = self.menu_panel_size()
         if self.window.mode == "system":
             reserved_height = 114
-        elif self.window.mode == "menu_size":
-            reserved_height = 92
+        elif self.window.mode in {"menu_size", "idle_hide_timeout"}:
+            reserved_height = 114
         else:
             reserved_height = 30
         return max(1, (panel_h - reserved_height) // 28)
+
+    def wrapped_text_lines(self, painter: QPainter, text: str, max_width: int) -> list[str]:
+        words = text.split()
+        if not words:
+            return [""]
+        lines = []
+        current = words[0]
+        metrics = painter.fontMetrics()
+        for word in words[1:]:
+            candidate = f"{current} {word}"
+            if metrics.horizontalAdvance(candidate) <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    def draw_instruction_text(self, painter: QPainter, x: int, y: int, max_width: int, lines: list[str]) -> int:
+        current_y = y
+        for text in lines:
+            for wrapped in self.wrapped_text_lines(painter, text, max_width):
+                painter.drawText(x, current_y, wrapped)
+                current_y += 28
+        return current_y + 14
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -5707,14 +5732,30 @@ class GentlemanView(QWidget):
             row_y += 84
         elif self.window.mode == "menu_size":
             painter.setPen(self.text)
-            painter.drawText(text_x, row_y, "Menu size applies in fullscreen mode.")
-            painter.drawText(text_x, row_y + 28, "Windowed mode always uses 100%.")
-            row_y += 70
+            instruction_w = max(120, panel_w - side_w - 60)
+            row_y = self.draw_instruction_text(
+                painter,
+                text_x,
+                row_y,
+                instruction_w,
+                [
+                    "Menu size applies in fullscreen mode.",
+                    "Windowed mode always uses 100%.",
+                ],
+            )
         elif self.window.mode == "idle_hide_timeout":
             painter.setPen(self.text)
-            painter.drawText(text_x, row_y, "Hides menu and top bar after idle time.")
-            painter.drawText(text_x, row_y + 28, "Disabled during dialogs and input screens.")
-            row_y += 70
+            instruction_w = max(120, panel_w - side_w - 60)
+            row_y = self.draw_instruction_text(
+                painter,
+                text_x,
+                row_y,
+                instruction_w,
+                [
+                    "Hides menu and top bar after idle time.",
+                    "Disabled during dialogs and input screens.",
+                ],
+            )
         elif self.window.mode == "wallpaper" and self.window.wallpaper_folder_path() is not None:
             painter.setPen(self.text)
             painter.drawText(text_x, row_y, "Wallpaper folder set")
