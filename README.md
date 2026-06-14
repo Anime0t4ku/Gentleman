@@ -42,7 +42,8 @@ Linux support may be added later, but the current version should be treated as W
 - Optional Favorites, Recent, Systems, and Emulators menu entries
 - Automatic Emulators menu generated from launcher JSON files
 - System selection using a predefined system list
-- Wallpaper support through the Gentleman Menu
+- Wallpaper support through Settings > Display
+- Custom `.json` theme support
 - Fullscreen support
 - Fullscreen-at-launch setting
 - Optional MiSTer-style auto-hide menu setting
@@ -72,7 +73,7 @@ Gentleman can check GitHub for stable releases. The update check can be started 
 
 The updater is optional and is released as a separate download. To use it, download `Gentleman-Updater-Windows-x86_64.zip`, extract `Gentleman-Updater.exe`, and place it next to `Gentleman.exe`. When an update is found, Gentleman can then start the updater for you.
 
-The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders such as `config/` and `menu/` are created on first launch and are not part of the release ZIP.
+The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders such as `config/`, `menu/`, and `themes/` are created on first launch and are not part of the release ZIP.
 
 ## Navigation
 
@@ -143,7 +144,6 @@ From here you can:
 - Edit Launcher
 - Refresh Menu
 - Open Settings
-- Open Wallpapers
 - Report Issues & Requests
 - Open Support the Project
 - Check for Updates
@@ -186,16 +186,18 @@ Settings are organized into categories.
 
 - Fullscreen at Launch: Enabled / Disabled
 - Logo: Enabled / Disabled
-
-### Menu
-
+- Theme: Default or custom themes from the `themes/` folder
+- Wallpaper
 - Menu Size: 100% / 125% / 150%
+- Auto Hide Menu: Disabled / 10 sec / 15 sec / 20 sec / 30 sec / 45 sec / 1 min
+
+### Menu Items
+
 - Systems Menu: Enabled / Disabled
 - Emulators Menu: Enabled / Disabled
 - Recent Menu: Enabled / Disabled
 - Favorites Menu: Enabled / Disabled
 - Arcade ROM Names: Enabled / Disabled
-- Auto Hide Menu: Disabled / 10 sec / 15 sec / 20 sec / 30 sec / 45 sec / 1 min
 - Clear Recent
 - Clear Favorites
 
@@ -209,6 +211,37 @@ Settings are organized into categories.
 
 - API: Enabled / Disabled
 - Update Check at Launch: Enabled / Disabled
+
+## Custom Themes
+
+Gentleman supports custom `.json` theme files.
+
+The built-in Default theme is always available and is not stored as a visible `default.json` file. To add your own themes, place `.json` files in the `themes/` folder and select them from Settings > Display > Theme.
+
+Theme files use a small set of user-facing color fields. Gentleman automatically applies these colors across the menu, text, highlights, dialogs, overlays, and related interface elements.
+
+Example using the Default theme values:
+
+```json
+{
+  "name": "Default Style Example",
+  "colors": {
+    "background_color": "#000000",
+    "menu_color": "#37000FDC",
+    "highlight_color": "#DCB9BE",
+    "text_color": "#F5EBEB",
+    "highlight_text_color": "#28000A"
+  }
+}
+```
+
+The color format is 8-digit hex:
+
+```text
+#RRGGBBAA
+```
+
+The last two characters control opacity. For example, `DC` is about 86% opacity.
 
 ## Auto Hide Menu
 
