@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
-from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent, QThread, pyqtSignal, QByteArray
 from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon, QImage, QMovie
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 
 from app.app_info import APP_NAME, APP_VERSION, ABOUT_LINES
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
+from app.theme_manager import ThemeManager, DEFAULT_THEME_ID
 from core.arcade_names import ArcadeNameDatabase
 from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, launch_link_shortcut, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
@@ -118,16 +119,21 @@ class InGameOsd(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.resize(960, 640)
-
-        self.panel = QColor(55, 0, 15, 245)
-        self.light = QColor(220, 185, 190)
-        self.text = QColor(245, 235, 235)
-        self.dark_text = QColor(40, 0, 10)
+        self.apply_theme()
 
         self.font = QFont("Consolas", 20)
         self.font.setStyleHint(QFont.StyleHint.Monospace)
         self.title_font = QFont("Consolas", 22, QFont.Weight.Bold)
         self.title_font.setStyleHint(QFont.StyleHint.Monospace)
+
+    def apply_theme(self):
+        theme = self.window.current_theme
+        self.panel = theme.color("menu_color")
+        self.light = theme.color("highlight_color")
+        self.text = theme.color("text_color")
+        self.dark_text = theme.color("highlight_text_color")
+        self.overlay = theme.color("osd_overlay_color")
+        self.dialog = theme.color("dialog_alt_color")
 
     def refresh_options(self):
         session = self.window.active_session_snapshot()
@@ -233,7 +239,7 @@ class InGameOsd(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 205))
+        painter.fillRect(self.rect(), self.overlay)
 
         bar = self.top_bar_rect()
         painter.fillRect(bar, self.light)
@@ -312,7 +318,7 @@ class InGameOsd(QWidget):
                 box_width,
                 box_height,
             )
-            painter.fillRect(box, QColor(35, 0, 10, 252))
+            painter.fillRect(box, self.dialog)
             painter.setPen(self.light)
             painter.drawRect(box)
 
@@ -359,13 +365,20 @@ class GentlemanWindow(QMainWindow):
         self.assets_dir = resource_path("assets")
         self.menu_root = base_dir / "menu"
         self.config_dir = base_dir / "config"
+        self.themes_dir = base_dir / "themes"
         self.settings_path = self.config_dir / "settings.json"
         self.recent_path = self.config_dir / "recent.json"
         self.favorites_path = self.config_dir / "favorites.json"
         self.menu_root.mkdir(exist_ok=True)
         self.config_dir.mkdir(exist_ok=True)
 
+        self.theme_manager = ThemeManager(base_dir)
+        self.current_theme = self.theme_manager.load_theme(DEFAULT_THEME_ID)
+        self.theme_picker_items: list[str] = []
+        self.theme_picker_infos = []
+
         self.settings = self.load_settings()
+        self.apply_selected_theme(save_if_invalid=False)
         self.arcade_name_database = ArcadeNameDatabase(self.assets_dir / "databases" / "arcade_names.json")
         self.ensure_settings_app_info()
         self.remote_api_server: GentlemanApiServer | None = None
@@ -566,6 +579,7 @@ class GentlemanWindow(QMainWindow):
             "ingame_osd_enabled": True,
             "fullscreen_menu_size": 100,
             "menu_idle_hide_timeout": 0,
+            "theme": DEFAULT_THEME_ID,
         }
 
     def load_settings(self) -> dict:
@@ -1647,7 +1661,6 @@ class GentlemanWindow(QMainWindow):
             "Edit Launcher",
             "Refresh Menu",
             "Settings",
-            "Wallpapers",
             "Report Issues & Requests",
             "Support the Project",
             "Check for Updates",
@@ -1710,7 +1723,7 @@ class GentlemanWindow(QMainWindow):
             self.view.update()
 
     def settings_categories(self) -> list[str]:
-        return ["Display", "Menu", "Controls", "System"]
+        return ["Display", "Menu Items", "Controls", "System"]
 
     def update_settings_items(self):
         if self.settings_category is None:
@@ -1777,6 +1790,8 @@ class GentlemanWindow(QMainWindow):
             self.ingame_osd_enabled(),
         )
 
+        theme_label = f"Theme: {self.current_theme.name}"
+
         menu_size_label = f"Menu Size: {int(self.settings.get('fullscreen_menu_size', 100))}%"
         idle_menu_hide_label = self.idle_menu_hide_label()
 
@@ -1784,11 +1799,13 @@ class GentlemanWindow(QMainWindow):
             self.settings_items = [
                 fullscreen_launch_label,
                 logo_label,
-            ]
-        elif self.settings_category == "Menu":
-            self.settings_items = [
+                theme_label,
+                "Wallpapers",
                 menu_size_label,
                 idle_menu_hide_label,
+            ]
+        elif self.settings_category == "Menu Items":
+            self.settings_items = [
                 systems_menu_label,
                 emulators_menu_label,
                 recent_menu_label,
@@ -2784,6 +2801,8 @@ class GentlemanWindow(QMainWindow):
             return "Menu Size"
         if self.mode == "idle_hide_timeout":
             return "Auto Hide Menu"
+        if self.mode == "theme_picker":
+            return "Theme"
         if self.mode == "wallpaper":
             return "Wallpapers"
         if self.mode == "support":
@@ -2850,6 +2869,9 @@ class GentlemanWindow(QMainWindow):
             return 3
         if self.mode == "idle_hide_timeout":
             return len(self.idle_menu_hide_timeout_choices())
+        if self.mode == "theme_picker":
+            self.update_theme_picker_items()
+            return len(self.theme_picker_items)
         if self.mode == "wallpaper":
             return len(self.wallpaper_items)
         if self.mode == "support":
@@ -2933,6 +2955,13 @@ class GentlemanWindow(QMainWindow):
             for value in self.idle_menu_hide_timeout_choices():
                 label = "Disabled" if value == 0 else ("1 min" if value == 60 else f"{value} sec")
                 labels.append((label + ("  ✓" if selected == value else ""), ""))
+            return labels
+        if self.mode == "theme_picker":
+            self.update_theme_picker_items()
+            selected = str(self.settings.get("theme", DEFAULT_THEME_ID))
+            labels = []
+            for info in self.theme_picker_infos:
+                labels.append((info.name + ("  ✓" if info.theme_id == selected else ""), ""))
             return labels
         if self.mode == "wallpaper":
             return [(name, "") for name in self.wallpaper_items]
@@ -3235,25 +3264,37 @@ class GentlemanWindow(QMainWindow):
 
         if self.mode == "menu_size":
             self.mode = "settings"
-            self.settings_category = "Menu"
+            self.settings_category = "Display"
             self.update_settings_items()
-            self.selected_index = 0
+            self.selected_index = 4
             self.view.scroll_offset = 0
             self.view.update()
             return
 
         if self.mode == "idle_hide_timeout":
             self.mode = "settings"
-            self.settings_category = "Menu"
+            self.settings_category = "Display"
             self.update_settings_items()
-            self.selected_index = 1
+            self.selected_index = 5
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+
+        if self.mode == "theme_picker":
+            self.mode = "settings"
+            self.settings_category = "Display"
+            self.update_settings_items()
+            self.selected_index = 2
             self.view.scroll_offset = 0
             self.view.update()
             return
 
         if self.mode == "wallpaper":
-            self.mode = "system"
-            self.selected_index = 0
+            self.mode = "settings"
+            self.settings_category = "Display"
+            self.update_settings_items()
+            self.selected_index = 3
+            self.view.scroll_offset = 0
             self.view.update()
             return
 
@@ -3400,6 +3441,10 @@ class GentlemanWindow(QMainWindow):
 
         if self.mode == "idle_hide_timeout":
             self.activate_idle_hide_timeout_item(self.selected_index)
+            return
+
+        if self.mode == "theme_picker":
+            self.activate_theme_picker_item(self.selected_index)
             return
 
         if self.mode == "wallpaper":
@@ -4128,6 +4173,20 @@ class GentlemanWindow(QMainWindow):
             self.selected_index = choices.index(current) if current in choices else 0
             self.view.scroll_offset = 0
             self.view.update()
+        elif item.startswith("Theme:"):
+            self.mode = "theme_picker"
+            self.update_theme_picker_items()
+            current = str(self.settings.get("theme", DEFAULT_THEME_ID))
+            ids = [info.theme_id for info in self.theme_picker_infos]
+            self.selected_index = ids.index(current) if current in ids else 0
+            self.view.scroll_offset = 0
+            self.view.update()
+        elif item == "Wallpapers":
+            self.update_wallpaper_items()
+            self.mode = "wallpaper"
+            self.selected_index = 0
+            self.view.scroll_offset = 0
+            self.view.update()
         elif item.startswith("Systems Menu:"):
             self.settings["show_systems_menu"] = not self.systems_menu_enabled()
             self.refresh_settings_menu()
@@ -4176,6 +4235,33 @@ class GentlemanWindow(QMainWindow):
         elif item.startswith("Swap X/Y:"):
             self.settings["swap_controller_xy"] = not self.settings.get("swap_controller_xy", False)
             self.refresh_settings_menu()
+
+    def update_theme_picker_items(self):
+        self.theme_picker_infos = self.theme_manager.available_themes()
+        self.theme_picker_items = [info.name for info in self.theme_picker_infos]
+
+    def apply_selected_theme(self, save_if_invalid: bool = True):
+        requested = str(self.settings.get("theme", DEFAULT_THEME_ID))
+        self.current_theme = self.theme_manager.load_theme(requested)
+        if self.current_theme.theme_id != requested:
+            self.settings["theme"] = DEFAULT_THEME_ID
+            if save_if_invalid:
+                self.save_settings()
+        if hasattr(self, "view"):
+            self.view.apply_theme()
+        if hasattr(self, "ingame_osd"):
+            self.ingame_osd.apply_theme()
+
+    def activate_theme_picker_item(self, index: int):
+        self.update_theme_picker_items()
+        if not (0 <= index < len(self.theme_picker_infos)):
+            return
+        self.settings["theme"] = self.theme_picker_infos[index].theme_id
+        self.apply_selected_theme()
+        self.save_settings()
+        self.update_settings_items()
+        self.view.scroll_offset = 0
+        self.view.update()
 
     def activate_menu_size_item(self, index: int):
         sizes = [100, 125, 150]
@@ -5130,11 +5216,7 @@ class GentlemanView(QWidget):
         self.scroll_offset = 0
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        self.bg = QColor(0, 0, 0)
-        self.panel = QColor(55, 0, 15, 220)
-        self.light = QColor(220, 185, 190)
-        self.text = QColor(245, 235, 235)
-        self.dark_text = QColor(40, 0, 10)
+        self.apply_theme()
 
         self.font = QFont("Consolas", 20)
         self.font.setStyleHint(QFont.StyleHint.Monospace)
@@ -5163,15 +5245,32 @@ class GentlemanView(QWidget):
         self.static_noise_frame = 0
 
         self.icon_dir = self.window.assets_dir / "icons"
-        self.icon_renderers = {
-            "lan": QSvgRenderer(str(self.icon_dir / "lan.svg")),
-            "wifi": QSvgRenderer(str(self.icon_dir / "wifi.svg")),
-            "bluetooth": QSvgRenderer(str(self.icon_dir / "bluetooth.svg")),
-            "keyboard": QSvgRenderer(str(self.icon_dir / "keyboard.svg")),
-            "controller": QSvgRenderer(str(self.icon_dir / "controller.svg")),
-            "favorite": QSvgRenderer(str(self.icon_dir / "favorite.svg")),
-            "api": QSvgRenderer(str(self.icon_dir / "api.svg")),
-        }
+        self.icon_svgs = {}
+        self.icon_renderer_cache = {}
+        for icon_name in ("lan", "wifi", "bluetooth", "keyboard", "controller", "favorite", "api"):
+            icon_path = self.icon_dir / f"{icon_name}.svg"
+            if icon_path.exists():
+                try:
+                    self.icon_svgs[icon_name] = icon_path.read_text(encoding="utf-8")
+                except Exception:
+                    self.icon_svgs[icon_name] = ""
+
+    def apply_theme(self):
+        theme = self.window.current_theme
+        self.bg = theme.color("background_color")
+        self.panel = theme.color("menu_color")
+        self.light = theme.color("highlight_color")
+        self.text = theme.color("text_color")
+        self.dark_text = theme.color("highlight_text_color")
+        self.overlay = theme.color("overlay_color")
+        self.soft_overlay = theme.color("soft_overlay_color")
+        self.keyboard_overlay = theme.color("keyboard_overlay_color")
+        self.dialog = theme.color("dialog_color")
+        self.dialog_alt = theme.color("dialog_alt_color")
+        self.field = theme.color("field_color")
+        self.preview = theme.color("preview_color")
+        self.wallpaper_tint = theme.color("wallpaper_tint_color")
+        self.update()
 
     def reload_wallpaper(self):
         if self.wallpaper_movie is not None:
@@ -5306,7 +5405,7 @@ class GentlemanView(QWidget):
             return
         rect = self.wallpaper_preview_rect()
         preview = self.wallpaper_preview_pixmap
-        painter.fillRect(rect, QColor(45, 0, 12, 245))
+        painter.fillRect(rect, self.preview)
         painter.setPen(self.light)
         painter.drawRect(rect)
         inner = rect.adjusted(8, 8, -8, -8)
@@ -5407,7 +5506,7 @@ class GentlemanView(QWidget):
             painter.setClipRect(self.rect())
             painter.drawPixmap(x, y, scaled)
             painter.restore()
-            painter.fillRect(self.rect(), QColor(0, 0, 0, 95))
+            painter.fillRect(self.rect(), self.soft_overlay)
         else:
             self.draw_static_noise(painter)
 
@@ -5451,8 +5550,8 @@ class GentlemanView(QWidget):
             box_height,
         )
 
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 150))
-        painter.fillRect(box, QColor(45, 0, 12, 252))
+        painter.fillRect(self.rect(), self.overlay)
+        painter.fillRect(box, self.dialog)
         painter.setPen(self.light)
         painter.drawRect(box)
 
@@ -5537,10 +5636,10 @@ class GentlemanView(QWidget):
         return key
 
     def draw_text_input(self, painter):
-        painter.fillRect(self.rect(), QColor(0,0,0,175)); box=QRect(70,70,self.width()-140,self.height()-140); painter.fillRect(box,QColor(45,0,12,252)); painter.setPen(self.light); painter.drawRect(box)
+        painter.fillRect(self.rect(), self.keyboard_overlay); box=QRect(70,70,self.width()-140,self.height()-140); painter.fillRect(box,self.dialog); painter.setPen(self.light); painter.drawRect(box)
         painter.setFont(self.title_font); painter.setPen(self.text); painter.drawText(box.x()+28,box.y()+40,self.window.text_input_title)
         painter.setFont(self.font); painter.drawText(box.x()+28,box.y()+76,self.window.text_input_prompt)
-        field=QRect(box.x()+28,box.y()+95,box.width()-56,48); painter.fillRect(field,QColor(20,0,6,245)); painter.setPen(self.light); painter.drawRect(field)
+        field=QRect(box.x()+28,box.y()+95,box.width()-56,48); painter.fillRect(field,self.field); painter.setPen(self.light); painter.drawRect(field)
         value=self.window.text_input_value; cursor=self.window.text_input_cursor; display=value[:cursor]+'|' + value[cursor:]; painter.setPen(self.text); painter.drawText(field.adjusted(12,0,-12,0),Qt.AlignmentFlag.AlignVCenter,display)
         rows=self.window.text_input_keys; y=box.y()+175
         for ri,row in enumerate(rows):
@@ -5619,7 +5718,7 @@ class GentlemanView(QWidget):
         painter.drawPixmap(-overscan, -overscan, scaled)
         painter.fillRect(
             QRect(-overscan, -overscan, self.width() + overscan * 2, self.height() + overscan * 2),
-            QColor(30, 0, 10, 45),
+            self.wallpaper_tint,
         )
         painter.restore()
 
@@ -5632,14 +5731,32 @@ class GentlemanView(QWidget):
     def input_icon(self) -> str:
         return "keyboard" if self.window.active_input == "keyboard" else "controller"
 
+    def svg_renderer_for_color(self, icon_name: str, color: QColor):
+        svg_text = self.icon_svgs.get(icon_name)
+        if not svg_text:
+            return None
+
+        color_key = color.rgba()
+        cache_key = (icon_name, color_key)
+        renderer = self.icon_renderer_cache.get(cache_key)
+        if renderer is not None:
+            return renderer
+
+        if len(self.icon_renderer_cache) > 64:
+            self.icon_renderer_cache.clear()
+
+        svg_color = color.name(QColor.NameFormat.HexRgb)
+        themed_svg = svg_text.replace("currentColor", svg_color)
+        renderer = QSvgRenderer(QByteArray(themed_svg.encode("utf-8")))
+        self.icon_renderer_cache[cache_key] = renderer
+        return renderer
+
     def draw_svg_icon(self, painter: QPainter, icon_name: str, rect: QRect, color: QColor):
-        renderer = self.icon_renderers.get(icon_name)
+        renderer = self.svg_renderer_for_color(icon_name, color)
         if not renderer or not renderer.isValid():
             return
 
         painter.save()
-        painter.setPen(color)
-        painter.setBrush(color)
         renderer.render(painter, QRectF(rect))
         painter.restore()
 
