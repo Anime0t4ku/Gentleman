@@ -6,6 +6,7 @@ import ctypes
 import threading
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -397,8 +398,12 @@ class GentlemanWindow(QMainWindow):
         self.launcher_form_folders: list[str] = []
         self.system_picker_items: list[str] = []
         self.type_picker_items: list[str] = []
-        self.folder_picker_items: list[str] = []
-        self.launcher_form_return_index = 0
+        self.folder_picker_items: list[dict] = []
+        self.folder_picker_current_folder = self.menu_root
+        self.item_options_items: list[str] = []
+        self.item_options_target: MenuItem | None = None
+        self.item_options_return_mode = "menu"
+        self.item_options_return_index = 0
         self.mode = "menu"
         self.overlay = None
         self.overlay_return_mode = None
@@ -438,6 +443,7 @@ class GentlemanWindow(QMainWindow):
         self.system_items = []
         self.update_system_items()
         self.settings_items = []
+        self.settings_category = None
         self.update_settings_items()
         self.wallpaper_items = []
         self.update_wallpaper_items()
@@ -445,11 +451,17 @@ class GentlemanWindow(QMainWindow):
             "Ko-fi",
             "Buy Me a Coffee",
         ]
+        self.search_items: list[dict] = []
+        self.search_query = ""
+        self.search_scope_label = ""
+        self.search_return_state: dict = {}
 
         self.current_launcher: LauncherConfig | None = None
         self.current_rom_folder: Path | None = None
         self.selected_index = 0
         self.active_input = "keyboard"
+        self.idle_menu_hidden = False
+        self.last_idle_activity_time = time.monotonic()
         self.input_suspended_for_launch = False
         self.active_process = None
         self.active_session = {"running": False, "type": None, "name": None, "emulator": None}
@@ -485,6 +497,10 @@ class GentlemanWindow(QMainWindow):
         self.marquee_timer = QTimer(self)
         self.marquee_timer.timeout.connect(self.view.update)
         self.marquee_timer.start(45)
+
+        self.idle_menu_timer = QTimer(self)
+        self.idle_menu_timer.timeout.connect(self.check_idle_menu_hide)
+        self.idle_menu_timer.start(250)
 
         self.init_controller_support()
         self.controller_timer = QTimer(self)
@@ -549,6 +565,7 @@ class GentlemanWindow(QMainWindow):
             "normalize_arcade_names": True,
             "ingame_osd_enabled": True,
             "fullscreen_menu_size": 100,
+            "menu_idle_hide_timeout": 0,
         }
 
     def load_settings(self) -> dict:
@@ -1642,7 +1659,64 @@ class GentlemanWindow(QMainWindow):
         state = "Enabled" if enabled else "Disabled"
         return f"{name}: {state}"
 
+    def idle_menu_hide_timeout_choices(self) -> list[int]:
+        return [0, 10, 15, 20, 30, 45, 60]
+
+    def idle_menu_hide_timeout_seconds(self) -> int:
+        try:
+            value = int(self.settings.get("menu_idle_hide_timeout", 0))
+        except Exception:
+            value = 0
+        return value if value in self.idle_menu_hide_timeout_choices() else 0
+
+    def idle_menu_hide_label(self, value: int | None = None) -> str:
+        timeout = self.idle_menu_hide_timeout_seconds() if value is None else int(value)
+        if timeout <= 0:
+            return "Auto Hide Menu: Disabled"
+        unit = "sec" if timeout < 60 else "min"
+        amount = timeout if timeout < 60 else 1
+        return f"Auto Hide Menu: {amount} {unit}"
+
+    def idle_menu_hide_allowed(self) -> bool:
+        return (
+            self.idle_menu_hide_timeout_seconds() > 0
+            and self.mode == "menu"
+            and self.overlay is None
+            and not self.input_suspended_for_launch
+            and not self.ingame_osd.isVisible()
+        )
+
+    def note_user_activity(self) -> bool:
+        self.last_idle_activity_time = time.monotonic()
+        if self.idle_menu_hidden:
+            self.idle_menu_hidden = False
+            self.view.update()
+            return True
+        return False
+
+    def check_idle_menu_hide(self):
+        if not self.idle_menu_hide_allowed():
+            self.last_idle_activity_time = time.monotonic()
+            if self.idle_menu_hidden:
+                self.idle_menu_hidden = False
+                self.view.update()
+            return
+
+        if self.idle_menu_hidden:
+            return
+
+        if time.monotonic() - self.last_idle_activity_time >= self.idle_menu_hide_timeout_seconds():
+            self.idle_menu_hidden = True
+            self.view.update()
+
+    def settings_categories(self) -> list[str]:
+        return ["Display", "Menu", "Controls", "System"]
+
     def update_settings_items(self):
+        if self.settings_category is None:
+            self.settings_items = self.settings_categories()
+            return
+
         fullscreen_launch_label = self.setting_state_label(
             "Fullscreen at Launch",
             self.settings.get("fullscreen_at_launch", False),
@@ -1703,23 +1777,40 @@ class GentlemanWindow(QMainWindow):
             self.ingame_osd_enabled(),
         )
 
-        self.settings_items = [
-            fullscreen_launch_label,
-            "Menu Size",
-            systems_menu_label,
-            emulators_menu_label,
-            recent_menu_label,
-            favorites_menu_label,
-            logo_label,
-            arcade_names_label,
-            "Clear Recent",
-            "Clear Favorites",
-            update_check_label,
-            ingame_osd_label,
-            api_label,
-            swap_ab_label,
-            swap_xy_label,
-        ]
+        menu_size_label = f"Menu Size: {int(self.settings.get('fullscreen_menu_size', 100))}%"
+        idle_menu_hide_label = self.idle_menu_hide_label()
+
+        if self.settings_category == "Display":
+            self.settings_items = [
+                fullscreen_launch_label,
+                logo_label,
+            ]
+        elif self.settings_category == "Menu":
+            self.settings_items = [
+                menu_size_label,
+                idle_menu_hide_label,
+                systems_menu_label,
+                emulators_menu_label,
+                recent_menu_label,
+                favorites_menu_label,
+                arcade_names_label,
+                "Clear Recent",
+                "Clear Favorites",
+            ]
+        elif self.settings_category == "Controls":
+            self.settings_items = [
+                swap_ab_label,
+                swap_xy_label,
+                ingame_osd_label,
+            ]
+        elif self.settings_category == "System":
+            self.settings_items = [
+                api_label,
+                update_check_label,
+            ]
+        else:
+            self.settings_category = None
+            self.settings_items = self.settings_categories()
 
     def launcher_type_values(self) -> list[str]:
         return ["Standalone Emulator", "RetroArch", "Application", "PC Game", "Shortcut", "Shortcut Folder"]
@@ -1756,13 +1847,10 @@ class GentlemanWindow(QMainWindow):
                     folders.append(str(folder.relative_to(self.menu_root)).replace(chr(92), "/"))
                 except ValueError:
                     pass
-        folders.append("__new__")
         self.launcher_form_folders = folders
 
     def launcher_form_folder_label(self) -> str:
         folder = self.launcher_form_data.get("folder", "")
-        if folder == "__new__":
-            return "Create New Folder"
         return "Root Menu" if not folder else folder
 
     def update_launcher_form_fields(self):
@@ -1774,8 +1862,6 @@ class GentlemanWindow(QMainWindow):
             "Save Folder",
         ]
 
-        if self.launcher_form_data.get("folder") == "__new__":
-            fields.append("New Folder Name")
 
         if launcher_type in ("Application", "PC Game"):
             fields.extend([
@@ -1820,9 +1906,8 @@ class GentlemanWindow(QMainWindow):
             ])
 
         if self.launcher_form_mode == "edit":
-            fields.remove("Save Folder")
-            if "New Folder Name" in fields:
-                fields.remove("New Folder Name")
+            if "Save" in fields and "Remove Launcher" not in fields:
+                fields.insert(fields.index("Save") + 1, "Remove Launcher")
 
         self.launcher_form_fields = fields
 
@@ -1839,10 +1924,15 @@ class GentlemanWindow(QMainWindow):
                 return
 
             launcher_type = self.launcher_type_from_json(str(data.get("type", "standalone")))
+            try:
+                launcher_folder = launcher_path.parent.relative_to(self.menu_root)
+                launcher_folder_value = "" if str(launcher_folder) == "." else str(launcher_folder).replace(chr(92), "/")
+            except ValueError:
+                launcher_folder_value = ""
+
             self.launcher_form_data = {
                 "launcher_name": launcher_path.stem,
-                "folder": "",
-                "new_folder": "",
+                "folder": launcher_folder_value,
                 "emulator_name": str(data.get("emulator_name", "")),
                 "system": str(data.get("system", "")),
                 "type": launcher_type,
@@ -1865,7 +1955,6 @@ class GentlemanWindow(QMainWindow):
             self.launcher_form_data = {
                 "launcher_name": "",
                 "folder": "",
-                "new_folder": "",
                 "emulator_name": "",
                 "system": "",
                 "type": "Standalone Emulator",
@@ -1918,8 +2007,6 @@ class GentlemanWindow(QMainWindow):
             return self.launcher_form_data.get("launcher_name", "")
         if field == "Save Folder":
             return self.launcher_form_folder_label()
-        if field == "New Folder Name":
-            return self.launcher_form_data.get("new_folder", "")
         if field == "Emulator Name":
             return self.launcher_form_data.get("emulator_name", "")
         if field in ("Application Name", "Game Name"):
@@ -1972,34 +2059,162 @@ class GentlemanWindow(QMainWindow):
         self.view.update()
         return True
 
+    def folder_picker_relative_label(self) -> str:
+        try:
+            rel = self.folder_picker_current_folder.relative_to(self.menu_root)
+        except ValueError:
+            return "Root Menu"
+        return "Root Menu" if str(rel) == "." else str(rel).replace(chr(92), "/")
+
+    def is_path_inside_menu_root(self, path: Path) -> bool:
+        try:
+            root = self.menu_root.resolve()
+            resolved = path.resolve()
+        except Exception:
+            return False
+        return resolved == root or root in resolved.parents
+
+    def rebuild_folder_picker_items(self):
+        folder = self.folder_picker_current_folder
+        if not self.is_path_inside_menu_root(folder):
+            folder = self.menu_root
+            self.folder_picker_current_folder = folder
+
+        entries = []
+        try:
+            children = sorted([child for child in folder.iterdir() if child.is_dir()], key=lambda item: item.name.lower())
+        except Exception:
+            children = []
+
+        for child in children:
+            entries.append({"type": "folder", "name": child.name, "path": child})
+
+        entries.append({"type": "separator", "name": ""})
+        entries.append({"type": "create", "name": "Create Folder"})
+        entries.append({"type": "select", "name": "Select This Folder"})
+        if folder != self.menu_root:
+            entries.append({"type": "remove", "name": "Remove This Folder"})
+        self.folder_picker_items = entries
+
+    def first_selectable_folder_picker_index(self) -> int:
+        for index, item in enumerate(self.folder_picker_items):
+            if item.get("type") != "separator":
+                return index
+        return 0
+
+    def select_this_folder_picker_index(self) -> int:
+        for index, item in enumerate(self.folder_picker_items):
+            if item.get("type") == "select":
+                return index
+        return self.first_selectable_folder_picker_index()
+
     def open_folder_picker(self):
-        self.rebuild_launcher_form_folders()
-        self.folder_picker_items = self.launcher_form_folders[:]
         self.launcher_form_return_index = self.selected_index
 
-        current = self.launcher_form_data.get("folder", "")
-        try:
-            self.selected_index = self.folder_picker_items.index(current)
-        except ValueError:
-            self.selected_index = 0
+        folder_value = self.launcher_form_data.get("folder", "")
+        target = self.menu_root / folder_value if folder_value else self.menu_root
+        self.folder_picker_current_folder = target if target.exists() and target.is_dir() and self.is_path_inside_menu_root(target) else self.menu_root
 
+        self.rebuild_folder_picker_items()
+        self.selected_index = self.first_selectable_folder_picker_index()
         self.mode = "folder_picker"
         self.view.scroll_offset = 0
         self.view.ensure_visible()
         self.view.update()
 
+    def set_folder_picker_folder(self, folder: Path, prefer_select: bool = False):
+        self.folder_picker_current_folder = folder
+        self.rebuild_folder_picker_items()
+        self.selected_index = self.select_this_folder_picker_index() if prefer_select else self.first_selectable_folder_picker_index()
+        self.view.scroll_offset = 0
+        self.view.ensure_visible()
+        self.view.update()
+
+    def create_folder_from_picker(self, folder_name: str):
+        safe_name = self.launcher_form_safe_filename(folder_name.strip())
+        if not folder_name.strip() or not safe_name:
+            self.show_message("Missing folder name", "Enter a folder name.")
+            return
+
+        target = self.folder_picker_current_folder / safe_name
+        if not self.is_path_inside_menu_root(target):
+            self.show_message("Invalid folder", "Folder path is outside the menu folder.")
+            return
+
+        if target.exists() and not target.is_dir():
+            self.show_message("Invalid folder", "A file with this name already exists.")
+            return
+
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.show_message("Create folder failed", str(exc))
+            return
+
+        self.mode = "folder_picker"
+        self.set_folder_picker_folder(target, prefer_select=True)
+
+    def confirm_remove_folder_from_picker(self):
+        folder_path = self.folder_picker_current_folder
+        if folder_path == self.menu_root or not folder_path.exists() or not folder_path.is_dir() or not self.is_path_inside_menu_root(folder_path):
+            self.show_message("Remove failed", "This folder cannot be removed safely.")
+            return
+
+        parent_folder = folder_path.parent
+        folder_name = folder_path.name
+
+        def remove_folder():
+            try:
+                shutil.rmtree(folder_path)
+            except Exception as exc:
+                self.show_message("Remove failed", str(exc))
+                return
+            self.mode = "folder_picker"
+            self.set_folder_picker_folder(parent_folder if self.is_path_inside_menu_root(parent_folder) else self.menu_root)
+
+        self.show_confirmation(
+            "Remove Folder",
+            f"Remove folder '{folder_name}'?\n\nThis will remove the folder, all launchers, and all subfolders inside it.",
+            remove_folder,
+        )
+
     def select_folder_picker_item(self):
         if not self.folder_picker_items:
             return
 
-        selected = self.folder_picker_items[self.selected_index]
-        self.launcher_form_data["folder"] = selected
-        self.update_launcher_form_fields()
-        self.mode = "launcher_form"
-        self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
-        self.view.scroll_offset = 0
-        self.view.ensure_visible()
-        self.view.update()
+        item = self.folder_picker_items[self.selected_index]
+        item_type = item.get("type")
+
+        if item_type == "separator":
+            return
+
+        if item_type == "folder":
+            folder = item.get("path")
+            if isinstance(folder, Path):
+                self.set_folder_picker_folder(folder)
+            return
+
+        if item_type == "create":
+            self.open_text_input("Create Folder", "Folder name:", "", self.create_folder_from_picker)
+            return
+
+        if item_type == "remove":
+            self.confirm_remove_folder_from_picker()
+            return
+
+        if item_type == "select":
+            try:
+                rel = self.folder_picker_current_folder.relative_to(self.menu_root)
+                folder_value = "" if str(rel) == "." else str(rel).replace(chr(92), "/")
+            except ValueError:
+                folder_value = ""
+            self.launcher_form_data["folder"] = folder_value
+            self.update_launcher_form_fields()
+            self.mode = "launcher_form"
+            self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
+            self.view.scroll_offset = 0
+            self.view.ensure_visible()
+            self.view.update()
 
     def open_type_picker(self):
         self.type_picker_items = self.launcher_type_values()
@@ -2071,6 +2286,10 @@ class GentlemanWindow(QMainWindow):
             self.save_launcher_form()
             return
 
+        if field == "Remove Launcher":
+            self.confirm_remove_launcher()
+            return
+
         if field == "Cancel":
             self.cancel_launcher_form()
             return
@@ -2089,7 +2308,6 @@ class GentlemanWindow(QMainWindow):
 
         key_map = {
             "Launcher Name": "launcher_name",
-            "New Folder Name": "new_folder",
             "Emulator Name": "emulator_name",
             "Application Name": "emulator_name",
             "Game Name": "emulator_name",
@@ -2194,27 +2412,29 @@ class GentlemanWindow(QMainWindow):
                 self.show_message("Missing core", "Select a RetroArch core.")
                 return
 
-        if self.launcher_form_mode == "edit" and self.launcher_form_path:
-            json_path = self.launcher_form_path
-        else:
-            folder_value = data.get("folder", "")
-            if folder_value == "__new__":
-                folder_name = data.get("new_folder", "").strip()
-                if not folder_name:
-                    self.show_message("Missing folder name", "Enter a new folder name.")
-                    return
-                target_folder = self.menu_root / self.launcher_form_safe_filename(folder_name)
-            elif folder_value:
-                target_folder = self.menu_root / folder_value
-            else:
-                target_folder = self.menu_root
+        folder_value = data.get("folder", "")
+        target_folder = self.menu_root / folder_value if folder_value else self.menu_root
 
+        if not self.is_path_inside_menu_root(target_folder):
+            self.show_message("Invalid folder", "Folder path is outside the menu folder.")
+            return
+
+        try:
             target_folder.mkdir(parents=True, exist_ok=True)
-            json_path = target_folder / f"{self.launcher_form_safe_filename(launcher_name)}.json"
+        except Exception as exc:
+            self.show_message("Save failed", str(exc))
+            return
 
-            if json_path.exists():
-                self.show_message("Already exists", f"{json_path.name} already exists.")
-                return
+        json_path = target_folder / f"{self.launcher_form_safe_filename(launcher_name)}.json"
+
+        if not self.is_path_inside_menu_root(json_path):
+            self.show_message("Invalid launcher", "Launcher path is outside the menu folder.")
+            return
+
+        old_json_path = self.launcher_form_path if self.launcher_form_mode == "edit" else None
+        if json_path.exists() and (not old_json_path or json_path.resolve() != old_json_path.resolve()):
+            self.show_message("Already exists", f"{json_path.name} already exists.")
+            return
 
         extensions = []
         for ext in data.get("extensions", "").split(","):
@@ -2258,11 +2478,43 @@ class GentlemanWindow(QMainWindow):
 
         json_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
+        if old_json_path and json_path.resolve() != old_json_path.resolve():
+            try:
+                old_json_path.unlink()
+            except Exception:
+                pass
+            self.launcher_form_path = json_path
+
         if self.launcher_form_mode == "edit":
-            self.open_edit_launcher_browser(self.current_edit_folder)
+            self.open_edit_launcher_browser(json_path.parent)
         else:
             self.current_folder = self.menu_root
             self.refresh_menu()
+
+    def confirm_remove_launcher(self):
+        if self.launcher_form_mode != "edit" or not self.launcher_form_path:
+            return
+
+        launcher_path = self.launcher_form_path
+        if launcher_path.suffix.lower() != ".json" or not self.is_path_inside_menu_root(launcher_path):
+            self.show_message("Remove failed", "This launcher cannot be removed safely.")
+            return
+
+        launcher_name = launcher_path.stem
+
+        def remove_launcher():
+            try:
+                launcher_path.unlink()
+            except Exception as exc:
+                self.show_message("Remove failed", str(exc))
+                return
+            self.open_edit_launcher_browser(launcher_path.parent)
+
+        self.show_confirmation(
+            "Remove Launcher",
+            f"Remove '{launcher_name}'?\n\nThis will delete the launcher JSON file.",
+            remove_launcher,
+        )
 
     def cancel_launcher_form(self):
         if self.launcher_form_mode == "edit":
@@ -2525,9 +2777,13 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "system":
             return "Gentleman Menu"
         if self.mode == "settings":
+            if self.settings_category:
+                return f"Settings/{self.settings_category}"
             return "Settings"
         if self.mode == "menu_size":
             return "Menu Size"
+        if self.mode == "idle_hide_timeout":
+            return "Auto Hide Menu"
         if self.mode == "wallpaper":
             return "Wallpapers"
         if self.mode == "support":
@@ -2539,7 +2795,11 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "type_picker":
             return "Type"
         if self.mode == "folder_picker":
-            return "Save Folder"
+            return f"Save Folder/{self.folder_picker_relative_label()}"
+        if self.mode == "item_options":
+            if self.item_options_target and self.item_options_target.item_type == "folder":
+                return "Folder Options"
+            return "Launcher Options"
         if self.mode == "edit_launchers":
             if self.current_edit_folder == self.menu_root:
                 return "Edit Launcher"
@@ -2547,6 +2807,8 @@ class GentlemanWindow(QMainWindow):
                 return f"Edit/{str(self.current_edit_folder.relative_to(self.menu_root)).replace(chr(92), '/')}"
             except Exception:
                 return "Edit Launcher"
+        if self.mode == "search_results":
+            return f"Search Results/{self.search_query}" if self.search_query else "Search Results"
         if self.mode == "favorites":
             return "Favorites"
         if self.mode == "recent":
@@ -2586,6 +2848,8 @@ class GentlemanWindow(QMainWindow):
             return len(self.settings_items)
         if self.mode == "menu_size":
             return 3
+        if self.mode == "idle_hide_timeout":
+            return len(self.idle_menu_hide_timeout_choices())
         if self.mode == "wallpaper":
             return len(self.wallpaper_items)
         if self.mode == "support":
@@ -2599,10 +2863,14 @@ class GentlemanWindow(QMainWindow):
             return len(self.type_picker_items)
         if self.mode == "folder_picker":
             return len(self.folder_picker_items)
+        if self.mode == "item_options":
+            return len(self.item_options_items)
         if self.mode == "edit_launchers":
             return len(self.edit_launcher_items) + 1
         if self.mode == "about":
             return len(ABOUT_LINES)
+        if self.mode == "search_results":
+            return len(self.search_items) + 1
         if self.mode == "favorites":
             return len(self.favorite_items) + 1
         if self.mode == "recent":
@@ -2659,6 +2927,13 @@ class GentlemanWindow(QMainWindow):
                 ("125%" + ("  ✓" if selected == 125 else ""), ""),
                 ("150%" + ("  ✓" if selected == 150 else ""), ""),
             ]
+        if self.mode == "idle_hide_timeout":
+            selected = self.idle_menu_hide_timeout_seconds()
+            labels = []
+            for value in self.idle_menu_hide_timeout_choices():
+                label = "Disabled" if value == 0 else ("1 min" if value == 60 else f"{value} sec")
+                labels.append((label + ("  ✓" if selected == value else ""), ""))
+            return labels
         if self.mode == "wallpaper":
             return [(name, "") for name in self.wallpaper_items]
         if self.mode == "support":
@@ -2669,7 +2944,7 @@ class GentlemanWindow(QMainWindow):
             launcher_type = self.launcher_form_data.get("type", "Standalone Emulator")
             for field in self.launcher_form_fields:
                 display_field = "RetroArch Path" if field == "Emulator Path" and launcher_type == "RetroArch" else field
-                if field in ("Save", "Cancel"):
+                if field in ("Save", "Cancel", "Remove Launcher"):
                     labels.append((field, ""))
                 else:
                     labels.append((f"{display_field}: {self.launcher_form_value(field)}", ""))
@@ -2681,17 +2956,22 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "folder_picker":
             labels = []
             for item in self.folder_picker_items:
-                if item == "":
-                    labels.append(("Root Menu", ""))
-                elif item == "__new__":
-                    labels.append(("Create New Folder", ""))
+                item_type = item.get("type")
+                if item_type == "folder":
+                    labels.append((item.get("name", ""), "<DIR>"))
+                elif item_type == "separator":
+                    labels.append(("", ""))
                 else:
-                    labels.append((item, ""))
+                    labels.append((item.get("name", ""), ""))
             return labels
+        if self.mode == "item_options":
+            return [(name, "") for name in self.item_options_items]
         if self.mode == "edit_launchers":
-            return [("...", "<DIR>")] + [(item.name, "<DIR>") for item in self.edit_launcher_items]
+            return [("...", "<DIR>")] + [(item.name, item.marker) for item in self.edit_launcher_items]
         if self.mode == "about":
             return [(line, "") for line in ABOUT_LINES]
+        if self.mode == "search_results":
+            return [("...", "<DIR>")] + [(str(item.get("name", "")), str(item.get("marker", ""))) for item in self.search_items]
         if self.mode == "favorites":
             return [("...", "<DIR>")] + [(self.display_name_for_saved_game_item(item), "") for item in self.favorite_items]
         if self.mode == "recent":
@@ -2720,11 +3000,186 @@ class GentlemanWindow(QMainWindow):
             labels.append(("Emulators", "<DIR>"))
 
         for item in self.menu_items:
-            labels.append((item.name, "<DIR>"))
+            labels.append((item.name, item.marker))
 
         if self.current_folder != self.menu_root:
             labels.insert(0, ("...", "<DIR>"))
         return labels
+
+    def selected_menu_item(self) -> MenuItem | None:
+        if self.mode != "menu":
+            return None
+
+        menu_index = self.selected_index
+
+        if self.current_folder == self.menu_root:
+            if self.favorites_menu_enabled():
+                if menu_index == 0:
+                    return None
+                menu_index -= 1
+
+            if self.recent_menu_enabled():
+                if menu_index == 0:
+                    return None
+                menu_index -= 1
+
+            if self.systems_menu_enabled():
+                if menu_index == 0:
+                    return None
+                menu_index -= 1
+
+            if self.emulators_menu_enabled():
+                if menu_index == 0:
+                    return None
+                menu_index -= 1
+
+        if self.current_folder != self.menu_root:
+            if self.selected_index == 0:
+                return None
+            menu_index -= 1
+
+        if menu_index < 0 or menu_index >= len(self.menu_items):
+            return None
+
+        return self.menu_items[menu_index]
+
+    def open_current_item_options(self):
+        item = self.selected_menu_item()
+        if not item:
+            return
+
+        self.item_options_target = item
+        self.item_options_return_mode = self.mode
+        self.item_options_return_index = self.selected_index
+
+        if item.item_type == "folder":
+            self.item_options_items = ["Open Folder", "Remove Folder", "Cancel"]
+        else:
+            self.item_options_items = ["Open Launcher", "Edit Launcher", "Remove Launcher", "Cancel"]
+
+        self.mode = "item_options"
+        self.selected_index = 0
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def close_item_options(self):
+        self.mode = self.item_options_return_mode or "menu"
+        self.selected_index = self.item_options_return_index
+        self.item_options_target = None
+        self.item_options_items = []
+        self.view.ensure_visible()
+        self.view.update()
+
+    def activate_item_option(self):
+        if not self.item_options_target or self.selected_index >= len(self.item_options_items):
+            self.close_item_options()
+            return
+
+        action = self.item_options_items[self.selected_index]
+        item = self.item_options_target
+
+        if action == "Cancel":
+            self.close_item_options()
+            return
+
+        if item.item_type == "folder":
+            if action == "Open Folder":
+                folder = item.path
+                self.close_item_options()
+                self.current_folder = folder
+                self.refresh_menu()
+                return
+            if action == "Remove Folder":
+                self.confirm_remove_menu_folder(item.path)
+                return
+
+        if item.item_type == "launcher":
+            if action == "Open Launcher":
+                launcher_item = item
+                self.close_item_options()
+                self.open_launcher_item(launcher_item)
+                return
+            if action == "Edit Launcher":
+                launcher_path = item.path
+                self.close_item_options()
+                self.open_launcher_form(launcher_path)
+                return
+            if action == "Remove Launcher":
+                self.confirm_remove_menu_launcher(item.path)
+                return
+
+    def confirm_remove_menu_launcher(self, launcher_path: Path):
+        if launcher_path.suffix.lower() != ".json" or not self.is_path_inside_menu_root(launcher_path):
+            self.show_message("Remove failed", "This launcher cannot be removed safely.")
+            return
+
+        launcher_name = launcher_path.stem
+        parent_folder = launcher_path.parent
+        return_index = self.item_options_return_index
+
+        def remove_launcher():
+            try:
+                launcher_path.unlink()
+            except Exception as exc:
+                self.show_message("Remove failed", str(exc))
+                return
+
+            self.item_options_target = None
+            self.item_options_items = []
+            self.current_folder = parent_folder if self.is_path_inside_menu_root(parent_folder) else self.menu_root
+            self.refresh_menu()
+            count = self.current_items_count()
+            self.selected_index = min(return_index, max(0, count - 1)) if count else 0
+            self.view.ensure_visible()
+            self.view.update()
+
+        self.show_confirmation(
+            "Remove Launcher",
+            f"Remove '{launcher_name}'?\n\nThis will delete the launcher JSON file.",
+            remove_launcher,
+        )
+
+    def confirm_remove_menu_folder(self, folder_path: Path):
+        if not folder_path.exists() or not folder_path.is_dir() or not self.is_path_inside_menu_root(folder_path):
+            self.show_message("Remove failed", "This folder cannot be removed safely.")
+            return
+
+        try:
+            root = self.menu_root.resolve()
+            target = folder_path.resolve()
+        except Exception:
+            self.show_message("Remove failed", "This folder cannot be removed safely.")
+            return
+
+        if target == root or root not in target.parents:
+            self.show_message("Remove failed", "The root menu folder cannot be removed.")
+            return
+
+        folder_name = folder_path.name
+        parent_folder = folder_path.parent
+        return_index = self.item_options_return_index
+
+        def remove_folder():
+            try:
+                shutil.rmtree(folder_path)
+            except Exception as exc:
+                self.show_message("Remove failed", str(exc))
+                return
+
+            self.item_options_target = None
+            self.item_options_items = []
+            self.current_folder = parent_folder if self.is_path_inside_menu_root(parent_folder) else self.menu_root
+            self.refresh_menu()
+            count = self.current_items_count()
+            self.selected_index = min(return_index, max(0, count - 1)) if count else 0
+            self.view.ensure_visible()
+            self.view.update()
+
+        self.show_confirmation(
+            "Remove Folder",
+            f"Remove folder '{folder_name}'?\n\nThis will remove the folder, all launchers, and all subfolders inside it.",
+            remove_folder,
+        )
 
     def refresh_menu(self):
         self.mode = "menu"
@@ -2766,6 +3221,13 @@ class GentlemanWindow(QMainWindow):
             return
 
         if self.mode == "settings":
+            if self.settings_category:
+                self.settings_category = None
+                self.update_settings_items()
+                self.selected_index = 0
+                self.view.scroll_offset = 0
+                self.view.update()
+                return
             self.mode = "system"
             self.selected_index = 0
             self.view.update()
@@ -2773,8 +3235,18 @@ class GentlemanWindow(QMainWindow):
 
         if self.mode == "menu_size":
             self.mode = "settings"
+            self.settings_category = "Menu"
             self.update_settings_items()
-            self.selected_index = min(1, max(0, len(self.settings_items) - 1))
+            self.selected_index = 0
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+
+        if self.mode == "idle_hide_timeout":
+            self.mode = "settings"
+            self.settings_category = "Menu"
+            self.update_settings_items()
+            self.selected_index = 1
             self.view.scroll_offset = 0
             self.view.update()
             return
@@ -2810,10 +3282,17 @@ class GentlemanWindow(QMainWindow):
             return
 
         if self.mode == "folder_picker":
+            if self.folder_picker_current_folder != self.menu_root:
+                self.set_folder_picker_folder(self.folder_picker_current_folder.parent)
+                return
             self.mode = "launcher_form"
             self.selected_index = min(self.launcher_form_return_index, max(0, len(self.launcher_form_fields) - 1))
             self.view.ensure_visible()
             self.view.update()
+            return
+
+        if self.mode == "item_options":
+            self.close_item_options()
             return
 
         if self.mode == "edit_launchers":
@@ -2830,6 +3309,10 @@ class GentlemanWindow(QMainWindow):
             self.mode = "system"
             self.selected_index = 0
             self.view.update()
+            return
+
+        if self.mode == "search_results":
+            self.restore_search_return_state()
             return
 
         if self.mode == "favorites":
@@ -2915,6 +3398,10 @@ class GentlemanWindow(QMainWindow):
             self.activate_menu_size_item(self.selected_index)
             return
 
+        if self.mode == "idle_hide_timeout":
+            self.activate_idle_hide_timeout_item(self.selected_index)
+            return
+
         if self.mode == "wallpaper":
             self.activate_wallpaper_item(self.wallpaper_items[self.selected_index])
             return
@@ -2939,6 +3426,10 @@ class GentlemanWindow(QMainWindow):
             self.edit_launcher_form_field()
             return
 
+        if self.mode == "item_options":
+            self.activate_item_option()
+            return
+
         if self.mode == "edit_launchers":
             if self.selected_index == 0:
                 self.go_back()
@@ -2954,6 +3445,10 @@ class GentlemanWindow(QMainWindow):
                 return
 
             self.open_launcher_form(item.path)
+            return
+
+        if self.mode == "search_results":
+            self.activate_search_result()
             return
 
         if self.mode == "favorites":
@@ -3129,6 +3624,258 @@ class GentlemanWindow(QMainWindow):
 
         self.open_launcher_item(item)
 
+
+    def search_normalized_text(self, value: str) -> str:
+        text = str(value or "").lower()
+        return "".join(ch for ch in text if ch.isalnum())
+
+    def search_result_marker(self, launcher: LauncherConfig | None, fallback: str = "") -> str:
+        if launcher is None:
+            return fallback
+        if launcher.launcher_type == "application":
+            return "<APP>"
+        if launcher.launcher_type == "shortcut":
+            return "<LINK>"
+        if launcher.launcher_type == "shortcut_folder":
+            return "<LINK>"
+        label = (launcher.system or launcher.emulator_name or launcher.path.stem).strip()
+        if not label:
+            return fallback
+        return f"<{label[:12]}>"
+
+    def search_result_matches(self, name: str, query: str) -> bool:
+        q = self.search_normalized_text(query)
+        if not q:
+            return False
+        return q in self.search_normalized_text(name)
+
+    def current_search_scope_label(self) -> str:
+        if self.mode == "menu":
+            if self.current_folder == self.menu_root:
+                return "All"
+            try:
+                return str(self.current_folder.relative_to(self.menu_root)).replace(chr(92), "/")
+            except Exception:
+                return self.current_folder.name
+        if self.mode == "roms" and self.current_launcher:
+            label = self.current_launcher.system or self.current_launcher.path.stem
+            if self.current_rom_folder:
+                try:
+                    root = Path(self.current_launcher.rom_directory).resolve()
+                    folder = self.current_rom_folder.resolve()
+                    if folder != root and root in folder.parents:
+                        rel = str(folder.relative_to(root)).replace(chr(92), "/")
+                        return f"{label}/{rel}"
+                except Exception:
+                    pass
+            return label
+        if self.mode == "system_launchers" and self.current_game_system:
+            return self.current_game_system
+        if self.mode == "favorites":
+            return "Favorites"
+        if self.mode == "recent":
+            return "Recent"
+        return "Current"
+
+    def capture_search_return_state(self) -> dict:
+        return {
+            "mode": self.mode,
+            "selected_index": self.selected_index,
+            "scroll_offset": self.view.scroll_offset,
+            "current_folder": self.current_folder,
+            "current_launcher": self.current_launcher,
+            "current_rom_folder": self.current_rom_folder,
+            "current_game_system": self.current_game_system,
+        }
+
+    def restore_search_return_state(self):
+        state = self.search_return_state or {}
+        self.mode = state.get("mode", "menu")
+        self.selected_index = int(state.get("selected_index", 0) or 0)
+        self.view.scroll_offset = int(state.get("scroll_offset", 0) or 0)
+        self.current_folder = state.get("current_folder", self.current_folder)
+        self.current_launcher = state.get("current_launcher", self.current_launcher)
+        self.current_rom_folder = state.get("current_rom_folder", self.current_rom_folder)
+        self.current_game_system = state.get("current_game_system", self.current_game_system)
+        self.search_items = []
+        self.search_query = ""
+        self.search_scope_label = ""
+        self.view.ensure_visible()
+        self.view.update()
+
+    def open_context_search(self):
+        if self.overlay or self.input_suspended_for_launch or self.ingame_osd.isVisible():
+            return
+        if self.mode not in {"menu", "roms", "system_launchers", "favorites", "recent", "search_results"}:
+            return
+        if self.mode == "roms" and self.rom_loading:
+            return
+
+        if self.mode != "search_results":
+            self.search_return_state = self.capture_search_return_state()
+            self.search_scope_label = self.current_search_scope_label()
+        title = f"Search: {self.search_scope_label or 'Current'}"
+        self.open_text_input(title, "Enter search text", self.search_query, self.run_context_search)
+
+    def launcher_items_under_folder(self, folder: Path) -> list[MenuItem]:
+        items: list[MenuItem] = []
+        try:
+            launcher_paths = sorted(folder.rglob("*.json"), key=lambda p: str(p).lower())
+        except Exception:
+            launcher_paths = []
+        for launcher_path in launcher_paths:
+            if not self.is_path_inside_menu_root(launcher_path):
+                continue
+            items.append(MenuItem(launcher_path.stem, launcher_path, "launcher"))
+        return items
+
+    def collect_search_games_for_launcher(self, launcher_item: MenuItem, start_folder: Path | None = None, recursive: bool = True) -> list[dict]:
+        try:
+            launcher = load_launcher(launcher_item.path)
+        except Exception:
+            return []
+
+        if launcher.launcher_type in {"application", "shortcut"}:
+            return [{
+                "type": "launcher",
+                "name": launcher.emulator_name or launcher_item.name,
+                "marker": self.search_result_marker(launcher),
+                "launcher_item": launcher_item,
+                "launcher": launcher,
+                "rom": None,
+            }]
+
+        root = Path(start_folder or launcher.rom_directory)
+        if not root.is_dir():
+            return []
+
+        games: list[dict] = []
+        folders_to_scan = [root]
+        visited: set[str] = set()
+
+        while folders_to_scan:
+            folder = folders_to_scan.pop(0)
+            try:
+                folder_key = str(folder.resolve()).replace(chr(92), "/").lower()
+            except Exception:
+                folder_key = str(folder).replace(chr(92), "/").lower()
+            if folder_key in visited:
+                continue
+            visited.add(folder_key)
+
+            for rom_item in self.scan_cached_rom_folder_sync(launcher, folder):
+                if rom_item.is_dir:
+                    if recursive:
+                        folders_to_scan.append(rom_item.path)
+                    continue
+                games.append({
+                    "type": "game",
+                    "name": rom_item.display_name,
+                    "marker": self.search_result_marker(launcher),
+                    "launcher_item": launcher_item,
+                    "launcher": launcher,
+                    "rom": rom_item.path,
+                })
+        return games
+
+    def build_context_search_items(self, query: str) -> list[dict]:
+        state = self.search_return_state or {}
+        mode = state.get("mode", self.mode)
+        results: list[dict] = []
+
+        if mode == "menu":
+            folder = state.get("current_folder", self.menu_root)
+            if not isinstance(folder, Path):
+                folder = self.menu_root
+            for launcher_item in self.launcher_items_under_folder(folder):
+                results.extend(self.collect_search_games_for_launcher(launcher_item, recursive=True))
+        elif mode == "roms":
+            launcher = state.get("current_launcher")
+            folder = state.get("current_rom_folder")
+            if isinstance(launcher, LauncherConfig) and isinstance(folder, Path):
+                launcher_item = MenuItem(launcher.path.stem, launcher.path, "launcher")
+                results.extend(self.collect_search_games_for_launcher(launcher_item, folder, recursive=True))
+        elif mode == "system_launchers":
+            system_name = str(state.get("current_game_system") or "")
+            results.extend(self.game_system_games.get(system_name, []))
+        elif mode == "favorites":
+            for item in self.favorite_items:
+                results.append({
+                    "type": "saved",
+                    "name": self.display_name_for_saved_game_item(item),
+                    "marker": "<FAV>",
+                    "saved_item": item,
+                })
+        elif mode == "recent":
+            for item in self.recent_items:
+                results.append({
+                    "type": "saved",
+                    "name": self.display_name_for_saved_game_item(item),
+                    "marker": "<RECENT>",
+                    "saved_item": item,
+                })
+
+        filtered: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for item in results:
+            name = str(item.get("name", ""))
+            if not self.search_result_matches(name, query):
+                continue
+            launcher = item.get("launcher")
+            rom = item.get("rom")
+            launcher_path = getattr(launcher, "path", item.get("launcher_item", MenuItem("", Path(), "launcher")).path)
+            rom_path = rom if rom is not None else launcher_path
+            if item.get("type") == "saved":
+                saved = item.get("saved_item", {})
+                key = (str(saved.get("launcher", "")).lower(), str(saved.get("rom", "")).lower())
+            else:
+                key = (str(launcher_path).lower(), str(rom_path).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            if "marker" not in item or not item.get("marker"):
+                item["marker"] = self.search_result_marker(item.get("launcher"))
+            filtered.append(item)
+
+        filtered.sort(key=lambda item: str(item.get("name", "")).lower())
+        return filtered
+
+    def run_context_search(self, value: str):
+        query = str(value or "").strip()
+        if not query:
+            self.restore_search_return_state()
+            return
+
+        self.search_query = query
+        self.search_items = self.build_context_search_items(query)
+        self.mode = "search_results"
+        self.selected_index = 0 if not self.search_items else 1
+        self.view.scroll_offset = 0
+        self.view.update()
+
+        if not self.search_items:
+            self.show_message("Search", f"No results found for '{query}'.")
+
+    def activate_search_result(self):
+        if self.selected_index == 0:
+            self.restore_search_return_state()
+            return
+        result_index = self.selected_index - 1
+        if result_index < 0 or result_index >= len(self.search_items):
+            return
+
+        item = self.search_items[result_index]
+        item_type = item.get("type")
+        if item_type == "saved":
+            self.launch_recent_item(item.get("saved_item", {}))
+            return
+        if item_type == "launcher":
+            launcher_item = item.get("launcher_item")
+            if isinstance(launcher_item, MenuItem):
+                self.open_launcher_item(launcher_item)
+            return
+        self.launch_system_game_item(item)
+
     def launch_system_game_item(self, item: dict):
         launcher = item.get("launcher")
         launcher_item = item.get("launcher_item")
@@ -3253,9 +4000,11 @@ class GentlemanWindow(QMainWindow):
             self.view.scroll_offset = 0
             self.view.update()
         elif item == "Settings":
+            self.settings_category = None
             self.update_settings_items()
             self.mode = "settings"
             self.selected_index = 0
+            self.view.scroll_offset = 0
             self.view.update()
         elif item == "Report Issues & Requests":
             webbrowser.open("https://github.com/Anime0t4ku/Gentleman/issues/new/choose")
@@ -3353,14 +4102,30 @@ class GentlemanWindow(QMainWindow):
         self.view.update()
 
     def activate_settings_item(self, item: str):
+        if self.settings_category is None:
+            if item in self.settings_categories():
+                self.settings_category = item
+                self.update_settings_items()
+                self.selected_index = 0
+                self.view.scroll_offset = 0
+                self.view.update()
+            return
+
         if item.startswith("Fullscreen at Launch:"):
             self.settings["fullscreen_at_launch"] = not self.settings.get("fullscreen_at_launch", False)
             self.refresh_settings_menu()
-        elif item == "Menu Size":
+        elif item.startswith("Menu Size:"):
             self.mode = "menu_size"
             sizes = [100, 125, 150]
             current = int(self.settings.get("fullscreen_menu_size", 100))
             self.selected_index = sizes.index(current) if current in sizes else 0
+            self.view.scroll_offset = 0
+            self.view.update()
+        elif item.startswith("Auto Hide Menu:"):
+            self.mode = "idle_hide_timeout"
+            choices = self.idle_menu_hide_timeout_choices()
+            current = self.idle_menu_hide_timeout_seconds()
+            self.selected_index = choices.index(current) if current in choices else 0
             self.view.scroll_offset = 0
             self.view.update()
         elif item.startswith("Systems Menu:"):
@@ -3418,6 +4183,17 @@ class GentlemanWindow(QMainWindow):
             return
         self.settings["fullscreen_menu_size"] = sizes[index]
         self.save_settings()
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_idle_hide_timeout_item(self, index: int):
+        choices = self.idle_menu_hide_timeout_choices()
+        if not (0 <= index < len(choices)):
+            return
+        self.settings["menu_idle_hide_timeout"] = choices[index]
+        self.save_settings()
+        self.idle_menu_hidden = False
+        self.last_idle_activity_time = time.monotonic()
         self.view.scroll_offset = 0
         self.view.update()
 
@@ -3886,16 +4662,19 @@ class GentlemanWindow(QMainWindow):
 
     def controller_activate(self):
         self.active_input = "controller"
+        self.note_user_activity()
         self.activate_selected(); self.view.update()
 
     def controller_back(self):
         self.active_input = "controller"
+        self.note_user_activity()
         if self.mode == "text_input": self.text_backspace()
         else: self.go_back()
         self.view.update()
 
     def controller_favorite(self):
         self.active_input = "controller"
+        self.note_user_activity()
         if self.mode == "text_input": self.insert_text(' ')
         elif self.mode == "favorites": self.remove_selected_favorite()
         else: self.toggle_current_favorite()
@@ -3903,24 +4682,42 @@ class GentlemanWindow(QMainWindow):
 
     def controller_shift(self):
         self.active_input='controller'
-        if self.mode=='text_input': self.text_input_shift=not self.text_input_shift; self.view.update()
+        self.note_user_activity()
+        if self.mode=='text_input':
+            self.text_input_shift=not self.text_input_shift
+        else:
+            self.open_current_item_options()
+        self.view.update()
 
     def controller_caps(self):
         self.active_input='controller'
+        self.note_user_activity()
         if self.mode=='text_input': self.text_input_caps=not self.text_input_caps; self.view.update()
 
+    def controller_search(self):
+        self.active_input = 'controller'
+        self.note_user_activity()
+        if self.mode == 'text_input':
+            self.text_input_symbols = not self.text_input_symbols
+            self.text_keyboard_row = self.text_keyboard_col = 0
+            self.rebuild_text_input_keys()
+        else:
+            self.open_context_search()
+        self.view.update()
+
     def controller_symbols(self):
-        self.active_input='controller'
-        if self.mode=='text_input': self.text_input_symbols=not self.text_input_symbols; self.text_keyboard_row=self.text_keyboard_col=0; self.rebuild_text_input_keys(); self.view.update()
+        self.controller_search()
 
     def controller_done(self):
         self.active_input='controller'
+        self.note_user_activity()
         if self.mode=='text_input': self.finish_text_input()
         else: self.activate_selected()
         self.view.update()
 
     def controller_step(self, action: str):
         self.active_input = "controller"
+        self.note_user_activity()
         if self.overlay:
             if self.overlay.get("type") == "choice" and action in ("left", "right"):
                 count=len(self.overlay.get("buttons", []))
@@ -4158,6 +4955,17 @@ class GentlemanWindow(QMainWindow):
         try:
             active_actions = self.controller_active_actions(directions)
 
+            if self.idle_menu_hidden and self.controller_any_input_active(buttons, axes, hats):
+                self.note_user_activity()
+                self.controller_button_state = {button: bool(pressed) for button, pressed in buttons.items()}
+                if active_actions:
+                    self.controller_repeat_action = active_actions[0]
+                    self.controller_repeat_next_ms = int(time.monotonic() * 1000) + 350
+                else:
+                    self.controller_repeat_action = None
+                    self.controller_repeat_next_ms = 0
+                return
+
             self.handle_controller_repeat(active_actions)
 
             if self.settings.get("swap_controller_ab", False):
@@ -4200,6 +5008,11 @@ class GentlemanWindow(QMainWindow):
             self.controller_available = False
             self.refresh_controller(force=True)
 
+    def is_current_selection_selectable(self) -> bool:
+        if self.mode == "folder_picker" and 0 <= self.selected_index < len(self.folder_picker_items):
+            return self.folder_picker_items[self.selected_index].get("type") != "separator"
+        return True
+
     def move_selection(self, delta: int):
         count = self.current_items_count()
         if count <= 0:
@@ -4212,7 +5025,10 @@ class GentlemanWindow(QMainWindow):
             self.view.update()
             return
 
-        self.selected_index = (self.selected_index + delta) % count
+        for _ in range(count):
+            self.selected_index = (self.selected_index + delta) % count
+            if self.is_current_selection_selectable():
+                break
         self.view.ensure_visible()
         self.view.update()
 
@@ -4226,6 +5042,12 @@ class GentlemanWindow(QMainWindow):
             return
 
         self.selected_index = max(0, min(count - 1, self.selected_index + delta))
+        if not self.is_current_selection_selectable():
+            direction = 1 if delta >= 0 else -1
+            for _ in range(count):
+                self.selected_index = max(0, min(count - 1, self.selected_index + direction))
+                if self.is_current_selection_selectable() or self.selected_index in (0, count - 1):
+                    break
         self.view.ensure_visible()
         self.view.update()
 
@@ -4240,6 +5062,8 @@ class GentlemanWindow(QMainWindow):
         if self.input_suspended_for_launch: self.resume_frontend_input_after_launch()
         self.set_keyboard_active_input()
         key = event.key()
+        if self.note_user_activity():
+            return
         if self.overlay:
             if self.overlay.get("type") == "choice" and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
                 count=len(self.overlay.get("buttons", [])); delta=-1 if key in (Qt.Key.Key_Left,Qt.Key.Key_A) else 1
@@ -4250,8 +5074,12 @@ class GentlemanWindow(QMainWindow):
             elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space): self.activate_overlay()
             elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace): self.close_overlay()
             self.view.update(); return
+        mods=event.modifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_F:
+            self.open_context_search()
+            self.view.update()
+            return
         if self.mode == "text_input":
-            mods=event.modifiers()
             if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_A: self.text_input_value=''; self.text_input_cursor=0
             elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter): self.finish_text_input()
             elif key == Qt.Key.Key_Escape: self.cancel_text_input()
@@ -4277,6 +5105,8 @@ class GentlemanWindow(QMainWindow):
         elif key == Qt.Key.Key_F:
             if self.mode == "favorites": self.remove_selected_favorite()
             else: self.toggle_current_favorite()
+        elif key == Qt.Key.Key_Y:
+            self.open_current_item_options()
         elif key == Qt.Key.Key_F11: self.toggle_fullscreen()
         self.view.update()
 
@@ -4557,9 +5387,10 @@ class GentlemanView(QWidget):
             self.draw_static_noise(painter)
 
         self.draw_logo(painter)
-        self.draw_top_bar(painter)
-        self.draw_panel(painter)
-        self.draw_wallpaper_preview(painter)
+        if not self.window.idle_menu_hidden:
+            self.draw_top_bar(painter)
+            self.draw_panel(painter)
+            self.draw_wallpaper_preview(painter)
         if self.window.mode == "text_input": self.draw_text_input(painter)
         if self.window.overlay: self.draw_overlay(painter)
 
@@ -4878,6 +5709,11 @@ class GentlemanView(QWidget):
             painter.setPen(self.text)
             painter.drawText(text_x, row_y, "Menu size applies in fullscreen mode.")
             painter.drawText(text_x, row_y + 28, "Windowed mode always uses 100%.")
+            row_y += 70
+        elif self.window.mode == "idle_hide_timeout":
+            painter.setPen(self.text)
+            painter.drawText(text_x, row_y, "Hides menu and top bar after idle time.")
+            painter.drawText(text_x, row_y + 28, "Disabled during dialogs and input screens.")
             row_y += 70
         elif self.window.mode == "wallpaper" and self.window.wallpaper_folder_path() is not None:
             painter.setPen(self.text)

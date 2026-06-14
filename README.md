@@ -22,9 +22,15 @@ Linux support may be added later, but the current version should be treated as W
 
 - MiSTer-inspired menu layout
 - Folder-based menu structure
+- Optional subfolder support inside the `menu/` folder
 - JSON-based launcher entries
 - In-app launcher creation
 - In-app launcher editing
+- Launcher save folder editing
+- Launcher and folder options from the menu
+- Confirmed launcher removal
+- Confirmed folder removal
+- Contextual game search with controller and keyboard shortcuts
 - Standalone emulator launcher support
 - RetroArch launcher support with core selection
 - Application launcher support
@@ -33,12 +39,13 @@ Linux support may be added later, but the current version should be treated as W
 - Favorites list
 - Favorite/unfavorite support
 - Clear Recent and Clear Favorites actions
-- Optional Favorites, Recent, and Emulators menu entries
+- Optional Favorites, Recent, Systems, and Emulators menu entries
 - Automatic Emulators menu generated from launcher JSON files
 - System selection using a predefined system list
 - Wallpaper support through the Gentleman Menu
 - Fullscreen support
 - Fullscreen-at-launch setting
+- Optional MiSTer-style auto-hide menu setting
 - Controller navigation support
 - A/B and X/Y controller button swap settings
 - API support for third-party apps and remote devices
@@ -76,6 +83,8 @@ The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders suc
 - Enter / Space: select
 - Esc / Backspace: go back
 - Esc / Backspace on the home screen: open the Gentleman Menu
+- Ctrl + F: search the current context
+- Y: open options for the selected folder or launcher
 - F11: toggle fullscreen
 - F5: refresh menu
 - F: favorite or unfavorite selected game
@@ -92,6 +101,8 @@ Default controller mapping:
 - A: select
 - B: back
 - X: favorite or unfavorite selected game
+- Y: open options for the selected folder or launcher
+- R1: search the current context
 - Start: select
 - Back: back
 - Hold L1 + L2 + L3 + R1 + R2 + R3 for one second: open the in-game OSD
@@ -100,6 +111,24 @@ The button layout can be adjusted from Settings:
 
 - Swap A/B
 - Swap X/Y
+
+## Search
+
+Gentleman includes contextual search.
+
+Search can be opened with:
+
+- `Ctrl + F` on a keyboard
+- `R1` on a controller
+
+Search depends on where it is opened:
+
+- From the root menu, it searches all folders and launchers under `menu/`
+- From a menu folder, it searches that folder and its subfolders
+- From inside a launcher or game list, it searches that launcher/list
+- From search results, opening search again searches the same scope
+
+Search uses the existing onscreen keyboard. Results are shown in the normal Gentleman menu style, and selecting a result launches it like a normal game or launcher entry.
 
 ## Gentleman Menu
 
@@ -125,22 +154,71 @@ Report Issues & Requests opens the Gentleman GitHub issue templates.
 
 Support the Project opens a submenu with links to Ko-fi and Buy Me a Coffee.
 
+## Folder and Launcher Options
+
+The selected folder or launcher can be managed directly from the menu.
+
+Open options with:
+
+- `Y` on a keyboard
+- `Y` on a controller
+
+Folder options include:
+
+- Open Folder
+- Remove Folder
+- Cancel
+
+Launcher options include:
+
+- Open Launcher
+- Edit Launcher
+- Remove Launcher
+- Cancel
+
+Removing a launcher or folder requires confirmation first. Folder removal also removes launchers and subfolders inside that folder.
+
 ## Settings
 
-The Settings menu currently includes:
+Settings are organized into categories.
+
+### Display
 
 - Fullscreen at Launch: Enabled / Disabled
+- Logo: Enabled / Disabled
+
+### Menu
+
+- Menu Size: 100% / 125% / 150%
+- Systems Menu: Enabled / Disabled
 - Emulators Menu: Enabled / Disabled
 - Recent Menu: Enabled / Disabled
 - Favorites Menu: Enabled / Disabled
-- Logo: Enabled / Disabled
-- Update Check at Launch: Enabled / Disabled
-- API: Enabled / Disabled
+- Arcade ROM Names: Enabled / Disabled
+- Auto Hide Menu: Disabled / 10 sec / 15 sec / 20 sec / 30 sec / 45 sec / 1 min
+- Clear Recent
+- Clear Favorites
+
+### Controls
+
 - Swap A/B: Enabled / Disabled
 - Swap X/Y: Enabled / Disabled
 - In-Game OSD: Enabled / Disabled
-- Clear Recent
-- Clear Favorites
+
+### System
+
+- API: Enabled / Disabled
+- Update Check at Launch: Enabled / Disabled
+
+## Auto Hide Menu
+
+Gentleman includes an optional MiSTer-style auto-hide menu feature.
+
+When enabled, the main menu and top bar hide after the selected idle time. The logo stays visible when enabled. Any keyboard or controller input shows the menu again.
+
+Auto-hide is ignored while dialogs, confirmations, file browsers, launcher forms, and the onscreen keyboard are active.
+
+The setting is disabled by default.
 
 ## Menu Structure
 
@@ -151,6 +229,8 @@ Example:
 ```text
 menu/
 ├─ Consoles/
+│  ├─ Nintendo/
+│  │  └─ SNES.json
 │  ├─ PS2.json
 │  └─ GameCube.json
 ├─ Handhelds/
@@ -170,11 +250,31 @@ Apps
 Inside `Consoles`:
 
 ```text
+Nintendo
 PS2
 GameCube
 ```
 
+Inside `Nintendo`:
+
+```text
+SNES
+```
+
 No manual registration is needed. If a JSON launcher exists inside the `menu/` folder, Gentleman can find it.
+
+## Launcher Creation and Editing
+
+Launchers can be created and edited from inside Gentleman.
+
+The Save Folder field opens a folder browser. From there users can:
+
+- Browse into folders
+- Create folders with the onscreen keyboard
+- Select the current folder as the launcher save location
+- Remove folders with confirmation
+
+Edit Launcher can also change the save folder of an existing launcher. When the save folder is changed, the launcher JSON is moved to the selected folder. When the launcher name is changed, the launcher JSON is renamed.
 
 ## Launcher Types
 
@@ -239,41 +339,28 @@ Example:
 
 Arguments control how Gentleman starts an emulator or application.
 
-Gentleman supports placeholders:
+Gentleman supports placeholders that are replaced before launching:
 
-```text
-{rom}
-```
+- `{rom}` is used by Gentleman to inject the selected ROM/game path into the launch command. For game launchers, this placeholder should always be included so the emulator knows which game to start.
+- `{core}` is used by Gentleman to inject the selected RetroArch core path.
 
-The selected game path.
-
-```text
-{core}
-```
-
-The selected RetroArch core path.
+Other arguments are passed directly to the emulator. These are emulator-specific, so an argument that works for one emulator may not work for another. Check the emulator's official documentation or wiki for the correct argument list.
 
 Examples:
 
-```text
-"{rom}"
-```
+- `"{rom}"`
 
-Launches the selected ROM directly.
+  Launches the selected ROM directly.
 
-```text
--fullscreen "{rom}"
-```
+- `-fullscreen "{rom}"`
 
-Launches the selected ROM with a fullscreen argument.
+  Launches the selected ROM with a fullscreen argument.
 
-```text
--L "{core}" "{rom}"
-```
+- `-L "{core}" "{rom}"`
 
-Launches RetroArch with the selected core and ROM.
+  Launches RetroArch with the selected core and ROM.
 
-Applications usually do not need arguments, so this field can often be left empty for Application launchers.
+Applications usually do not need `{rom}` because they launch directly without a selected game.
 
 ## Favorites and Recent
 
@@ -310,7 +397,6 @@ PCSX2
 ```
 
 Selecting an emulator opens the emulator directly without a ROM.
-
 
 ## In-Game OSD
 
