@@ -1018,19 +1018,23 @@ class ScreenScraperClient:
         if credentials_error:
             raise RuntimeError(credentials_error)
 
-        query_name = search_name or rom_name
-        data = None
-        if preferred_region:
-            data = self.scrape_game_by_region_search(system_id, query_name, preferred_region)
+        selected_game_id = str(game_id or "").strip()
+        if selected_game_id:
+            data = self.fetch_game_by_id(system_id, selected_game_id, preferred_region)
+        else:
+            query_name = search_name or rom_name
+            data = None
+            if preferred_region:
+                data = self.scrape_game_by_region_search(system_id, query_name, preferred_region)
 
-        if data is None:
-            params = self.base_params()
-            params.update({
-                "systemeid": str(system_id),
-                "romtype": "rom",
-                "romnom": query_name,
-            })
-            data = self.request_json(SCREENSCRAPER_BASE_URL, params)
+            if data is None:
+                params = self.base_params()
+                params.update({
+                    "systemeid": str(system_id),
+                    "romtype": "rom",
+                    "romnom": query_name,
+                })
+                data = self.request_json(SCREENSCRAPER_BASE_URL, params)
 
         metadata, image_url = self.parse_game_response(data, preferred_region)
         image_bytes = self.download_image(image_url) if image_url else None
