@@ -2,11 +2,13 @@
 
 Gentleman is a MiSTer-inspired emulator frontend for PC.
 
-The goal is to bring the simple, fast, menu-driven feel of the MiSTer interface to a PC-based emulator setup. Instead of using a database-heavy frontend, Gentleman builds its menu from a normal `menu/` folder. Folders become menu categories, and JSON files become launcher entries.
+The goal is to bring the simple, fast, menu-driven feel of the MiSTer interface to a PC-based emulator setup while still giving users the option of a richer visual library view. Gentleman can be used as a classic folder-based frontend, or with Modern Mode for boxart, metadata, summaries, and grid/list layouts.
 
-For example, `menu/Consoles/PS2.json` will make `Consoles` appear in the main menu, with `PS2` listed inside it.
+The classic menu is built from a normal `menu/` folder. Folders become menu categories, and JSON files become launcher entries. For example, `menu/Consoles/PS2.json` will make `Consoles` appear in the main menu, with `PS2` listed inside it.
 
-Gentleman is designed to stay simple and transparent. Users can either create launcher JSON files manually, or create and edit them from inside the Gentleman menu. Each launcher points to an emulator executable, a ROM folder, supported file extensions, and optional launch arguments. RetroArch launchers can also define a specific core.
+Gentleman is designed to stay simple and transparent. Users can create launcher JSON files manually, or create and edit them from inside the Gentleman menu. Each launcher points to an emulator executable, a ROM folder, supported file extensions, and optional launch arguments. RetroArch launchers can also define a specific core.
+
+Modern Mode is optional and adds ScreenScraper-powered metadata, summaries, and boxart on top of the same launcher setup. Scraped files are stored locally, so the normal transparent folder and JSON structure remains the foundation of the app.
 
 This project is experimental and not affiliated with the official MiSTer FPGA project.
 
@@ -35,6 +37,14 @@ Linux support may be added later, but the current version should be treated as W
 - RetroArch launcher support with core selection
 - Application launcher support
 - Fast folder browsing without generating a database
+- Classic List and Modern game view modes
+- Modern Mode with boxart, metadata, and summaries
+- Modern View layouts: Detailed List, Simple List, and Grid
+- Resolution-aware Modern Mode layouts
+- Ultra-wide aware centered Modern Mode content area
+- ScreenScraper integration for metadata, summaries, and boxart
+- Full library scraping and single-game scraping
+- Local metadata and artwork storage
 - Recent games list
 - Favorites list
 - Favorite/unfavorite support
@@ -73,7 +83,7 @@ Gentleman can check GitHub for stable releases. The update check can be started 
 
 The updater is optional and is released as a separate download. To use it, download `Gentleman-Updater-Windows-x86_64.zip`, extract `Gentleman-Updater.exe`, and place it next to `Gentleman.exe`. When an update is found, Gentleman can then start the updater for you.
 
-The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders such as `config/`, `menu/`, and `themes/` are created on first launch and are not part of the release ZIP.
+The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders such as `config/`, `menu/`, `themes/`, and locally scraped metadata or artwork folders are created on first launch or when needed, and are not part of the release ZIP.
 
 ## Navigation
 
@@ -89,6 +99,7 @@ The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders suc
 - F11: toggle fullscreen
 - F5: refresh menu
 - F: favorite or unfavorite selected game
+- L: open the selected game's summary in Modern Mode
 - Ctrl + Alt + G: open the in-game OSD while a game, emulator, or application is running
 
 ### Controller
@@ -102,6 +113,7 @@ Default controller mapping:
 - A: select
 - B: back
 - X: favorite or unfavorite selected game
+- L1: open the selected game's summary in Modern Mode
 - Y: open options for the selected folder or launcher
 - R1: search the current context
 - Start: select
@@ -188,6 +200,8 @@ Settings are organized into categories.
 - Logo: Enabled / Disabled
 - Theme: Default or custom themes from the `themes/` folder
 - Wallpaper
+- Game View: Classic / Modern
+- Modern View: Detailed List / Simple List / Grid, shown only when Modern Mode is active
 - Menu Size: 100% / 125% / 150%
 - Auto Hide Menu: Disabled / 10 sec / 15 sec / 20 sec / 30 sec / 45 sec / 1 min
 
@@ -252,6 +266,40 @@ When enabled, the main menu and top bar hide after the selected idle time. The l
 Auto-hide is ignored while dialogs, confirmations, file browsers, launcher forms, and the onscreen keyboard are active.
 
 The setting is disabled by default.
+
+## Modern Mode
+
+Modern Mode is an optional visual game browser. It keeps the normal launcher and ROM folder setup, but adds locally stored metadata, summaries, and boxart for games that have been scraped.
+
+Modern Mode can be selected from Settings > Display > Game View. When Modern Mode is active, Settings > Display also shows Modern View.
+
+Modern View options are:
+
+- Detailed List, shows the game list with boxart, metadata, and summary text.
+- Simple List, shows the game list with larger boxart and hides inline metadata and summary text.
+- Grid, shows boxart tiles with the game title underneath, or the filename when a game has not been scraped yet.
+
+The Summary button remains available in Modern Mode, including Simple List and Grid. Opening the summary shows metadata above the summary text and remains scrollable.
+
+Modern Mode layouts are resolution-aware. Detailed List, Simple List, and Grid adjust to the available screen space. Grid calculates how many rows and columns fit and only shows complete artwork tiles so boxart is not cut off.
+
+On ultra-wide displays, Modern Mode keeps its content inside a centered widescreen area. The extra left and right space remains background or wallpaper, instead of stretching the game list and metadata too far apart.
+
+## ScreenScraper
+
+Gentleman includes ScreenScraper integration for Modern Mode.
+
+ScreenScraper can be used to fetch:
+
+- Game metadata
+- Game summaries
+- Boxart
+
+Scraping can be started for a full library or for a single game from the game list. Large scrape jobs show a progress dialog immediately while Gentleman indexes games for scraping. Single-game scraping can also search for similar game matches before applying metadata and artwork.
+
+ScreenScraper login details are configured from the scrape settings shown in Modern Mode. Dev credentials are intended to be provided by the packaged build.
+
+Scraped metadata and artwork are stored locally. Gentleman uses clean ROM-based filenames for metadata and boxart. If duplicate ROM filenames exist in different folders, a stable duplicate suffix is added so metadata and artwork stay matched to the correct ROM.
 
 ## Menu Structure
 
