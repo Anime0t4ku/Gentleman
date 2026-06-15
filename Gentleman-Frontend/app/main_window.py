@@ -109,6 +109,24 @@ class RomFolderScanWorker(QThread):
             })
 
 
+
+
+class ScrapeJobIndexWorker(QThread):
+    result = pyqtSignal(object)
+
+    def __init__(self, window, target: str, mode: str):
+        super().__init__()
+        self.window = window
+        self.target = target
+        self.mode = mode
+
+    def run(self):
+        try:
+            jobs = self.window.build_scrape_jobs(self.target, self.mode)
+            self.result.emit({"ok": True, "jobs": jobs})
+        except Exception as exc:
+            self.result.emit({"ok": False, "error": str(exc)})
+
 class ScrapeWorker(QThread):
     progress = pyqtSignal(object)
     finished_result = pyqtSignal(object)
@@ -217,6 +235,45 @@ class ScreenScraperQuotaWorker(QThread):
             self.result.emit({"ok": False, "error": str(exc)})
 
 
+class ScreenScraperSuggestionWorker(QThread):
+    result = pyqtSignal(object)
+
+    def __init__(self, username: str, password: str, system_id: int, search_name: str, preferred_region: str):
+        super().__init__()
+        self.username = username
+        self.password = password
+        self.system_id = system_id
+        self.search_name = search_name
+        self.preferred_region = preferred_region
+
+    def run(self):
+        try:
+            client = ScreenScraperClient(self.username, self.password)
+            items = client.search_game_suggestions(self.system_id, self.search_name, self.preferred_region)
+            self.result.emit({"ok": True, "items": items})
+        except Exception as exc:
+            self.result.emit({"ok": False, "error": str(exc)})
+
+
+class ModernBoxartLoadWorker(QThread):
+    result = pyqtSignal(object)
+
+    def __init__(self, items: list[tuple[str, str]]):
+        super().__init__()
+        self.items = items
+
+    def run(self):
+        loaded = {}
+        for key, path_text in self.items:
+            try:
+                image = QImage(path_text)
+                if not image.isNull():
+                    loaded[key] = image
+            except Exception:
+                pass
+        self.result.emit(loaded)
+
+
 def resource_path(relative_path: str) -> Path:
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
     return base_path / relative_path
@@ -295,6 +352,7 @@ class InGameOsd(QWidget):
             )
 
     def controller_accept(self):
+        self.window.set_controller_active_input()
         if self.confirmation_active:
             if self.confirmation_selected == 1:
                 self.window.close_active_session(force=True); self.close_confirmation(); self.window.hide_ingame_osd(resume=False)
@@ -302,10 +360,12 @@ class InGameOsd(QWidget):
         else: self.activate_selected()
 
     def controller_back(self):
+        self.window.set_controller_active_input()
         if self.confirmation_active: self.close_confirmation()
         else: self.window.hide_ingame_osd(resume=True)
 
     def controller_horizontal(self):
+        self.window.set_controller_active_input()
         if self.confirmation_active:
             self.confirmation_selected = 1 - self.confirmation_selected; self.update()
 
@@ -322,6 +382,7 @@ class InGameOsd(QWidget):
         self.update()
 
     def keyPressEvent(self, event):
+        self.window.set_keyboard_active_input()
         key = event.key()
         if self.confirmation_active:
             if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
@@ -356,6 +417,11 @@ class InGameOsd(QWidget):
     def top_bar_rect(self) -> QRect:
         panel = self.menu_panel_rect()
         return QRect(panel.x(), max(16, panel.y() - 78), panel.width(), 44)
+
+    def confirmation_guide_text(self) -> str:
+        if self.window.active_input == "keyboard":
+            return "Left/Right Select   Enter Confirm   Esc Back"
+        return "D-pad Select   A Confirm   B Back"
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -419,7 +485,10 @@ class InGameOsd(QWidget):
             painter.drawText(text_x, yy, option)
 
         if self.confirmation_active:
-            box_width = min(700, panel.width() - 40)
+            painter.setFont(self.font)
+            guide_text = self.confirmation_guide_text()
+            guide_width = painter.fontMetrics().horizontalAdvance(guide_text) + 64
+            box_width = min(max(700, guide_width), panel.width() - 40)
             message_width = box_width - 64
             painter.setFont(self.title_font)
             title_height = painter.fontMetrics().height()
@@ -471,7 +540,7 @@ class InGameOsd(QWidget):
                 painter.drawText(r, Qt.AlignmentFlag.AlignCenter, label)
 
             painter.setPen(self.text)
-            painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, "D-pad Select   A Confirm   B Back")
+            painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, guide_text)
 
 
 class GentlemanWindow(QMainWindow):
@@ -503,6 +572,7 @@ class GentlemanWindow(QMainWindow):
         self.arcade_name_database = ArcadeNameDatabase(self.assets_dir / "databases" / "arcade_names.json")
         self.metadata_cache = MetadataCache(self.base_dir)
         self.scrape_worker: ScrapeWorker | None = None
+        self.scrape_index_worker: ScrapeJobIndexWorker | None = None
         self.scrape_quota_worker: ScreenScraperQuotaWorker | None = None
         self.scrape_target_items: list[str] = []
         self.scrape_target = "All Systems"
@@ -525,6 +595,9 @@ class GentlemanWindow(QMainWindow):
         self.single_scrape_custom_name = ""
         self.single_scrape_region = "Same as Game"
         self.scrape_match_items: list[dict] = []
+        self.scrape_match_worker: ScreenScraperSuggestionWorker | None = None
+        self.scrape_match_loading = False
+        self.scrape_match_status = ""
         self.scrape_match_return_mode = "single_scrape"
         self.region_picker_return_mode = "scrape_settings"
         self.ensure_settings_app_info()
@@ -730,6 +803,7 @@ class GentlemanWindow(QMainWindow):
             "menu_idle_hide_timeout": 0,
             "theme": DEFAULT_THEME_ID,
             "game_view": "classic",
+            "modern_view": "detailed",
             "screenscraper_username": "",
             "screenscraper_password": "",
             "scrape_region": "Same as Game",
@@ -968,6 +1042,32 @@ class GentlemanWindow(QMainWindow):
     def game_view_label(self) -> str:
         return "Game View: Modern" if self.modern_mode_enabled() else "Game View: Classic"
 
+    def modern_view_choices(self) -> list[tuple[str, str]]:
+        return [("Detailed List", "detailed"), ("Simple List", "simple"), ("Grid", "grid")]
+
+    def modern_view_mode(self) -> str:
+        value = str(self.settings.get("modern_view", "detailed")).lower().strip()
+        return value if value in {"detailed", "simple", "grid"} else "detailed"
+
+    def modern_view_name(self) -> str:
+        current = self.modern_view_mode()
+        for name, value in self.modern_view_choices():
+            if value == current:
+                return name
+        return "Detailed List"
+
+    def modern_view_label(self) -> str:
+        return f"Modern View: {self.modern_view_name()}"
+
+    def modern_simple_list_enabled(self) -> bool:
+        return self.modern_view_mode() == "simple"
+
+    def modern_grid_enabled(self) -> bool:
+        return self.modern_view_mode() == "grid"
+
+    def modern_grid_active(self) -> bool:
+        return self.modern_game_list_active() and self.modern_grid_enabled()
+
     def screenscraper_username(self) -> str:
         return str(self.settings.get("screenscraper_username", "")).strip()
 
@@ -1096,6 +1196,30 @@ class GentlemanWindow(QMainWindow):
             return None
         return self.game_metadata_identity(data.get("launcher"), data.get("rom"))
 
+    def metadata_summary_message(self, identity: GameMetadataIdentity, data: dict | None) -> str:
+        metadata_lines = []
+        system = str(identity.system or "").strip()
+        if system:
+            metadata_lines.append(f"System: {system}")
+        if data:
+            fields = [
+                ("Year", data.get("year", "")),
+                ("Genre", data.get("genre", "")),
+                ("Developer", data.get("developer", "")),
+                ("Publisher", data.get("publisher", "")),
+                ("Players", data.get("players", "")),
+            ]
+            for label, value in fields:
+                text = str(value or "").strip()
+                if text:
+                    metadata_lines.append(f"{label}: {text}")
+        description = str((data or {}).get("description", "")).strip()
+        if not description:
+            description = "No summary available."
+        if metadata_lines:
+            return "Metadata\n" + "\n".join(metadata_lines) + "\n\nSummary\n" + description
+        return "Summary\n" + description
+
     def open_selected_summary_overlay(self):
         if not self.modern_mode_enabled():
             return
@@ -1104,14 +1228,12 @@ class GentlemanWindow(QMainWindow):
             return
         data = self.metadata_cache.load(identity)
         title = "Summary"
-        message = "No summary available."
         if data:
             title = str(data.get("scrape_name", "")).strip() or title
-            message = str(data.get("description", "")).strip() or message
         self.overlay = {
             "type": "message",
             "title": title,
-            "message": message,
+            "message": self.metadata_summary_message(identity, data),
             "buttons": [("Close", lambda: None)],
             "selected": 0,
             "scrollable": True,
@@ -1159,35 +1281,40 @@ class GentlemanWindow(QMainWindow):
         self.update_favorite_items()
         self.view.update()
 
-    def selected_game_data(self) -> dict | None:
-        if self.mode == "roms" and self.current_launcher and self.selected_index > 0:
-            idx = self.selected_index - 1
+    def game_data_for_index(self, index: int) -> dict | None:
+        if index <= 0:
+            return None
+        if self.mode == "roms" and self.current_launcher:
+            idx = index - 1
             if 0 <= idx < len(self.rom_items):
                 item = self.rom_items[idx]
                 if not item.is_dir:
                     return {"launcher": self.current_launcher, "rom": item.path, "name": item.display_name}
-        if self.mode == "favorites" and self.selected_index > 0:
-            idx = self.selected_index - 1
+        if self.mode == "favorites":
+            idx = index - 1
             if 0 <= idx < len(self.favorite_items):
                 return self.game_data_from_saved_item(self.favorite_items[idx])
-        if self.mode == "recent" and self.selected_index > 0:
-            idx = self.selected_index - 1
+        if self.mode == "recent":
+            idx = index - 1
             if 0 <= idx < len(self.recent_items):
                 return self.game_data_from_saved_item(self.recent_items[idx])
-        if self.mode == "system_launchers" and self.selected_index > 0:
+        if self.mode == "system_launchers":
             games = self.game_system_games.get(self.current_game_system or "", [])
-            idx = self.selected_index - 1
+            idx = index - 1
             if 0 <= idx < len(games):
                 item = games[idx]
                 if item.get("rom") is not None:
                     return {"launcher": item.get("launcher"), "rom": item.get("rom"), "name": str(item.get("name", ""))}
-        if self.mode == "search_results" and self.selected_index > 0:
-            idx = self.selected_index - 1
+        if self.mode == "search_results":
+            idx = index - 1
             if 0 <= idx < len(self.search_items):
                 item = self.search_items[idx]
                 if item.get("type") == "game" and item.get("rom") is not None:
                     return {"launcher": item.get("launcher"), "rom": item.get("rom"), "name": str(item.get("name", ""))}
         return None
+
+    def selected_game_data(self) -> dict | None:
+        return self.game_data_for_index(self.selected_index)
 
     def game_data_from_saved_item(self, item: dict) -> dict | None:
         launcher_rel = str(item.get("launcher", ""))
@@ -2215,6 +2342,7 @@ class GentlemanWindow(QMainWindow):
 
         theme_label = f"Theme: {self.current_theme.name}"
         game_view_label = self.game_view_label()
+        modern_view_label = self.modern_view_label()
 
         menu_size_label = f"Menu Size: {int(self.settings.get('fullscreen_menu_size', 100))}%"
         idle_menu_hide_label = self.idle_menu_hide_label()
@@ -2229,6 +2357,8 @@ class GentlemanWindow(QMainWindow):
                 idle_menu_hide_label,
                 game_view_label,
             ]
+            if self.modern_mode_enabled():
+                self.settings_items.append(modern_view_label)
         elif self.settings_category == "Menu Items":
             self.settings_items = [
                 systems_menu_label,
@@ -3234,6 +3364,8 @@ class GentlemanWindow(QMainWindow):
             return "Auto Hide Menu"
         if self.mode == "theme_picker":
             return "Theme"
+        if self.mode == "modern_view_picker":
+            return "Modern View"
         if self.mode == "scrape_settings":
             return "Scrape Artwork & Metadata"
         if self.mode == "scrape_target_picker":
@@ -3315,6 +3447,8 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "theme_picker":
             self.update_theme_picker_items()
             return len(self.theme_picker_items)
+        if self.mode == "modern_view_picker":
+            return len(self.modern_view_choices())
         if self.mode == "scrape_settings":
             return 10
         if self.mode == "scrape_target_picker":
@@ -3324,9 +3458,9 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "scrape_region_picker":
             return len(SCRAPE_REGIONS)
         if self.mode == "single_scrape":
-            return 5
+            return len(self.single_scrape_labels())
         if self.mode == "scrape_match_picker":
-            return len(self.scrape_match_items) + 1
+            return len(self.scrape_match_labels())
         if self.mode == "wallpaper":
             return len(self.wallpaper_items)
         if self.mode == "support":
@@ -3384,6 +3518,27 @@ class GentlemanWindow(QMainWindow):
         self.selected_index = self.first_real_list_index()
         self.view.scroll_offset = 0
 
+    def single_scrape_labels(self) -> list[tuple[str, str]]:
+        custom = "Enabled" if self.single_scrape_use_custom else "Disabled"
+        labels = [(f"Use Custom Name: {custom}", "")]
+        if self.single_scrape_use_custom:
+            labels.append((f"Scrape Name: {self.single_scrape_custom_name}", ""))
+        labels.extend([
+            (f"Region: {self.single_scrape_region}", ""),
+            (self.single_scrape_action, ""),
+            ("Cancel", ""),
+        ])
+        return labels
+
+    def scrape_match_labels(self) -> list[tuple[str, str]]:
+        if self.scrape_match_loading:
+            return [(self.scrape_match_status or "Fetching similar game matches...", ""), ("Cancel", "")]
+        labels = [(str(item.get("label", item.get("title", "Unknown"))), "") for item in self.scrape_match_items]
+        if not labels and self.scrape_match_status:
+            labels.append((self.scrape_match_status, ""))
+        labels.append(("Cancel", ""))
+        return labels
+
     def current_labels(self) -> list[tuple[str, str]]:
         if self.mode == "text_input": return []
         if self.mode == "file_browser":
@@ -3418,6 +3573,9 @@ class GentlemanWindow(QMainWindow):
             for info in self.theme_picker_infos:
                 labels.append((info.name + ("  ✓" if info.theme_id == selected else ""), ""))
             return labels
+        if self.mode == "modern_view_picker":
+            selected = self.modern_view_mode()
+            return [(name + ("  ✓" if value == selected else ""), "") for name, value in self.modern_view_choices()]
         if self.mode == "scrape_settings":
             start_label = self.active_scrape_label() if self.bulk_scrape_active() else "Start Scraping"
             username = self.screenscraper_username() or "Not Set"
@@ -3442,18 +3600,9 @@ class GentlemanWindow(QMainWindow):
             current = self.single_scrape_region if self.region_picker_return_mode == "single_scrape" else self.scrape_region
             return [(region + ("  ✓" if region == current else ""), "") for region in SCRAPE_REGIONS]
         if self.mode == "single_scrape":
-            custom = "Enabled" if self.single_scrape_use_custom else "Disabled"
-            return [
-                (f"Use Custom Name: {custom}", ""),
-                (f"Scrape Name: {self.single_scrape_custom_name}", ""),
-                (f"Region: {self.single_scrape_region}", ""),
-                (self.single_scrape_action, ""),
-                ("Cancel", ""),
-            ]
+            return self.single_scrape_labels()
         if self.mode == "scrape_match_picker":
-            labels = [(str(item.get("label", item.get("title", "Unknown"))), "") for item in self.scrape_match_items]
-            labels.append(("Cancel", ""))
-            return labels
+            return self.scrape_match_labels()
         if self.mode == "wallpaper":
             return [(name, "") for name in self.wallpaper_items]
         if self.mode == "support":
@@ -3837,7 +3986,7 @@ class GentlemanWindow(QMainWindow):
             previous_mode = self.mode
             if previous_mode == "scrape_region_picker" and self.region_picker_return_mode == "single_scrape":
                 self.mode = "single_scrape"
-                self.selected_index = 2
+                self.selected_index = self.single_scrape_region_index()
                 self.region_picker_return_mode = "scrape_settings"
             elif previous_mode == "scrape_settings":
                 self.mode = "system"
@@ -3852,8 +4001,9 @@ class GentlemanWindow(QMainWindow):
             return
 
         if self.mode == "scrape_match_picker":
+            self.cancel_scrape_match_worker()
             self.mode = "single_scrape"
-            self.selected_index = 3
+            self.selected_index = self.single_scrape_action_index()
             self.view.scroll_offset = 0
             self.view.update()
             return
@@ -4021,6 +4171,9 @@ class GentlemanWindow(QMainWindow):
             self.activate_theme_picker_item(self.selected_index)
             return
 
+        if self.mode == "modern_view_picker":
+            self.activate_modern_view_item(self.selected_index)
+            return
 
         if self.mode == "scrape_settings":
             self.activate_scrape_settings_item()
@@ -4649,6 +4802,13 @@ class GentlemanWindow(QMainWindow):
             if self.current_launcher and self.current_rom_folder:
                 self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
             self.refresh_settings_menu()
+        elif item.startswith("Modern View:"):
+            self.mode = "modern_view_picker"
+            choices = [value for _, value in self.modern_view_choices()]
+            current = self.modern_view_mode()
+            self.selected_index = choices.index(current) if current in choices else 0
+            self.view.scroll_offset = 0
+            self.view.update()
         elif item == "Scrape Artwork & Metadata":
             self.open_scrape_settings()
         elif item == "Settings":
@@ -4959,7 +5119,7 @@ class GentlemanWindow(QMainWindow):
             if self.region_picker_return_mode == "single_scrape":
                 self.single_scrape_region = selected
                 self.mode = "single_scrape"
-                self.selected_index = 2
+                self.selected_index = self.single_scrape_region_index()
             else:
                 self.scrape_region = selected
                 self.settings["scrape_region"] = selected
@@ -4968,18 +5128,40 @@ class GentlemanWindow(QMainWindow):
                 self.selected_index = 7
         else:
             self.mode = "single_scrape" if self.region_picker_return_mode == "single_scrape" else "scrape_settings"
-            self.selected_index = 2 if self.region_picker_return_mode == "single_scrape" else 7
+            self.selected_index = self.single_scrape_region_index() if self.region_picker_return_mode == "single_scrape" else 7
         self.region_picker_return_mode = "scrape_settings"
         self.view.scroll_offset = 0
         self.view.update()
 
     def start_bulk_scrape(self):
-        if not self.validate_screenscraper_login_now(show_error=True):
+        if not self.require_screenscraper_account():
             return
         if self.scrape_worker is not None and self.scrape_worker.isRunning():
             self.show_message("Scrape", "A scrape is already running.")
             return
-        jobs = self.build_scrape_jobs(self.scrape_target, self.scrape_mode)
+        if self.scrape_index_worker is not None and self.scrape_index_worker.isRunning():
+            self.reopen_scrape_progress()
+            return
+        self.scrape_return_mode = "settings"
+        self.scrape_progress_lines = ["Indexing games for scraping..."]
+        self.scrape_progress_text = "Indexing games for scraping..."
+        self.scrape_status_text = self.scrape_progress_text
+        self.scrape_status_complete_until = 0.0
+        self.scrape_stop_requested = False
+        self.reopen_scrape_progress()
+        self.view.repaint()
+        QApplication.processEvents()
+        self.scrape_index_worker = ScrapeJobIndexWorker(self, self.scrape_target, self.scrape_mode)
+        self.scrape_index_worker.result.connect(self.on_scrape_jobs_indexed)
+        self.scrape_index_worker.start()
+
+    def on_scrape_jobs_indexed(self, result: object):
+        self.scrape_index_worker = None
+        if not isinstance(result, dict) or not result.get("ok"):
+            error = str(result.get("error", "") if isinstance(result, dict) else "")
+            self.show_message("Scrape", f"Could not index games for scraping.\n\n{error}".strip())
+            return
+        jobs = result.get("jobs", [])
         if not jobs:
             self.show_message("Scrape", "No games need scraping for this target and mode.")
             return
@@ -5002,7 +5184,10 @@ class GentlemanWindow(QMainWindow):
         self.reopen_scrape_progress()
 
     def bulk_scrape_active(self) -> bool:
-        return self.scrape_worker is not None and self.scrape_worker.isRunning()
+        return bool(
+            (self.scrape_worker is not None and self.scrape_worker.isRunning())
+            or (self.scrape_index_worker is not None and self.scrape_index_worker.isRunning())
+        )
 
     def active_scrape_label(self) -> str:
         return self.scrape_progress_text or "Scraping"
@@ -5150,22 +5335,32 @@ class GentlemanWindow(QMainWindow):
         self.view.scroll_offset = 0
         self.view.update()
 
+    def single_scrape_region_index(self) -> int:
+        return 2 if self.single_scrape_use_custom else 1
+
+    def single_scrape_action_index(self) -> int:
+        return 3 if self.single_scrape_use_custom else 2
+
+    def single_scrape_cancel_index(self) -> int:
+        return 4 if self.single_scrape_use_custom else 3
+
     def activate_single_scrape_item(self):
         if self.selected_index == 0:
             self.single_scrape_use_custom = not self.single_scrape_use_custom
+            self.selected_index = 1 if self.single_scrape_use_custom else min(self.selected_index, self.single_scrape_cancel_index())
             self.view.update()
             return
-        if self.selected_index == 1:
+        if self.single_scrape_use_custom and self.selected_index == 1:
             self.open_text_input("Scrape Name", "Used when searching ScreenScraper", self.single_scrape_custom_name, self.set_single_scrape_custom_name)
             return
-        if self.selected_index == 2:
+        if self.selected_index == self.single_scrape_region_index():
             self.region_picker_return_mode = "single_scrape"
             self.mode = "scrape_region_picker"
             self.selected_index = SCRAPE_REGIONS.index(self.single_scrape_region) if self.single_scrape_region in SCRAPE_REGIONS else 0
             self.view.scroll_offset = 0
             self.view.update()
             return
-        if self.selected_index == 3:
+        if self.selected_index == self.single_scrape_action_index():
             self.start_single_scrape()
             return
         self.go_back()
@@ -5174,43 +5369,87 @@ class GentlemanWindow(QMainWindow):
         self.single_scrape_custom_name = value.strip() or self.single_scrape_custom_name
 
     def start_single_scrape(self):
-        if not self.validate_screenscraper_login_now(show_error=True):
-            return
         if self.single_scrape_identity is None or self.single_scrape_system_id <= 0:
             self.show_message("Scrape", "This game cannot be scraped.")
             return
         if self.single_scrape_use_custom:
             self.open_scrape_match_picker()
             return
+        if not self.validate_screenscraper_login_now(show_error=True):
+            return
         search_name = cleaned_scrape_name(self.single_scrape_identity.rom_name)
         self.start_single_scrape_job(search_name, "", "")
 
     def open_scrape_match_picker(self):
-        if not self.validate_screenscraper_login_now(show_error=True):
+        if not self.require_screenscraper_account():
             return
         if self.single_scrape_identity is None or self.single_scrape_system_id <= 0:
             self.show_message("Scrape", "This game cannot be scraped.")
             return
-        search_name = self.single_scrape_custom_name.strip() or cleaned_scrape_name(self.single_scrape_identity.rom_name)
-        preferred_region = region_from_option(self.single_scrape_region, self.single_scrape_identity)
-        try:
-            client = ScreenScraperClient(self.screenscraper_username(), self.screenscraper_password())
-            self.scrape_match_items = client.search_game_suggestions(self.single_scrape_system_id, search_name, preferred_region)
-        except Exception as exc:
-            self.show_message("Scrape", str(exc), scrollable=True)
-            return
-        if not self.scrape_match_items:
-            self.show_message("Scrape", "No ScreenScraper matches found for this scrape name.")
-            return
+        self.cancel_scrape_match_worker()
+        self.scrape_match_items = []
+        self.scrape_match_loading = True
+        self.scrape_match_status = "Fetching similar game matches..."
         self.mode = "scrape_match_picker"
-        self.selected_index = 0
+        self.selected_index = 1
         self.view.scroll_offset = 0
         self.view.update()
+        QTimer.singleShot(0, self.start_scrape_match_worker)
+
+    def start_scrape_match_worker(self):
+        if not self.scrape_match_loading or self.single_scrape_identity is None or self.single_scrape_system_id <= 0:
+            return
+        search_name = self.single_scrape_custom_name.strip() or cleaned_scrape_name(self.single_scrape_identity.rom_name)
+        preferred_region = region_from_option(self.single_scrape_region, self.single_scrape_identity)
+        worker = ScreenScraperSuggestionWorker(
+            self.screenscraper_username(),
+            self.screenscraper_password(),
+            self.single_scrape_system_id,
+            search_name,
+            preferred_region,
+        )
+        self.scrape_match_worker = worker
+        worker.result.connect(self.handle_scrape_match_result)
+        worker.finished.connect(lambda: self.clear_scrape_match_worker(worker))
+        worker.start()
+
+    def clear_scrape_match_worker(self, worker: ScreenScraperSuggestionWorker):
+        if self.scrape_match_worker is worker:
+            self.scrape_match_worker = None
+
+    def cancel_scrape_match_worker(self):
+        self.scrape_match_loading = False
+        if self.scrape_match_worker and self.scrape_match_worker.isRunning():
+            self.scrape_match_worker.requestInterruption()
+
+    def handle_scrape_match_result(self, result: object):
+        if not self.scrape_match_loading:
+            return
+        self.scrape_match_loading = False
+        if not isinstance(result, dict) or not result.get("ok"):
+            self.scrape_match_items = []
+            self.scrape_match_status = str((result or {}).get("error", "Unable to fetch similar game matches.")) if isinstance(result, dict) else "Unable to fetch similar game matches."
+            self.selected_index = 1
+        else:
+            self.scrape_match_items = list(result.get("items") or [])
+            self.scrape_match_status = "" if self.scrape_match_items else "No similar game matches found."
+            self.selected_index = 0 if self.scrape_match_items else 1
+        if self.mode == "scrape_match_picker":
+            self.view.scroll_offset = 0
+            self.view.update()
 
     def activate_scrape_match_picker_item(self):
+        if self.scrape_match_loading:
+            if self.selected_index >= 1:
+                self.cancel_scrape_match_worker()
+                self.mode = "single_scrape"
+                self.selected_index = self.single_scrape_action_index()
+                self.view.scroll_offset = 0
+                self.view.update()
+            return
         if self.selected_index >= len(self.scrape_match_items):
             self.mode = "single_scrape"
-            self.selected_index = 3
+            self.selected_index = self.single_scrape_action_index()
             self.view.scroll_offset = 0
             self.view.update()
             return
@@ -5284,6 +5523,13 @@ class GentlemanWindow(QMainWindow):
             if self.current_launcher and self.current_rom_folder:
                 self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
             self.refresh_settings_menu()
+        elif item.startswith("Modern View:"):
+            self.mode = "modern_view_picker"
+            choices = [value for _, value in self.modern_view_choices()]
+            current = self.modern_view_mode()
+            self.selected_index = choices.index(current) if current in choices else 0
+            self.view.scroll_offset = 0
+            self.view.update()
         elif item == "Scrape Artwork & Metadata":
             self.open_scrape_settings()
         elif item.startswith("Systems Menu:"):
@@ -5357,6 +5603,16 @@ class GentlemanWindow(QMainWindow):
             return
         self.settings["theme"] = self.theme_picker_infos[index].theme_id
         self.apply_selected_theme()
+        self.save_settings()
+        self.update_settings_items()
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_modern_view_item(self, index: int):
+        choices = self.modern_view_choices()
+        if not (0 <= index < len(choices)):
+            return
+        self.settings["modern_view"] = choices[index][1]
         self.save_settings()
         self.update_settings_items()
         self.view.scroll_offset = 0
@@ -5729,6 +5985,7 @@ class GentlemanWindow(QMainWindow):
         pressed = bool(user32.GetAsyncKeyState(0x11) & 0x8000) and bool(user32.GetAsyncKeyState(0x12) & 0x8000) and bool(user32.GetAsyncKeyState(ord("G")) & 0x8000)
         if pressed and not self.keyboard_osd_latched:
             self.keyboard_osd_latched = True
+            self.set_keyboard_active_input()
             self.show_ingame_osd()
         elif not pressed:
             self.keyboard_osd_latched = False
@@ -5767,6 +6024,7 @@ class GentlemanWindow(QMainWindow):
                 self.osd_shortcut_started_ms = now
             elif now - self.osd_shortcut_started_ms >= 1000 and not self.osd_shortcut_latched:
                 self.osd_shortcut_latched = True
+                self.set_controller_active_input()
                 self.show_ingame_osd()
         else:
             self.osd_shortcut_started_ms = 0
@@ -5924,6 +6182,9 @@ class GentlemanWindow(QMainWindow):
             dx = -1 if action == "left" else 1 if action == "right" else 0
             dy = -1 if action == "up" else 1 if action == "down" else 0
             self.text_input_move(dx, dy); return
+        if self.modern_grid_active() and action in ("left", "right", "up", "down"):
+            self.move_grid_selection(self.grid_navigation_delta(action))
+            return
         if action == "up":
             self.move_selection(-1)
         elif action == "down":
@@ -6132,8 +6393,8 @@ class GentlemanWindow(QMainWindow):
                     accept = buttons.get(0, False)
                     back = buttons.get(1, False)
                     for key, pressed, callback in (
-                        ("osd_up", up, lambda: self.ingame_osd.move_selection(-1)),
-                        ("osd_down", down, lambda: self.ingame_osd.move_selection(1)),
+                        ("osd_up", up, lambda: (self.set_controller_active_input(), self.ingame_osd.move_selection(-1))),
+                        ("osd_down", down, lambda: (self.set_controller_active_input(), self.ingame_osd.move_selection(1))),
                         ("osd_horizontal", horizontal, self.ingame_osd.controller_horizontal),
                         ("osd_accept", accept, self.ingame_osd.controller_accept),
                         ("osd_back", back, self.ingame_osd.controller_back),
@@ -6208,6 +6469,35 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "scrape_settings" and self.selected_index in (0, 1, 4):
             return False
         return True
+
+    def grid_selectable_bounds(self) -> tuple[int, int]:
+        count = self.current_items_count()
+        if count <= 1:
+            return (0, -1)
+        return (1, count - 1)
+
+    def move_grid_selection(self, delta: int):
+        first, last = self.grid_selectable_bounds()
+        if last < first:
+            return
+        if self.selected_index < first:
+            self.selected_index = first
+        else:
+            self.selected_index = max(first, min(last, self.selected_index + delta))
+        self.view.ensure_visible()
+        self.view.update()
+
+    def grid_navigation_delta(self, action: str) -> int:
+        columns = max(1, self.view.modern_grid_columns())
+        if action == "left":
+            return -1
+        if action == "right":
+            return 1
+        if action == "up":
+            return -columns
+        if action == "down":
+            return columns
+        return 0
 
     def move_selection(self, delta: int):
         count = self.current_items_count()
@@ -6290,7 +6580,20 @@ class GentlemanWindow(QMainWindow):
             elif key == Qt.Key.Key_End: self.text_input_cursor=len(self.text_input_value)
             elif event.text() and event.text().isprintable(): self.insert_text(event.text())
             self.view.update(); return
-        if key in (Qt.Key.Key_Up, Qt.Key.Key_W): self.move_selection(-1)
+        if self.modern_grid_active() and key in (Qt.Key.Key_Up, Qt.Key.Key_W, Qt.Key.Key_Down, Qt.Key.Key_S, Qt.Key.Key_Left, Qt.Key.Key_A, Qt.Key.Key_Right, Qt.Key.Key_D, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_W):
+                self.move_grid_selection(self.grid_navigation_delta("up"))
+            elif key in (Qt.Key.Key_Down, Qt.Key.Key_S):
+                self.move_grid_selection(self.grid_navigation_delta("down"))
+            elif key in (Qt.Key.Key_Left, Qt.Key.Key_A):
+                self.move_grid_selection(self.grid_navigation_delta("left"))
+            elif key in (Qt.Key.Key_Right, Qt.Key.Key_D):
+                self.move_grid_selection(self.grid_navigation_delta("right"))
+            elif key == Qt.Key.Key_PageUp:
+                self.move_grid_selection(-max(1, self.view.modern_grid_visible_slots()))
+            elif key == Qt.Key.Key_PageDown:
+                self.move_grid_selection(max(1, self.view.modern_grid_visible_slots()))
+        elif key in (Qt.Key.Key_Up, Qt.Key.Key_W): self.move_selection(-1)
         elif key in (Qt.Key.Key_Down, Qt.Key.Key_S): self.move_selection(1)
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_A):
             if not (self.mode == "launcher_form" and self.cycle_launcher_form_value(-1)):
@@ -6361,6 +6664,8 @@ class GentlemanView(QWidget):
         self.wallpaper_preview_pixmap = QPixmap()
         self.wallpaper_preview_cache = {}
         self.metadata_pixmap_cache = {}
+        self.grid_boxart_pending_keys = set()
+        self.grid_boxart_worker = None
 
         self.logo = QPixmap(str(self.window.assets_dir / "logo.png"))
 
@@ -6422,6 +6727,22 @@ class GentlemanView(QWidget):
         self.scaled_wallpaper_cache_key = None
 
     def ensure_visible(self):
+        if self.window.modern_grid_active():
+            columns = max(1, self.modern_grid_columns())
+            rows = max(1, self.modern_grid_visible_rows())
+            first_index = 1
+            count = self.window.current_items_count()
+            last_index = max(first_index, count - 1)
+            idx = max(first_index, min(last_index, self.window.selected_index))
+            first_row = max(0, (max(first_index, self.scroll_offset) - first_index) // columns)
+            selected_row = max(0, (idx - first_index) // columns)
+            if selected_row < first_row:
+                first_row = selected_row
+            elif selected_row >= first_row + rows:
+                first_row = selected_row - rows + 1
+            self.scroll_offset = first_index + first_row * columns
+            return
+
         visible_rows = self.visible_rows()
         idx = self.window.selected_index
 
@@ -6451,9 +6772,20 @@ class GentlemanView(QWidget):
         if self.window.modern_game_list_active():
             available_w = max(720, self.width() - 60)
             available_h = max(480, self.height() - 170)
-            panel_w = min(available_w, max(1040, round(self.width() * 0.78)))
             panel_h = min(available_h, max(560, round(self.height() * 0.66)))
-            return max(900, panel_w), max(500, panel_h)
+
+            unconstrained_w = min(available_w, max(1040, round(self.width() * 0.78)))
+            widescreen_w = int(panel_h * 16 / 9)
+            panel_w = min(unconstrained_w, widescreen_w, available_w)
+
+            panel_w = max(900, panel_w)
+            panel_h = max(500, panel_h)
+
+            if panel_w > available_w:
+                panel_w = available_w
+                panel_h = min(panel_h, int(panel_w * 9 / 16))
+
+            return panel_w, panel_h
         panel_w = min(round(620 * scale), max(620, self.width() - 80))
         panel_h = min(round(430 * scale), max(430, self.height() - 120))
         panel_w = min(panel_w, self.width() - 40)
@@ -6570,6 +6902,48 @@ class GentlemanView(QWidget):
             reserved_height = 30
         return max(1, (panel_h - reserved_height) // 28)
 
+    def modern_grid_area_rect(self) -> QRect:
+        panel = self.menu_panel_rect()
+        side_w = 48
+        return panel.adjusted(side_w + 20, 20, -20, -72)
+
+    def modern_grid_tile_metrics(self) -> tuple[int, int, int, int, int]:
+        area = self.modern_grid_area_rect()
+        gap = 18
+        min_box_w = 130
+        max_box_w = 190
+        horizontal_padding = 22
+        vertical_padding = 18
+        selection_padding = 8
+        title_h = 42
+        title_gap = 8
+        bottom_gap = 12
+
+        available_w = max(1, area.width() - horizontal_padding * 2)
+        columns = max(1, (available_w + gap) // (min_box_w + gap))
+        while columns > 1:
+            candidate_w = (available_w - gap * (columns - 1)) // columns
+            if candidate_w >= min_box_w:
+                break
+            columns -= 1
+        box_w = min(max_box_w, max(min_box_w, (available_w - gap * (columns - 1)) // columns))
+
+        box_h = int(box_w * 1.36)
+        tile_h = selection_padding * 2 + box_h + title_gap + title_h + bottom_gap
+        available_h = max(1, area.height() - vertical_padding * 2)
+        rows = max(1, available_h // max(1, tile_h))
+        return columns, rows, box_w, box_h, gap
+
+    def modern_grid_columns(self) -> int:
+        return self.modern_grid_tile_metrics()[0]
+
+    def modern_grid_visible_rows(self) -> int:
+        return self.modern_grid_tile_metrics()[1]
+
+    def modern_grid_visible_slots(self) -> int:
+        columns, rows, *_ = self.modern_grid_tile_metrics()
+        return max(1, columns * rows)
+
     def wrapped_text_lines(self, painter: QPainter, text: str, max_width: int) -> list[str]:
         words = text.split()
         if not words:
@@ -6655,6 +7029,24 @@ class GentlemanView(QWidget):
         if self.window.overlay: self.draw_overlay(painter)
 
 
+    def overlay_guide_text(self, ov: dict) -> str:
+        if self.window.active_input == "keyboard":
+            if ov.get("type") == "scrape_progress":
+                return "Up/Down Scroll   Enter Stop Scraper   Esc Background"
+            if ov.get("scrollable"):
+                return "Up/Down Scroll   Enter Close   Esc Back"
+            return "Left/Right Select   Enter Confirm   Esc Back"
+        if ov.get("type") == "scrape_progress":
+            return "Up/Down Scroll   A Stop Scraper   B Background"
+        if ov.get("scrollable"):
+            return "Up/Down Scroll   A Close   B Back"
+        return "D-pad Select   A Confirm   B Back"
+
+    def text_input_guide_text(self) -> str:
+        if self.window.active_input == "keyboard":
+            return "Arrow Keys Navigate   Enter Done   Esc Cancel   Backspace Delete   Space Space   Shift Toggle Shift   Caps Lock Toggle Caps   Ctrl+S Symbols"
+        return "D-pad Navigate   A Select   B Backspace   X Space   Y Shift   LB Caps Lock   RB Symbols   Start Done"
+
     def draw_background_scrape_status(self, painter):
         text = ""
         if self.window.bulk_scrape_active() and not self.window.progress_overlay_open():
@@ -6680,13 +7072,22 @@ class GentlemanView(QWidget):
     def draw_overlay(self, painter):
         ov = self.window.overlay
         labels = ["OK"] if ov.get("type") == "message" else [item[0] for item in ov.get("buttons", [])]
-        box_width = min(820, self.width() - 80)
+        painter.setFont(self.font)
+        guide = self.overlay_guide_text(ov)
+        guide_width = painter.fontMetrics().horizontalAdvance(guide) + 96
+        label_width = max((painter.fontMetrics().horizontalAdvance(label) for label in labels), default=0)
+        columns = min(3, max(1, len(labels)))
+        gap = 12
+        needed_button_width = columns * min(240, max(140, label_width + 52)) + gap * (columns - 1) + 72
+        box_width = min(max(820, guide_width, needed_button_width), self.width() - 80)
         content_width = box_width - 72
 
         painter.setFont(self.title_font)
         title_height = painter.fontMetrics().height()
         painter.setFont(self.font)
-        guide_height = painter.fontMetrics().height()
+        guide_line_height = painter.fontMetrics().height()
+        guide_wrap = painter.fontMetrics().horizontalAdvance(guide) > box_width - 64
+        guide_height = guide_line_height * (2 if guide_wrap else 1) + (6 if guide_wrap else 0)
         button_rows = max(1, (len(labels) + 2) // 3)
         button_area_height = button_rows * 44
 
@@ -6759,10 +7160,7 @@ class GentlemanView(QWidget):
                 message,
             )
 
-        columns = min(3, max(1, len(labels)))
-        gap = 12
         available_width = box.width() - 72 - gap * (columns - 1)
-        label_width = max((painter.fontMetrics().horizontalAdvance(label) for label in labels), default=0)
         button_w = min(240, max(140, label_width + 52, available_width // columns))
         row_width = columns * button_w + gap * (columns - 1)
         start_x = box.center().x() - row_width // 2
@@ -6779,12 +7177,8 @@ class GentlemanView(QWidget):
             painter.drawText(r, Qt.AlignmentFlag.AlignCenter, label)
 
         painter.setPen(self.text)
-        guide = "D-pad Select   A Confirm   B Back"
-        if ov.get("type") == "scrape_progress":
-            guide = "Up/Down Scroll   A Stop Scraper   B Background"
-        elif ov.get("scrollable"):
-            guide = "Up/Down Scroll   A Close   B Back"
-        painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, guide)
+        guide_flags = Qt.AlignmentFlag.AlignCenter | (Qt.TextFlag.TextWordWrap if guide_wrap else Qt.TextFlag.TextSingleLine)
+        painter.drawText(guide_rect, guide_flags, guide)
 
     def display_text_key(self, key: str) -> str:
         if len(key) != 1 or self.window.text_input_symbols:
@@ -6797,7 +7191,12 @@ class GentlemanView(QWidget):
         return key
 
     def draw_text_input(self, painter):
-        painter.fillRect(self.rect(), self.keyboard_overlay); box=QRect(70,70,self.width()-140,self.height()-140); painter.fillRect(box,self.dialog); painter.setPen(self.light); painter.drawRect(box)
+        painter.fillRect(self.rect(), self.keyboard_overlay)
+        painter.setFont(self.font)
+        guide = self.text_input_guide_text()
+        guide_width = painter.fontMetrics().horizontalAdvance(guide) + 96
+        box_width = min(max(self.width() - 140, guide_width), self.width() - 40)
+        box=QRect((self.width()-box_width)//2,70,box_width,self.height()-140); painter.fillRect(box,self.dialog); painter.setPen(self.light); painter.drawRect(box)
         painter.setFont(self.title_font); painter.setPen(self.text); painter.drawText(box.x()+28,box.y()+40,self.window.text_input_title)
         painter.setFont(self.font); painter.drawText(box.x()+28,box.y()+76,self.window.text_input_prompt)
         field=QRect(box.x()+28,box.y()+95,box.width()-56,48); painter.fillRect(field,self.field); painter.setPen(self.light); painter.drawRect(field)
@@ -6817,8 +7216,13 @@ class GentlemanView(QWidget):
                     painter.drawRect(r)
                 painter.drawText(r,Qt.AlignmentFlag.AlignCenter,label); x+=w+gap
             y+=48
-        guide="D-pad Navigate   A Select   B Backspace   X Space   Y Shift   LB Caps Lock   RB Symbols   Start Done"
-        painter.setPen(self.text); painter.drawText(box.adjusted(18,0,-18,-14),Qt.AlignmentFlag.AlignBottom|Qt.AlignmentFlag.AlignHCenter,guide)
+        guide_rect = box.adjusted(18, 0, -18, -14)
+        guide_available = guide_rect.width()
+        guide_wrap = painter.fontMetrics().horizontalAdvance(guide) > guide_available
+        guide_height = painter.fontMetrics().height() * (2 if guide_wrap else 1) + (6 if guide_wrap else 0)
+        guide_rect = QRect(guide_rect.x(), box.bottom() - guide_height - 14, guide_rect.width(), guide_height)
+        guide_flags = Qt.AlignmentFlag.AlignCenter | (Qt.TextFlag.TextWordWrap if guide_wrap else Qt.TextFlag.TextSingleLine)
+        painter.setPen(self.text); painter.drawText(guide_rect, guide_flags, guide)
 
     def draw_logo(self, painter: QPainter):
         if not self.window.settings.get("show_logo", True):
@@ -6924,6 +7328,163 @@ class GentlemanView(QWidget):
     def selected_metadata(self) -> tuple[GameMetadataIdentity | None, dict | None]:
         identity = self.window.selected_game_identity()
         return identity, self.window.metadata_cache.load(identity) if identity else None
+
+    def grid_item_metadata(self, index: int) -> tuple[GameMetadataIdentity | None, dict | None]:
+        data = self.window.game_data_for_index(index)
+        if not data:
+            return None, None
+        identity = self.window.game_metadata_identity(data.get("launcher"), data.get("rom"))
+        if identity is None:
+            return None, None
+        return identity, self.window.metadata_cache.load(identity)
+
+    def grid_item_title(self, labels: list[tuple[str, str]], index: int, data: dict | None) -> str:
+        if data:
+            title = str(data.get("scrape_name", "")).strip()
+            if title:
+                return title
+        if 0 <= index < len(labels):
+            return str(labels[index][0])
+        return ""
+
+    def request_grid_boxart(self, requests: list[tuple[str, str]]):
+        if not requests:
+            return
+        missing = []
+        for key, path_text in requests:
+            if not key or key in self.metadata_pixmap_cache or key in self.grid_boxart_pending_keys:
+                continue
+            missing.append((key, path_text))
+            self.grid_boxart_pending_keys.add(key)
+        if not missing:
+            return
+        if self.grid_boxart_worker is not None and self.grid_boxart_worker.isRunning():
+            return
+        worker = ModernBoxartLoadWorker(missing)
+        self.grid_boxart_worker = worker
+        worker.result.connect(self.on_grid_boxart_loaded)
+        worker.finished.connect(lambda: self.cleanup_grid_boxart_worker(worker))
+        worker.start()
+
+    def on_grid_boxart_loaded(self, loaded: object):
+        if isinstance(loaded, dict):
+            for key, image in loaded.items():
+                self.grid_boxart_pending_keys.discard(key)
+                if isinstance(image, QImage) and not image.isNull():
+                    self.metadata_pixmap_cache[key] = QPixmap.fromImage(image)
+        while len(self.metadata_pixmap_cache) > 160:
+            self.metadata_pixmap_cache.pop(next(iter(self.metadata_pixmap_cache)))
+        self.update()
+
+    def cleanup_grid_boxart_worker(self, worker):
+        if self.grid_boxart_worker is worker:
+            self.grid_boxart_worker = None
+        for key, _path_text in getattr(worker, "items", []):
+            self.grid_boxart_pending_keys.discard(key)
+        self.update()
+
+    def draw_scrolling_grid_title(self, painter: QPainter, rect: QRect, text: str, selected: bool):
+        metrics = painter.fontMetrics()
+        width = metrics.horizontalAdvance(text)
+        painter.save()
+        painter.setClipRect(rect)
+        y = rect.y() + metrics.ascent() + max(0, (rect.height() - metrics.height()) // 2)
+        if selected and width > rect.width():
+            gap = 42
+            cycle = width + gap
+            offset = int((time.monotonic() * 48) % cycle)
+            painter.drawText(rect.x() - offset, y, text)
+            painter.drawText(rect.x() - offset + cycle, y, text)
+        else:
+            painter.drawText(rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, metrics.elidedText(text, Qt.TextElideMode.ElideRight, rect.width()))
+        painter.restore()
+
+    def draw_modern_grid_panel(self, painter: QPainter, panel_rect: QRect, side_w: int):
+        labels = self.window.current_labels()
+        if len(labels) <= 1:
+            painter.setPen(self.text)
+            painter.drawText(panel_rect.adjusted(side_w + 22, 28, -28, -72), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, "No games")
+            return
+
+        area = self.modern_grid_area_rect()
+        painter.fillRect(area, self.dialog_alt)
+        painter.setPen(self.light)
+        painter.drawRect(area)
+
+        columns, rows, box_w, box_h, gap = self.modern_grid_tile_metrics()
+        visible_slots = max(1, columns * rows)
+        first_index = max(1, self.scroll_offset)
+        max_first = max(1, len(labels) - visible_slots)
+        first_index = min(first_index, max_first)
+        first_row = (first_index - 1) // columns
+        first_index = first_row * columns + 1
+        self.scroll_offset = first_index
+        end_index = min(len(labels), first_index + visible_slots)
+
+        grid_w = columns * box_w + (columns - 1) * gap
+        start_x = area.x() + max(0, (area.width() - grid_w) // 2)
+        y = area.y() + 18
+        title_h = 42
+        title_gap = 8
+        selection_padding = 8
+        bottom_gap = 12
+        tile_h = selection_padding * 2 + box_h + title_gap + title_h + bottom_gap
+        font = QFont(self.font)
+        font.setPointSize(max(10, min(15, int(box_w / 10))))
+        painter.setFont(font)
+
+        boxart_requests = []
+        for visible_pos, index in enumerate(range(first_index, end_index)):
+            col = visible_pos % columns
+            row = visible_pos // columns
+            x = start_x + col * (box_w + gap)
+            tile_y = y + row * tile_h + selection_padding
+            box_rect = QRect(x, tile_y, box_w, box_h)
+            title_rect = QRect(x, box_rect.bottom() + title_gap, box_w, title_h)
+            selected = index == self.window.selected_index
+
+            if selected:
+                painter.fillRect(QRect(x - selection_padding, tile_y - selection_padding, box_w + selection_padding * 2, box_h + title_gap + title_h + selection_padding * 2), self.light)
+                painter.setPen(self.dark_text)
+            else:
+                painter.setPen(self.light)
+
+            painter.drawRect(box_rect)
+            identity, data = self.grid_item_metadata(index)
+            title = self.grid_item_title(labels, index, data)
+            pixmap = QPixmap()
+            key = ""
+            if identity and data:
+                box = str(data.get("box2d", "")).strip()
+                if box:
+                    art_path = self.window.metadata_cache.resolve_box2d_path(identity, box)
+                    if art_path and art_path.exists():
+                        key = str(art_path)
+                        pixmap = self.metadata_pixmap_cache.get(key, QPixmap())
+                        if pixmap.isNull():
+                            boxart_requests.append((key, key))
+
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(box_rect.adjusted(8, 8, -8, -8).size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                painter.drawPixmap(box_rect.x() + (box_rect.width() - scaled.width()) // 2, box_rect.y() + (box_rect.height() - scaled.height()) // 2, scaled)
+            else:
+                painter.setFont(font)
+                painter.setPen(self.dark_text if selected else self.text)
+                placeholder = "Loading Boxart" if key in self.grid_boxart_pending_keys else "No Boxart"
+                painter.drawText(box_rect.adjusted(8, 8, -8, -8), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, placeholder)
+
+            painter.setPen(self.dark_text if selected else self.text)
+            painter.setFont(font)
+            self.draw_scrolling_grid_title(painter, title_rect, title, selected)
+
+        self.request_grid_boxart(boxart_requests)
+
+        arrow_x = area.right() - 18
+        painter.setPen(self.text)
+        if first_index > 1:
+            painter.drawText(arrow_x, area.y() + 24, "^")
+        if end_index < len(labels):
+            painter.drawText(arrow_x, area.bottom() - 8, "v")
 
     def draw_modern_metadata_panel(self, painter: QPainter, panel_rect: QRect, side_w: int):
         meta_x = panel_rect.x() + side_w + int((panel_rect.width() - side_w) * 0.54)
@@ -7081,6 +7642,48 @@ class GentlemanView(QWidget):
             )
             text_y += line_step
 
+    def draw_modern_simple_boxart_panel(self, painter: QPainter, panel_rect: QRect, side_w: int):
+        art_x = panel_rect.x() + side_w + int((panel_rect.width() - side_w) * 0.54)
+        art_w = panel_rect.right() - art_x - 18
+        if art_w < 260:
+            return
+
+        rect = QRect(art_x, panel_rect.y() + 18, art_w, panel_rect.height() - 72)
+        painter.fillRect(rect, self.dialog_alt)
+        painter.setPen(self.light)
+        painter.drawRect(rect)
+        inner = rect.adjusted(18, 18, -18, -18)
+
+        identity, data = self.selected_metadata()
+        pixmap = QPixmap()
+        if identity and data:
+            box = str(data.get("box2d", "")).strip()
+            if box:
+                art_path = self.window.metadata_cache.resolve_box2d_path(identity, box)
+                key = str(art_path) if art_path else ""
+                pixmap = self.metadata_pixmap_cache.get(key, QPixmap()) if key else QPixmap()
+                if key and pixmap.isNull() and art_path.exists():
+                    pixmap = QPixmap(key)
+                    self.metadata_pixmap_cache[key] = pixmap
+                    while len(self.metadata_pixmap_cache) > 24:
+                        self.metadata_pixmap_cache.pop(next(iter(self.metadata_pixmap_cache)))
+
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                inner.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            painter.drawPixmap(
+                inner.x() + (inner.width() - scaled.width()) // 2,
+                inner.y() + (inner.height() - scaled.height()) // 2,
+                scaled,
+            )
+        else:
+            painter.setFont(self.font)
+            painter.setPen(self.text)
+            painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, "No Boxart")
+
     def draw_modern_help_bar(self, painter: QPainter, panel_rect: QRect):
         rect = QRect(panel_rect.x(), panel_rect.bottom() + 12, panel_rect.width(), 36)
         if rect.bottom() > self.height() - 12:
@@ -7089,9 +7692,15 @@ class GentlemanView(QWidget):
         painter.setFont(self.font)
         painter.setPen(self.dark_text)
         if self.window.active_input == "controller":
-            text = "A Launch   B Back   X Favorite   Y Menu   L Summary   R Search   Left/Right Page"
+            if self.window.modern_grid_active():
+                text = "D-pad Move   A Launch   B Back   X Favorite   Y Menu   L Summary   R Search"
+            else:
+                text = "A Launch   B Back   X Favorite   Y Menu   L Summary   R Search   Left/Right Page"
         else:
-            text = "Enter Launch   Esc Back   F Favorite   Y Menu   I Summary   Ctrl+F Search   PgUp/PgDn Page"
+            if self.window.modern_grid_active():
+                text = "Arrows Move   Enter Launch   Esc Back   F Favorite   Y Menu   I Summary   Ctrl+F Search"
+            else:
+                text = "Enter Launch   Esc Back   F Favorite   Y Menu   I Summary   Ctrl+F Search   PgUp/PgDn Page"
         painter.drawText(rect.adjusted(12, 0, -12, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter, text)
 
     def draw_top_bar(self, painter: QPainter):
@@ -7221,6 +7830,14 @@ class GentlemanView(QWidget):
             painter.drawText(text_x, row_y, "No entries")
             return
 
+        if modern and self.window.modern_grid_enabled():
+            if self.window.selected_index <= 0 and len(labels) > 1:
+                self.window.selected_index = 1
+            self.ensure_visible()
+            self.draw_modern_grid_panel(painter, panel_rect, side_w)
+            self.draw_modern_help_bar(painter, panel_rect)
+            return
+
         for row, idx in enumerate(range(start, end)):
             label, marker = labels[idx]
             support_gap = 14 if self.window.mode == "system" and idx >= 6 else 0
@@ -7299,5 +7916,8 @@ class GentlemanView(QWidget):
             painter.setPen(self.text)
             painter.drawText(arrow_x, y + panel_h - 8, "v")
         if modern:
-            self.draw_modern_metadata_panel(painter, panel_rect, side_w)
+            if self.window.modern_simple_list_enabled():
+                self.draw_modern_simple_boxart_panel(painter, panel_rect, side_w)
+            else:
+                self.draw_modern_metadata_panel(painter, panel_rect, side_w)
             self.draw_modern_help_bar(painter, panel_rect)

@@ -532,6 +532,7 @@ class MetadataCache:
         box_path = self.resolve_box2d_path(identity, str(data.get("box2d", "")))
         index[key] = {
             "cache_key": key,
+            "file_base": str(data.get("file_base", self.safe_rom_asset_stem(identity))).strip(),
             "rom": identity.rom,
             "rom_filename": identity.rom_name,
             "scrape_name": str(data.get("scrape_name", "")).strip(),
@@ -541,14 +542,56 @@ class MetadataCache:
         }
         self.save_index(identity.system, index)
 
-    def json_path(self, identity: GameMetadataIdentity) -> Path:
-        return self.system_root(identity.system) / "games" / f"{self.cache_key(identity)}.json"
-
-    def safe_artwork_filename(self, identity: GameMetadataIdentity) -> str:
+    def safe_rom_filename_stem(self, identity: GameMetadataIdentity) -> str:
         name = Path(identity.rom_name).stem or identity.rom_stem or self.cache_key(identity)
-        cleaned = re.sub(r"[<>:\"/\\|?*]+", "_", name).strip().rstrip(".")
+        cleaned = re.sub(r'[<>:"/\\|?*]+', "_", name).strip().rstrip(".")
         cleaned = re.sub(r"\s+", " ", cleaned)
         return cleaned or self.cache_key(identity)
+
+    def duplicate_suffix(self, identity: GameMetadataIdentity) -> str:
+        return self.cache_key(identity)[:6]
+
+    def safe_rom_asset_stem(self, identity: GameMetadataIdentity) -> str:
+        key = self.cache_key(identity)
+        entry = self.index_entry(identity)
+        if entry is not None:
+            file_base = str(entry.get("file_base", "")).strip()
+            if file_base:
+                return file_base
+
+        base = self.safe_rom_filename_stem(identity)
+        suffixed = f"{base}__{self.duplicate_suffix(identity)}"
+        games_dir = self.system_root(identity.system) / "games"
+        clean_json = games_dir / f"{base}.json"
+        suffixed_json = games_dir / f"{suffixed}.json"
+
+        if suffixed_json.exists():
+            return suffixed
+
+        if clean_json.exists():
+            try:
+                existing = json.loads(clean_json.read_text(encoding="utf-8"))
+                existing_key = str(existing.get("cache_key", "")).strip()
+                if existing_key and existing_key != key:
+                    return suffixed
+            except Exception:
+                return suffixed
+
+        for other_key, other_entry in self.load_index(identity.system).items():
+            if other_key == key or not isinstance(other_entry, dict):
+                continue
+            other_base = str(other_entry.get("file_base", "")).strip()
+            other_rom_name = str(other_entry.get("rom_filename", "")).strip()
+            if other_base == base or (other_rom_name and other_rom_name == identity.rom_name):
+                return suffixed
+
+        return base
+
+    def json_path(self, identity: GameMetadataIdentity) -> Path:
+        return self.system_root(identity.system) / "games" / f"{self.safe_rom_asset_stem(identity)}.json"
+
+    def safe_artwork_filename(self, identity: GameMetadataIdentity) -> str:
+        return self.safe_rom_asset_stem(identity)
 
     def box2d_path(self, identity: GameMetadataIdentity) -> Path:
         return self.system_root(identity.system) / "box2d" / f"{self.safe_artwork_filename(identity)}.png"
@@ -660,6 +703,7 @@ class MetadataCache:
     def save(self, identity: GameMetadataIdentity, metadata: dict, box2d_bytes: bytes | None = None, manual_name: str = "") -> dict:
         key = self.cache_key(identity)
         json_path = self.json_path(identity)
+        file_base = json_path.stem
         box_path = self.box2d_path(identity)
         existing = self.load(identity) or {}
 
@@ -671,6 +715,7 @@ class MetadataCache:
 
         saved = {
             "cache_key": key,
+            "file_base": file_base,
             "source": "screenscraper",
             "system": identity.system,
             "launcher": identity.launcher,
