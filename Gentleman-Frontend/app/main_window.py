@@ -6,6 +6,7 @@ import ctypes
 import threading
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -16,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
-from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent, QThread, pyqtSignal, QByteArray
+from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QEvent, QThread, pyqtSignal, QByteArray, QSize
 from PyQt6.QtGui import QFont, QKeyEvent, QPainter, QColor, QPen, QPixmap, QIcon, QImage, QMovie
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -31,6 +32,18 @@ from app.theme_manager import ThemeManager, DEFAULT_THEME_ID
 from core.arcade_names import ArcadeNameDatabase
 from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, launch_link_shortcut, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
+from core.metadata import (
+    MetadataCache,
+    ScreenScraperClient,
+    GameMetadataIdentity,
+    SCRAPE_MODES,
+    SCRAPE_REGIONS,
+    SCREENSCRAPER_SYSTEM_IDS,
+    ScreenScraperQuotaError,
+    ScreenScraperDailyQuotaError,
+    cleaned_scrape_name,
+    region_from_option,
+)
 from core.remote_api import GentlemanApiServer
 from core.updater import (
     check_for_update,
@@ -94,6 +107,114 @@ class RomFolderScanWorker(QThread):
                 "items": [],
                 "error": str(exc),
             })
+
+
+class ScrapeWorker(QThread):
+    progress = pyqtSignal(object)
+    finished_result = pyqtSignal(object)
+
+    def __init__(self, cache: MetadataCache, jobs: list[dict], mode: str, username: str, password: str):
+        super().__init__()
+        self.cache = cache
+        self.jobs = jobs
+        self.mode = mode
+        self.username = username
+        self.password = password
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
+
+    def run(self):
+        def quota_callback(quota):
+            self.progress.emit({"type": "quota", "quota": quota})
+
+        client = ScreenScraperClient(self.username, self.password, quota_callback=quota_callback)
+        total = len(self.jobs)
+        summary = {"scraped": 0, "skipped": 0, "missing": 0, "failed": 0, "stopped": "", "quota_reached": False, "quota_message": "", "login_failed": False, "login_message": ""}
+        try:
+            client.quota_info()
+        except Exception as exc:
+            summary["stopped"] = "Login failed"
+            summary["login_failed"] = True
+            summary["login_message"] = str(exc) or "ScreenScraper login rejected."
+            self.finished_result.emit(summary)
+            return
+        for index, job in enumerate(self.jobs, 1):
+            if self.cancel_requested:
+                summary["stopped"] = "Cancelled"
+                break
+            identity = job.get("identity")
+            if not isinstance(identity, GameMetadataIdentity):
+                summary["failed"] += 1
+                continue
+            if not self.cache.should_scrape(identity, self.mode):
+                summary["skipped"] += 1
+                self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": "Skipped"})
+                continue
+            try:
+                search_name = str(job.get("search_name") or cleaned_scrape_name(identity.rom_name))
+                self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": "Scraping"})
+                preferred_region = str(job.get("preferred_region", ""))
+                metadata, box2d = client.scrape_game(int(job.get("system_id")), identity.rom_name, search_name, preferred_region, str(job.get("game_id", "")))
+                if not metadata.get("scrape_name"):
+                    summary["missing"] += 1
+                    self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": "Not found"})
+                    continue
+                self.cache.save(identity, metadata, box2d, str(job.get("manual_scrape_name", "")))
+                summary["scraped"] += 1
+                self.progress.emit({"index": index, "total": total, "name": str(metadata.get("scrape_name") or identity.rom_stem), "status": "Saved"})
+            except ScreenScraperDailyQuotaError as exc:
+                message = str(exc).strip() or "ScreenScraper daily quota has been reached."
+                summary["stopped"] = "Quota reached"
+                summary["quota_reached"] = True
+                summary["quota_message"] = message
+                self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": "Quota reached"})
+                break
+            except ScreenScraperQuotaError as exc:
+                message = str(exc).strip() or "ScreenScraper quota or rate limit reached."
+                summary["stopped"] = "Quota or rate limit reached"
+                summary["quota_reached"] = True
+                summary["quota_message"] = message
+                self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": "Quota or rate limit reached"})
+                break
+            except Exception as exc:
+                message = str(exc)
+                lower_message = message.lower()
+                if "login" in lower_message or "credential" in lower_message or "identifiant" in lower_message:
+                    summary["stopped"] = "Login failed"
+                    summary["login_failed"] = True
+                    summary["login_message"] = message
+                    self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": "Login failed"})
+                    break
+                if "limit reached" in lower_message or "quota" in lower_message:
+                    summary["stopped"] = message
+                    summary["quota_reached"] = True
+                    summary["quota_message"] = message
+                    self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": message})
+                    break
+                if "not found" in lower_message:
+                    summary["missing"] += 1
+                else:
+                    summary["failed"] += 1
+                self.progress.emit({"index": index, "total": total, "name": identity.rom_stem, "status": message})
+        self.finished_result.emit(summary)
+
+
+class ScreenScraperQuotaWorker(QThread):
+    result = pyqtSignal(object)
+
+    def __init__(self, username: str, password: str):
+        super().__init__()
+        self.username = username
+        self.password = password
+
+    def run(self):
+        try:
+            client = ScreenScraperClient(self.username, self.password)
+            self.result.emit({"ok": True, "quota": client.quota_info()})
+        except Exception as exc:
+            self.result.emit({"ok": False, "error": str(exc)})
 
 
 def resource_path(relative_path: str) -> Path:
@@ -380,6 +501,32 @@ class GentlemanWindow(QMainWindow):
         self.settings = self.load_settings()
         self.apply_selected_theme(save_if_invalid=False)
         self.arcade_name_database = ArcadeNameDatabase(self.assets_dir / "databases" / "arcade_names.json")
+        self.metadata_cache = MetadataCache(self.base_dir)
+        self.scrape_worker: ScrapeWorker | None = None
+        self.scrape_quota_worker: ScreenScraperQuotaWorker | None = None
+        self.scrape_target_items: list[str] = []
+        self.scrape_target = "All Systems"
+        self.scrape_mode = "Unscraped Only"
+        self.scrape_region = str(self.settings.get("scrape_region", "Same as Game"))
+        self.scrape_progress_lines: list[str] = []
+        self.scrape_progress_text = ""
+        self.scrape_status_text = ""
+        self.scrape_status_complete_until = 0.0
+        self.scrape_return_mode = "settings"
+        self.scrape_progress_window_open = False
+        self.scrape_stop_requested = False
+        self.screenscraper_quota_text = "User Quota: Loading..."
+        self.screenscraper_login_validated = False
+        self.screenscraper_login_error = ""
+        self.single_scrape_identity: GameMetadataIdentity | None = None
+        self.single_scrape_system_id = 0
+        self.single_scrape_action = "Scrape"
+        self.single_scrape_use_custom = False
+        self.single_scrape_custom_name = ""
+        self.single_scrape_region = "Same as Game"
+        self.scrape_match_items: list[dict] = []
+        self.scrape_match_return_mode = "single_scrape"
+        self.region_picker_return_mode = "scrape_settings"
         self.ensure_settings_app_info()
         self.remote_api_server: GentlemanApiServer | None = None
         self.api_show_requested.connect(self._show_from_api)
@@ -415,6 +562,7 @@ class GentlemanWindow(QMainWindow):
         self.folder_picker_current_folder = self.menu_root
         self.item_options_items: list[str] = []
         self.item_options_target: MenuItem | None = None
+        self.item_options_game_data: dict | None = None
         self.item_options_return_mode = "menu"
         self.item_options_return_index = 0
         self.mode = "menu"
@@ -437,6 +585,7 @@ class GentlemanWindow(QMainWindow):
         self.menu_items: list[MenuItem] = []
         self.rom_items: list[RomBrowserItem] = []
         self.rom_labels: list[tuple[str, str]] = []
+        self.rom_has_game_entries = False
         self.rom_folder_cache: dict[tuple, dict] = {}
         self.rom_scan_worker: RomFolderScanWorker | None = None
         self.retired_rom_scan_workers: list[RomFolderScanWorker] = []
@@ -580,6 +729,10 @@ class GentlemanWindow(QMainWindow):
             "fullscreen_menu_size": 100,
             "menu_idle_hide_timeout": 0,
             "theme": DEFAULT_THEME_ID,
+            "game_view": "classic",
+            "screenscraper_username": "",
+            "screenscraper_password": "",
+            "scrape_region": "Same as Game",
         }
 
     def load_settings(self) -> dict:
@@ -665,16 +818,42 @@ class GentlemanWindow(QMainWindow):
 
     def set_rom_items(self, items: list[RomBrowserItem]):
         self.rom_items = items
-        self.rom_labels = [("...", "<DIR>")] + [(item.display_name, item.marker) for item in items]
+        self.rom_has_game_entries = any(not item.is_dir for item in items)
+        self.refresh_rom_labels()
         self.rom_loading = False
+
+    def refresh_rom_labels(self):
+        labels = [("...", "<DIR>")]
+        index = {}
+        use_index = False
+        if self.current_launcher and self.modern_mode_enabled():
+            system = self.current_launcher.system.strip()
+            if self.metadata_supported_system(system):
+                index = self.metadata_cache.load_index(system)
+                use_index = bool(index)
+
+        for item in self.rom_items:
+            name = item.display_name
+            if self.current_launcher and not item.is_dir and use_index:
+                identity = self.game_metadata_identity(self.current_launcher, item.path)
+                if identity:
+                    entry = index.get(self.metadata_cache.cache_key(identity))
+                    if isinstance(entry, dict):
+                        scraped_name = str(entry.get("scrape_name", "")).strip()
+                        if scraped_name:
+                            name = scraped_name
+            labels.append((name, item.marker))
+        self.rom_labels = labels
 
     def clear_rom_items(self):
         self.rom_items = []
         self.rom_labels = []
+        self.rom_has_game_entries = False
         self.rom_loading = False
 
     def show_rom_loading(self):
         self.rom_items = []
+        self.rom_has_game_entries = False
         self.rom_labels = [("Loading folder...", "")]
         self.rom_loading = True
 
@@ -783,6 +962,245 @@ class GentlemanWindow(QMainWindow):
     def favorites_menu_enabled(self) -> bool:
         return bool(self.settings.get("show_favorites_menu", True))
 
+    def modern_mode_enabled(self) -> bool:
+        return str(self.settings.get("game_view", "classic")).lower() == "modern"
+
+    def game_view_label(self) -> str:
+        return "Game View: Modern" if self.modern_mode_enabled() else "Game View: Classic"
+
+    def screenscraper_username(self) -> str:
+        return str(self.settings.get("screenscraper_username", "")).strip()
+
+    def screenscraper_password(self) -> str:
+        return str(self.settings.get("screenscraper_password", "")).strip()
+
+    def screenscraper_account_ready(self) -> bool:
+        return bool(self.screenscraper_username() and self.screenscraper_password())
+
+    def screenscraper_account_label(self) -> str:
+        return "ScreenScraper Account: Set" if self.screenscraper_account_ready() else "ScreenScraper Account: Not Set"
+
+    def require_screenscraper_account(self) -> bool:
+        if self.screenscraper_account_ready():
+            return True
+        self.show_message("ScreenScraper Account", "Enter your ScreenScraper username and password before scraping.")
+        return False
+
+    def screenscraper_login_error_message(self, error: str) -> str:
+        detail = str(error or "").strip()
+        if not detail:
+            detail = "ScreenScraper rejected the account login."
+        return (
+            "ScreenScraper Login Failed\n\n"
+            f"{detail}\n\n"
+            "Please check your ScreenScraper username and password. "
+            "ScreenScraper passwords should be alphanumeric."
+        )
+
+    def validate_screenscraper_login_now(self, show_error: bool = True) -> bool:
+        if not self.require_screenscraper_account():
+            return False
+        try:
+            client = ScreenScraperClient(self.screenscraper_username(), self.screenscraper_password())
+            quota = client.quota_info()
+            self.screenscraper_login_validated = True
+            self.screenscraper_login_error = ""
+            if isinstance(quota, dict) and quota:
+                self.screenscraper_quota_text = self.format_quota_text(quota)
+            return True
+        except Exception as exc:
+            self.screenscraper_login_validated = False
+            self.screenscraper_login_error = str(exc)
+            self.screenscraper_quota_text = "User Quota: Login failed"
+            if show_error:
+                self.show_message("ScreenScraper Login Failed", self.screenscraper_login_error_message(str(exc)), scrollable=True)
+            else:
+                self.view.update()
+            return False
+
+    def validate_screenscraper_login_after_account_edit(self):
+        if not self.screenscraper_username() or not self.screenscraper_password():
+            self.screenscraper_login_validated = False
+            self.screenscraper_login_error = ""
+            self.screenscraper_quota_text = "User Quota: Not logged in"
+            self.view.update()
+            return
+        self.validate_screenscraper_login_now(show_error=True)
+        self.view.update()
+
+    def metadata_supported_system(self, system: str) -> bool:
+        return system.strip() in ZAPAROO_SYSTEM_NAMES and system.strip() in SCREENSCRAPER_SYSTEM_IDS
+
+    def game_metadata_identity(self, launcher: LauncherConfig | None, rom: Path | None) -> GameMetadataIdentity | None:
+        if launcher is None or rom is None:
+            return None
+        system = launcher.system.strip()
+        if not self.metadata_supported_system(system):
+            return None
+        try:
+            launcher_rel = str(launcher.path.relative_to(self.menu_root)).replace(chr(92), "/")
+        except Exception:
+            launcher_rel = str(launcher.path).replace(chr(92), "/")
+        try:
+            rom_path = str(rom if rom.is_absolute() else rom.absolute()).replace(chr(92), "/")
+        except Exception:
+            rom_path = str(rom).replace(chr(92), "/")
+        return GameMetadataIdentity(system, launcher_rel, rom_path, rom.name, rom.stem)
+
+    def metadata_for_identity(self, identity: GameMetadataIdentity | None) -> dict | None:
+        return self.metadata_cache.load(identity) if identity is not None else None
+
+    def display_name_for_identity(self, fallback: str, identity: GameMetadataIdentity | None) -> str:
+        if self.modern_mode_enabled():
+            entry = self.metadata_cache.index_entry(identity)
+            if entry:
+                name = str(entry.get("scrape_name", "")).strip()
+                if name:
+                    return name
+        return fallback
+
+    def current_view_has_game_entries(self) -> bool:
+        if self.mode == "roms":
+            return self.rom_has_game_entries
+        if self.mode == "favorites":
+            return bool(self.favorite_items)
+        if self.mode == "recent":
+            return bool(self.recent_items)
+        if self.mode == "system_launchers":
+            return any(item.get("rom") is not None for item in self.game_system_games.get(self.current_game_system or "", []))
+        if self.mode == "search_results":
+            return any(item.get("type") == "game" and item.get("rom") is not None for item in self.search_items)
+        return False
+
+    def modern_game_list_active(self) -> bool:
+        return (
+            self.modern_mode_enabled()
+            and self.mode in {"roms", "favorites", "recent", "system_launchers", "search_results"}
+            and self.current_view_has_game_entries()
+        )
+
+    def display_name_for_game_dict(self, item: dict) -> str:
+        fallback = str(item.get("name", "")).strip()
+        launcher = item.get("launcher")
+        rom = item.get("rom")
+        if isinstance(launcher, LauncherConfig) and rom is not None:
+            return self.display_name_for_identity(fallback, self.game_metadata_identity(launcher, Path(rom)))
+        return fallback
+
+    def metadata_display_name_for_rom_item(self, launcher: LauncherConfig, item: RomBrowserItem) -> str:
+        return self.display_name_for_identity(item.display_name, self.game_metadata_identity(launcher, item.path))
+
+    def selected_game_identity(self) -> GameMetadataIdentity | None:
+        data = self.selected_game_data()
+        if not data:
+            return None
+        return self.game_metadata_identity(data.get("launcher"), data.get("rom"))
+
+    def open_selected_summary_overlay(self):
+        if not self.modern_mode_enabled():
+            return
+        identity = self.selected_game_identity()
+        if identity is None:
+            return
+        data = self.metadata_cache.load(identity)
+        title = "Summary"
+        message = "No summary available."
+        if data:
+            title = str(data.get("scrape_name", "")).strip() or title
+            message = str(data.get("description", "")).strip() or message
+        self.overlay = {
+            "type": "message",
+            "title": title,
+            "message": message,
+            "buttons": [("Close", lambda: None)],
+            "selected": 0,
+            "scrollable": True,
+            "scroll_offset": 0,
+        }
+        self.view.update()
+
+    def favorite_item_from_game_data(self, data: dict | None) -> dict | None:
+        if not data:
+            return None
+        launcher = data.get("launcher")
+        rom = data.get("rom")
+        if not isinstance(launcher, LauncherConfig) or rom is None:
+            return None
+        try:
+            launcher_rel = str(launcher.path.relative_to(self.menu_root)).replace(chr(92), "/")
+        except Exception:
+            launcher_rel = str(launcher.path).replace(chr(92), "/")
+        return {
+            "name": self.display_name_for_rom(launcher, Path(rom)),
+            "launcher": launcher_rel,
+            "rom": str(Path(rom)).replace(chr(92), "/"),
+        }
+
+    def game_data_is_favorite(self, data: dict | None) -> bool:
+        item = self.favorite_item_from_game_data(data)
+        return bool(item and self.item_identity_key(item) in self.favorite_item_keys)
+
+    def toggle_favorite_for_game_data(self, data: dict | None):
+        item = self.favorite_item_from_game_data(data)
+        if not item:
+            return
+        favorites = self.load_favorite_items()
+        item_key = self.item_identity_key(item)
+        updated = []
+        removed = False
+        for favorite in favorites:
+            if self.item_identity_key(favorite) == item_key:
+                removed = True
+                continue
+            updated.append(favorite)
+        if not removed:
+            updated.append(item)
+        self.save_favorite_items(updated)
+        self.update_favorite_items()
+        self.view.update()
+
+    def selected_game_data(self) -> dict | None:
+        if self.mode == "roms" and self.current_launcher and self.selected_index > 0:
+            idx = self.selected_index - 1
+            if 0 <= idx < len(self.rom_items):
+                item = self.rom_items[idx]
+                if not item.is_dir:
+                    return {"launcher": self.current_launcher, "rom": item.path, "name": item.display_name}
+        if self.mode == "favorites" and self.selected_index > 0:
+            idx = self.selected_index - 1
+            if 0 <= idx < len(self.favorite_items):
+                return self.game_data_from_saved_item(self.favorite_items[idx])
+        if self.mode == "recent" and self.selected_index > 0:
+            idx = self.selected_index - 1
+            if 0 <= idx < len(self.recent_items):
+                return self.game_data_from_saved_item(self.recent_items[idx])
+        if self.mode == "system_launchers" and self.selected_index > 0:
+            games = self.game_system_games.get(self.current_game_system or "", [])
+            idx = self.selected_index - 1
+            if 0 <= idx < len(games):
+                item = games[idx]
+                if item.get("rom") is not None:
+                    return {"launcher": item.get("launcher"), "rom": item.get("rom"), "name": str(item.get("name", ""))}
+        if self.mode == "search_results" and self.selected_index > 0:
+            idx = self.selected_index - 1
+            if 0 <= idx < len(self.search_items):
+                item = self.search_items[idx]
+                if item.get("type") == "game" and item.get("rom") is not None:
+                    return {"launcher": item.get("launcher"), "rom": item.get("rom"), "name": str(item.get("name", ""))}
+        return None
+
+    def game_data_from_saved_item(self, item: dict) -> dict | None:
+        launcher_rel = str(item.get("launcher", ""))
+        rom = Path(str(item.get("rom", "")))
+        try:
+            launcher_path = self.menu_root / launcher_rel
+            if launcher_path.exists():
+                launcher = load_launcher(launcher_path)
+                return {"launcher": launcher, "rom": rom, "name": self.display_name_for_rom(launcher, rom)}
+        except Exception:
+            pass
+        return None
+
     def item_identity_key(self, item: dict) -> tuple[str, str]:
         launcher = str(item.get("launcher", "")).replace(chr(92), "/").strip().lower()
         rom = str(item.get("rom", "")).replace(chr(92), "/").strip().lower()
@@ -819,7 +1237,8 @@ class GentlemanWindow(QMainWindow):
             launcher_path = self.menu_root / launcher_rel
             if launcher_path.exists():
                 launcher = load_launcher(launcher_path)
-                return self.display_name_for_rom(launcher, rom)
+                fallback = self.display_name_for_rom(launcher, rom)
+                return self.display_name_for_identity(fallback, self.game_metadata_identity(launcher, rom))
         except Exception:
             pass
 
@@ -1660,13 +2079,17 @@ class GentlemanWindow(QMainWindow):
             "Create Launcher",
             "Edit Launcher",
             "Refresh Menu",
+        ]
+        if self.modern_mode_enabled():
+            self.system_items.append("Scrape Artwork & Metadata")
+        self.system_items.extend([
             "Settings",
             "Report Issues & Requests",
             "Support the Project",
             "Check for Updates",
             "About",
             "Exit",
-        ]
+        ])
 
     def setting_state_label(self, name: str, enabled: bool) -> str:
         state = "Enabled" if enabled else "Disabled"
@@ -1791,6 +2214,7 @@ class GentlemanWindow(QMainWindow):
         )
 
         theme_label = f"Theme: {self.current_theme.name}"
+        game_view_label = self.game_view_label()
 
         menu_size_label = f"Menu Size: {int(self.settings.get('fullscreen_menu_size', 100))}%"
         idle_menu_hide_label = self.idle_menu_hide_label()
@@ -1803,6 +2227,7 @@ class GentlemanWindow(QMainWindow):
                 "Wallpapers",
                 menu_size_label,
                 idle_menu_hide_label,
+                game_view_label,
             ]
         elif self.settings_category == "Menu Items":
             self.settings_items = [
@@ -2557,6 +2982,12 @@ class GentlemanWindow(QMainWindow):
         self.ingame_osd.show_confirmation(title, message)
 
     def close_overlay(self):
+        if self.overlay and self.overlay.get("type") == "scrape_progress" and self.bulk_scrape_active():
+            self.scrape_progress_window_open = False
+            self.scrape_status_text = self.active_scrape_label()
+            self.overlay = None
+            self.view.update()
+            return
         callback = self.overlay.get("on_close") if self.overlay else None
         self.overlay = None
         self.view.update()
@@ -2803,6 +3234,18 @@ class GentlemanWindow(QMainWindow):
             return "Auto Hide Menu"
         if self.mode == "theme_picker":
             return "Theme"
+        if self.mode == "scrape_settings":
+            return "Scrape Artwork & Metadata"
+        if self.mode == "scrape_target_picker":
+            return "Scrape Target"
+        if self.mode == "scrape_mode_picker":
+            return "Scrape Mode"
+        if self.mode == "scrape_region_picker":
+            return "Region"
+        if self.mode == "single_scrape":
+            return "Scrape Game"
+        if self.mode == "scrape_match_picker":
+            return "Select Scrape Match"
         if self.mode == "wallpaper":
             return "Wallpapers"
         if self.mode == "support":
@@ -2872,6 +3315,18 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "theme_picker":
             self.update_theme_picker_items()
             return len(self.theme_picker_items)
+        if self.mode == "scrape_settings":
+            return 10
+        if self.mode == "scrape_target_picker":
+            return len(self.scrape_target_items)
+        if self.mode == "scrape_mode_picker":
+            return len(SCRAPE_MODES)
+        if self.mode == "scrape_region_picker":
+            return len(SCRAPE_REGIONS)
+        if self.mode == "single_scrape":
+            return 5
+        if self.mode == "scrape_match_picker":
+            return len(self.scrape_match_items) + 1
         if self.mode == "wallpaper":
             return len(self.wallpaper_items)
         if self.mode == "support":
@@ -2963,6 +3418,42 @@ class GentlemanWindow(QMainWindow):
             for info in self.theme_picker_infos:
                 labels.append((info.name + ("  ✓" if info.theme_id == selected else ""), ""))
             return labels
+        if self.mode == "scrape_settings":
+            start_label = self.active_scrape_label() if self.bulk_scrape_active() else "Start Scraping"
+            username = self.screenscraper_username() or "Not Set"
+            password = "Set" if self.screenscraper_password() else "Not Set"
+            return [
+                (self.screenscraper_quota_text, ""),
+                ("", ""),
+                (f"Username: {username}", ""),
+                (f"Password: {password}", ""),
+                ("", ""),
+                (f"Target: {self.scrape_target}", ""),
+                (f"Mode: {self.scrape_mode}", ""),
+                (f"Region: {self.scrape_region}", ""),
+                (start_label, ""),
+                ("Cancel", ""),
+            ]
+        if self.mode == "scrape_target_picker":
+            return [(target + ("  ✓" if target == self.scrape_target else ""), "") for target in self.scrape_target_items]
+        if self.mode == "scrape_mode_picker":
+            return [(mode + ("  ✓" if mode == self.scrape_mode else ""), "") for mode in SCRAPE_MODES]
+        if self.mode == "scrape_region_picker":
+            current = self.single_scrape_region if self.region_picker_return_mode == "single_scrape" else self.scrape_region
+            return [(region + ("  ✓" if region == current else ""), "") for region in SCRAPE_REGIONS]
+        if self.mode == "single_scrape":
+            custom = "Enabled" if self.single_scrape_use_custom else "Disabled"
+            return [
+                (f"Use Custom Name: {custom}", ""),
+                (f"Scrape Name: {self.single_scrape_custom_name}", ""),
+                (f"Region: {self.single_scrape_region}", ""),
+                (self.single_scrape_action, ""),
+                ("Cancel", ""),
+            ]
+        if self.mode == "scrape_match_picker":
+            labels = [(str(item.get("label", item.get("title", "Unknown"))), "") for item in self.scrape_match_items]
+            labels.append(("Cancel", ""))
+            return labels
         if self.mode == "wallpaper":
             return [(name, "") for name in self.wallpaper_items]
         if self.mode == "support":
@@ -3000,7 +3491,7 @@ class GentlemanWindow(QMainWindow):
         if self.mode == "about":
             return [(line, "") for line in ABOUT_LINES]
         if self.mode == "search_results":
-            return [("...", "<DIR>")] + [(str(item.get("name", "")), str(item.get("marker", ""))) for item in self.search_items]
+            return [("...", "<DIR>")] + [(self.display_name_for_game_dict(item) if item.get("type") == "game" else str(item.get("name", "")), str(item.get("marker", ""))) for item in self.search_items]
         if self.mode == "favorites":
             return [("...", "<DIR>")] + [(self.display_name_for_saved_game_item(item), "") for item in self.favorite_items]
         if self.mode == "recent":
@@ -3009,7 +3500,7 @@ class GentlemanWindow(QMainWindow):
             return [("...", "<DIR>")] + [(name, "") for name in self.game_system_items]
         if self.mode == "system_launchers":
             games = self.game_system_games.get(self.current_game_system or "", [])
-            return [("...", "<DIR>")] + [(str(item.get("name", "")), "") for item in games]
+            return [("...", "<DIR>")] + [(self.display_name_for_game_dict(item), "") for item in games]
         if self.mode == "emulators":
             return [("...", "<DIR>")] + [(name, "") for name in self.emulator_items]
         if self.mode == "emulator_launchers":
@@ -3073,6 +3564,23 @@ class GentlemanWindow(QMainWindow):
         return self.menu_items[menu_index]
 
     def open_current_item_options(self):
+        self.item_options_game_data = None
+        if self.modern_mode_enabled():
+            game_data = self.selected_game_data()
+            if game_data:
+                identity = self.game_metadata_identity(game_data.get("launcher"), game_data.get("rom"))
+                scrape_label = "Rescrape" if self.metadata_cache.exists(identity) else "Scrape"
+                fav_label = "Remove Favorite" if self.mode == "favorites" else ("Unfavorite" if self.game_data_is_favorite(game_data) else "Favorite")
+                self.item_options_game_data = game_data
+                self.item_options_return_mode = self.mode
+                self.item_options_return_index = self.selected_index
+                self.item_options_items = ["Launch", fav_label, scrape_label, "Cancel"]
+                self.mode = "item_options"
+                self.selected_index = 0
+                self.view.scroll_offset = 0
+                self.view.update()
+                return
+
         item = self.selected_menu_item()
         if not item:
             return
@@ -3095,21 +3603,57 @@ class GentlemanWindow(QMainWindow):
         self.mode = self.item_options_return_mode or "menu"
         self.selected_index = self.item_options_return_index
         self.item_options_target = None
+        self.item_options_game_data = None
         self.item_options_items = []
         self.view.ensure_visible()
         self.view.update()
 
     def activate_item_option(self):
-        if not self.item_options_target or self.selected_index >= len(self.item_options_items):
+        if self.selected_index >= len(self.item_options_items):
             self.close_item_options()
             return
 
         action = self.item_options_items[self.selected_index]
-        item = self.item_options_target
 
         if action == "Cancel":
             self.close_item_options()
             return
+
+        if self.item_options_game_data is not None:
+            return_mode = self.item_options_return_mode or "roms"
+            return_index = self.item_options_return_index
+            if action == "Launch":
+                self.close_item_options()
+                self.mode = return_mode
+                self.selected_index = return_index
+                self.activate_selected()
+                return
+            if action in {"Favorite", "Unfavorite"}:
+                data = self.item_options_game_data
+                self.close_item_options()
+                self.mode = return_mode
+                self.selected_index = return_index
+                self.toggle_favorite_for_game_data(data)
+                return
+            if action == "Remove Favorite":
+                self.close_item_options()
+                self.mode = return_mode
+                self.selected_index = return_index
+                self.remove_selected_favorite()
+                return
+            if action in {"Scrape", "Rescrape"}:
+                self.mode = return_mode
+                self.selected_index = return_index
+                self.item_options_game_data = None
+                self.item_options_items = []
+                self.open_single_scrape_window()
+                return
+
+        if not self.item_options_target:
+            self.close_item_options()
+            return
+
+        item = self.item_options_target
 
         if item.item_type == "folder":
             if action == "Open Folder":
@@ -3289,6 +3833,36 @@ class GentlemanWindow(QMainWindow):
             self.view.update()
             return
 
+        if self.mode in {"scrape_settings", "scrape_target_picker", "scrape_mode_picker", "scrape_region_picker"}:
+            previous_mode = self.mode
+            if previous_mode == "scrape_region_picker" and self.region_picker_return_mode == "single_scrape":
+                self.mode = "single_scrape"
+                self.selected_index = 2
+                self.region_picker_return_mode = "scrape_settings"
+            elif previous_mode == "scrape_settings":
+                self.mode = "system"
+                self.update_system_items()
+                target = "Scrape Artwork & Metadata"
+                self.selected_index = self.system_items.index(target) if target in self.system_items else 0
+            else:
+                self.mode = "scrape_settings"
+                self.selected_index = 5
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+
+        if self.mode == "scrape_match_picker":
+            self.mode = "single_scrape"
+            self.selected_index = 3
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+
+        if self.mode == "single_scrape":
+            self.mode = self.scrape_return_mode or ("roms" if self.current_launcher else "menu")
+            self.view.update()
+            return
+
         if self.mode == "wallpaper":
             self.mode = "settings"
             self.settings_category = "Display"
@@ -3445,6 +4019,31 @@ class GentlemanWindow(QMainWindow):
 
         if self.mode == "theme_picker":
             self.activate_theme_picker_item(self.selected_index)
+            return
+
+
+        if self.mode == "scrape_settings":
+            self.activate_scrape_settings_item()
+            return
+
+        if self.mode == "scrape_target_picker":
+            self.activate_scrape_target_picker_item()
+            return
+
+        if self.mode == "scrape_mode_picker":
+            self.activate_scrape_mode_picker_item()
+            return
+
+        if self.mode == "scrape_region_picker":
+            self.activate_scrape_region_picker_item()
+            return
+
+        if self.mode == "single_scrape":
+            self.activate_single_scrape_item()
+            return
+
+        if self.mode == "scrape_match_picker":
+            self.activate_scrape_match_picker_item()
             return
 
         if self.mode == "wallpaper":
@@ -4044,6 +4643,14 @@ class GentlemanWindow(QMainWindow):
             self.selected_index = 0
             self.view.scroll_offset = 0
             self.view.update()
+        elif item.startswith("Game View:"):
+            self.settings["game_view"] = "classic" if self.modern_mode_enabled() else "modern"
+            self.invalidate_rom_folder_cache()
+            if self.current_launcher and self.current_rom_folder:
+                self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
+            self.refresh_settings_menu()
+        elif item == "Scrape Artwork & Metadata":
+            self.open_scrape_settings()
         elif item == "Settings":
             self.settings_category = None
             self.update_settings_items()
@@ -4146,6 +4753,490 @@ class GentlemanWindow(QMainWindow):
         self.update_settings_items()
         self.view.update()
 
+    def available_scrape_targets(self) -> list[str]:
+        systems = []
+        for launcher_path in self.menu_root.rglob("*.json"):
+            try:
+                launcher = load_launcher(launcher_path)
+            except Exception:
+                continue
+            system = launcher.system.strip()
+            if system and self.metadata_supported_system(system) and Path(launcher.rom_directory).is_dir():
+                systems.append(system)
+        unique = sorted(set(systems), key=str.lower)
+        return ["All Systems"] + unique
+
+
+    def format_quota_text(self, quota: dict | None = None, unavailable: bool = False) -> str:
+        if not self.screenscraper_username() or not self.screenscraper_password():
+            return "User Quota: Not logged in"
+        if unavailable or not isinstance(quota, dict):
+            return "User Quota: Unavailable"
+        used = quota.get("used", quota.get("daily_used"))
+        limit = quota.get("limit", quota.get("daily_limit"))
+        remaining = quota.get("remaining", quota.get("daily_remaining"))
+        if used is not None and limit is not None:
+            return f"User Quota: {int(used):,} / {int(limit):,}"
+        if used is not None:
+            return f"User Quota: {int(used):,} used"
+        if remaining is not None:
+            return f"User Quota: {int(remaining):,} remaining"
+        return "User Quota: Unavailable"
+
+    def refresh_screenscraper_quota(self):
+        if not self.screenscraper_username() or not self.screenscraper_password():
+            self.screenscraper_quota_text = "User Quota: Not logged in"
+            self.view.update()
+            return
+        if self.scrape_quota_worker is not None and self.scrape_quota_worker.isRunning():
+            return
+        self.screenscraper_quota_text = "User Quota: Loading..."
+        self.screenscraper_login_validated = False
+        self.screenscraper_login_error = ""
+        self.scrape_quota_worker = ScreenScraperQuotaWorker(self.screenscraper_username(), self.screenscraper_password())
+        self.scrape_quota_worker.result.connect(self.on_screenscraper_quota_result)
+        self.scrape_quota_worker.start()
+        self.view.update()
+
+    def on_screenscraper_quota_result(self, result: object):
+        if isinstance(result, dict) and result.get("ok"):
+            self.screenscraper_login_validated = True
+            self.screenscraper_login_error = ""
+            self.screenscraper_quota_text = self.format_quota_text(result.get("quota"))
+        else:
+            error = str(result.get("error", "") if isinstance(result, dict) else "")
+            if "login" in error.lower() or "credential" in error.lower() or "identifiant" in error.lower():
+                self.screenscraper_login_validated = False
+                self.screenscraper_login_error = error
+                self.screenscraper_quota_text = "User Quota: Login failed"
+            else:
+                self.screenscraper_quota_text = self.format_quota_text(unavailable=True)
+        self.scrape_quota_worker = None
+        self.view.update()
+
+    def open_scrape_settings(self):
+        self.scrape_target_items = self.available_scrape_targets()
+        if self.scrape_target not in self.scrape_target_items:
+            self.scrape_target = self.scrape_target_items[0] if self.scrape_target_items else "All Systems"
+        if self.scrape_mode not in SCRAPE_MODES:
+            self.scrape_mode = "Unscraped Only"
+        self.scrape_region = str(self.settings.get("scrape_region", self.scrape_region))
+        if self.scrape_region not in SCRAPE_REGIONS:
+            self.scrape_region = "Same as Game"
+        self.mode = "scrape_settings"
+        self.selected_index = 8 if self.bulk_scrape_active() else 5
+        self.view.scroll_offset = 0
+        self.refresh_screenscraper_quota()
+        self.view.update()
+
+    def build_scrape_jobs(self, target: str, mode: str) -> list[dict]:
+        jobs = []
+        seen = set()
+        for launcher_path in self.menu_root.rglob("*.json"):
+            try:
+                launcher = load_launcher(launcher_path)
+            except Exception:
+                continue
+            system = launcher.system.strip()
+            if not self.metadata_supported_system(system):
+                continue
+            if target != "All Systems" and system != target:
+                continue
+            root = Path(launcher.rom_directory)
+            if not root.is_dir():
+                continue
+            folders = [root]
+            visited = set()
+            while folders:
+                folder = folders.pop(0)
+                try:
+                    folder_key = str(folder.resolve()).replace(chr(92), "/").lower()
+                except Exception:
+                    folder_key = str(folder).replace(chr(92), "/").lower()
+                if folder_key in visited:
+                    continue
+                visited.add(folder_key)
+                for rom_item in self.scan_cached_rom_folder_sync(launcher, folder):
+                    if rom_item.is_dir:
+                        if launcher.recursive:
+                            folders.append(rom_item.path)
+                        continue
+                    identity = self.game_metadata_identity(launcher, rom_item.path)
+                    if identity is None:
+                        continue
+                    key = self.metadata_cache.cache_key(identity)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if not self.metadata_cache.should_scrape(identity, mode):
+                        continue
+                    jobs.append({
+                        "identity": identity,
+                        "system_id": SCREENSCRAPER_SYSTEM_IDS[system],
+                        "search_name": cleaned_scrape_name(rom_item.name),
+                        "preferred_region": region_from_option(self.scrape_region, identity),
+                    })
+        return jobs
+
+    def set_screenscraper_username(self, value: str):
+        self.settings["screenscraper_username"] = value.strip()
+        self.screenscraper_login_validated = False
+        self.screenscraper_login_error = ""
+        self.save_settings()
+        self.validate_screenscraper_login_after_account_edit()
+        self.view.update()
+
+    def set_screenscraper_password(self, value: str):
+        self.settings["screenscraper_password"] = value.strip()
+        self.screenscraper_login_validated = False
+        self.screenscraper_login_error = ""
+        self.save_settings()
+        self.validate_screenscraper_login_after_account_edit()
+        self.view.update()
+
+    def activate_scrape_settings_item(self):
+        if self.selected_index in (0, 1, 4):
+            self.move_selection(1)
+            return
+        if self.selected_index == 2:
+            self.open_text_input("ScreenScraper Username", "Enter your ScreenScraper username", self.screenscraper_username(), self.set_screenscraper_username)
+            return
+        if self.selected_index == 3:
+            self.open_text_input("ScreenScraper Password", "Enter your ScreenScraper password", self.screenscraper_password(), self.set_screenscraper_password)
+            return
+        if self.selected_index == 5:
+            self.scrape_target_items = self.available_scrape_targets()
+            self.mode = "scrape_target_picker"
+            self.selected_index = self.scrape_target_items.index(self.scrape_target) if self.scrape_target in self.scrape_target_items else 0
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+        if self.selected_index == 6:
+            self.mode = "scrape_mode_picker"
+            self.selected_index = SCRAPE_MODES.index(self.scrape_mode) if self.scrape_mode in SCRAPE_MODES else 0
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+        if self.selected_index == 7:
+            self.region_picker_return_mode = "scrape_settings"
+            self.mode = "scrape_region_picker"
+            self.selected_index = SCRAPE_REGIONS.index(self.scrape_region) if self.scrape_region in SCRAPE_REGIONS else 0
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+        if self.selected_index == 8:
+            if self.bulk_scrape_active():
+                self.reopen_scrape_progress()
+            else:
+                self.start_bulk_scrape()
+            return
+        self.mode = "system"
+        self.update_system_items()
+        target = "Scrape Artwork & Metadata"
+        self.selected_index = self.system_items.index(target) if target in self.system_items else 0
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_scrape_target_picker_item(self):
+        if 0 <= self.selected_index < len(self.scrape_target_items):
+            self.scrape_target = self.scrape_target_items[self.selected_index]
+        self.mode = "scrape_settings"
+        self.selected_index = 5
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_scrape_mode_picker_item(self):
+        if 0 <= self.selected_index < len(SCRAPE_MODES):
+            self.scrape_mode = SCRAPE_MODES[self.selected_index]
+        self.mode = "scrape_settings"
+        self.selected_index = 6
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_scrape_region_picker_item(self):
+        if 0 <= self.selected_index < len(SCRAPE_REGIONS):
+            selected = SCRAPE_REGIONS[self.selected_index]
+            if self.region_picker_return_mode == "single_scrape":
+                self.single_scrape_region = selected
+                self.mode = "single_scrape"
+                self.selected_index = 2
+            else:
+                self.scrape_region = selected
+                self.settings["scrape_region"] = selected
+                self.save_settings()
+                self.mode = "scrape_settings"
+                self.selected_index = 7
+        else:
+            self.mode = "single_scrape" if self.region_picker_return_mode == "single_scrape" else "scrape_settings"
+            self.selected_index = 2 if self.region_picker_return_mode == "single_scrape" else 7
+        self.region_picker_return_mode = "scrape_settings"
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def start_bulk_scrape(self):
+        if not self.validate_screenscraper_login_now(show_error=True):
+            return
+        if self.scrape_worker is not None and self.scrape_worker.isRunning():
+            self.show_message("Scrape", "A scrape is already running.")
+            return
+        jobs = self.build_scrape_jobs(self.scrape_target, self.scrape_mode)
+        if not jobs:
+            self.show_message("Scrape", "No games need scraping for this target and mode.")
+            return
+        if self.scrape_mode == "All Games":
+            self.show_choice("Scrape All Games", "This will rescrape every matching game and may use many ScreenScraper requests. Continue?", [("Cancel", None), ("Continue", lambda: self.start_scrape_worker(jobs, self.scrape_mode, "settings"))])
+            return
+        self.start_scrape_worker(jobs, self.scrape_mode, "settings")
+
+    def start_scrape_worker(self, jobs: list[dict], mode: str, return_mode: str):
+        self.scrape_return_mode = return_mode
+        self.scrape_progress_lines = [f"Preparing {len(jobs)} game(s)..."]
+        self.scrape_progress_text = f"Scraping 0 / {len(jobs)}"
+        self.scrape_status_text = self.scrape_progress_text
+        self.scrape_status_complete_until = 0.0
+        self.scrape_stop_requested = False
+        self.scrape_worker = ScrapeWorker(self.metadata_cache, jobs, mode, self.screenscraper_username(), self.screenscraper_password())
+        self.scrape_worker.progress.connect(self.on_scrape_progress)
+        self.scrape_worker.finished_result.connect(self.on_scrape_finished)
+        self.scrape_worker.start()
+        self.reopen_scrape_progress()
+
+    def bulk_scrape_active(self) -> bool:
+        return self.scrape_worker is not None and self.scrape_worker.isRunning()
+
+    def active_scrape_label(self) -> str:
+        return self.scrape_progress_text or "Scraping"
+
+    def progress_overlay_open(self) -> bool:
+        return bool(self.overlay and self.overlay.get("type") == "scrape_progress")
+
+    def show_scrape_progress_overlay(self):
+        self.scrape_progress_window_open = True
+        self.scrape_status_text = ""
+        message = "\n".join(self.scrape_progress_lines) if self.scrape_progress_lines else self.active_scrape_label()
+        self.overlay = {
+            "type": "scrape_progress",
+            "title": "Scrape",
+            "message": message,
+            "selected": 0,
+            "buttons": [("Stop Scraper", self.confirm_stop_scraper)],
+            "scrollable": True,
+            "scroll_offset": 1000000,
+        }
+        self.view.update()
+
+    def reopen_scrape_progress(self):
+        self.show_scrape_progress_overlay()
+
+    def confirm_stop_scraper(self):
+        self.show_choice(
+            "Stop Scraper",
+            "Stop scraping?\n\nThe current scrape will stop after the current request finishes.",
+            [("No", self.reopen_scrape_progress), ("Yes", self.request_stop_scraper)],
+        )
+
+    def request_stop_scraper(self):
+        if self.bulk_scrape_active():
+            self.scrape_stop_requested = True
+            self.scrape_progress_lines.append("Stopping after current request...")
+            self.scrape_progress_text = "Stopping scraper..."
+            self.scrape_status_text = self.scrape_progress_text
+            if self.scrape_worker is not None:
+                self.scrape_worker.cancel()
+            self.reopen_scrape_progress()
+
+    def on_scrape_progress(self, info: object):
+        if not isinstance(info, dict):
+            return
+        if info.get("type") == "quota":
+            quota = info.get("quota")
+            if isinstance(quota, dict) and quota:
+                self.screenscraper_quota_text = self.format_quota_text(quota)
+                self.view.update()
+            return
+        index = info.get('index', '?')
+        total = info.get('total', '?')
+        line = f"{index}/{total} {info.get('name', '')}: {info.get('status', '')}"
+        self.scrape_progress_lines.append(line)
+        self.scrape_progress_text = f"Scraping {index} / {total}"
+        self.scrape_status_text = self.scrape_progress_text
+        if self.progress_overlay_open():
+            self.overlay["message"] = "\n".join(self.scrape_progress_lines)
+            self.overlay["scrollable"] = True
+            self.overlay["scroll_offset"] = 1000000
+        self.view.update()
+
+    def on_scrape_finished(self, summary: object):
+        self.scrape_worker = None
+        self.refresh_screenscraper_quota()
+        if hasattr(self.view, "metadata_pixmap_cache"):
+            self.view.metadata_pixmap_cache.clear()
+        lines = []
+        stopped = ""
+        if isinstance(summary, dict):
+            lines = [
+                f"Scraped: {summary.get('scraped', 0)}",
+                f"Skipped: {summary.get('skipped', 0)}",
+                f"Missing: {summary.get('missing', 0)}",
+                f"Failed: {summary.get('failed', 0)}",
+            ]
+            stopped = str(summary.get("stopped", "")).strip()
+            quota_reached = bool(summary.get("quota_reached"))
+            quota_message = str(summary.get("quota_message", "")).strip()
+            login_failed = bool(summary.get("login_failed"))
+            login_message = str(summary.get("login_message", "")).strip()
+            if stopped:
+                lines.append(f"Stopped: {stopped}")
+            if quota_reached and quota_message:
+                lines.append("")
+                lines.append(quota_message)
+            if login_failed and login_message:
+                lines.append("")
+                lines.append(self.screenscraper_login_error_message(login_message))
+        else:
+            quota_reached = False
+            quota_message = ""
+            login_failed = False
+            login_message = ""
+            lines = ["Scrape finished."]
+        final_title = "Login failed" if login_failed else ("Quota reached" if quota_reached else ("Scraping stopped" if stopped else "Scraping complete"))
+        self.scrape_progress_text = final_title
+        self.scrape_status_text = final_title
+        self.scrape_status_complete_until = time.monotonic() + 5.0
+        if login_failed:
+            self.screenscraper_login_validated = False
+            self.screenscraper_login_error = login_message
+            self.show_message("ScreenScraper Login Failed", "\n".join(lines), scrollable=True)
+        elif quota_reached:
+            self.show_message("ScreenScraper Quota Reached", "\n".join(lines), scrollable=True)
+        elif self.progress_overlay_open():
+            self.overlay["title"] = "Scrape Complete" if not stopped else "Scrape Stopped"
+            self.overlay["type"] = "message"
+            self.overlay["message"] = "\n".join(lines)
+            self.overlay["scrollable"] = True
+            self.overlay["scroll_offset"] = 1000000
+        self.invalidate_rom_folder_cache()
+        if self.current_launcher and self.current_rom_folder:
+            self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
+        self.update_recent_items()
+        self.update_favorite_items()
+        self.update_current_system_game_items()
+        if self.mode == "roms":
+            self.refresh_rom_labels()
+        self.view.update()
+
+    def open_single_scrape_window(self):
+        data = self.selected_game_data()
+        if not data:
+            return
+        launcher = data.get("launcher")
+        rom = data.get("rom")
+        identity = self.game_metadata_identity(launcher, rom)
+        if identity is None:
+            self.show_message("Scrape", "This game is not tied to a supported internal system.")
+            return
+        self.scrape_return_mode = self.mode
+        self.single_scrape_identity = identity
+        self.single_scrape_system_id = SCREENSCRAPER_SYSTEM_IDS.get(identity.system, 0)
+        existing = self.metadata_cache.load(identity) or {}
+        self.single_scrape_action = "Rescrape" if existing else "Scrape"
+        self.single_scrape_use_custom = False
+        self.single_scrape_custom_name = str(existing.get("manual_scrape_name") or existing.get("scrape_name") or cleaned_scrape_name(identity.rom_name))
+        self.single_scrape_region = str(self.settings.get("scrape_region", "Same as Game"))
+        if self.single_scrape_region not in SCRAPE_REGIONS:
+            self.single_scrape_region = "Same as Game"
+        self.mode = "single_scrape"
+        self.selected_index = 0
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_single_scrape_item(self):
+        if self.selected_index == 0:
+            self.single_scrape_use_custom = not self.single_scrape_use_custom
+            self.view.update()
+            return
+        if self.selected_index == 1:
+            self.open_text_input("Scrape Name", "Used when searching ScreenScraper", self.single_scrape_custom_name, self.set_single_scrape_custom_name)
+            return
+        if self.selected_index == 2:
+            self.region_picker_return_mode = "single_scrape"
+            self.mode = "scrape_region_picker"
+            self.selected_index = SCRAPE_REGIONS.index(self.single_scrape_region) if self.single_scrape_region in SCRAPE_REGIONS else 0
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+        if self.selected_index == 3:
+            self.start_single_scrape()
+            return
+        self.go_back()
+
+    def set_single_scrape_custom_name(self, value: str):
+        self.single_scrape_custom_name = value.strip() or self.single_scrape_custom_name
+
+    def start_single_scrape(self):
+        if not self.validate_screenscraper_login_now(show_error=True):
+            return
+        if self.single_scrape_identity is None or self.single_scrape_system_id <= 0:
+            self.show_message("Scrape", "This game cannot be scraped.")
+            return
+        if self.single_scrape_use_custom:
+            self.open_scrape_match_picker()
+            return
+        search_name = cleaned_scrape_name(self.single_scrape_identity.rom_name)
+        self.start_single_scrape_job(search_name, "", "")
+
+    def open_scrape_match_picker(self):
+        if not self.validate_screenscraper_login_now(show_error=True):
+            return
+        if self.single_scrape_identity is None or self.single_scrape_system_id <= 0:
+            self.show_message("Scrape", "This game cannot be scraped.")
+            return
+        search_name = self.single_scrape_custom_name.strip() or cleaned_scrape_name(self.single_scrape_identity.rom_name)
+        preferred_region = region_from_option(self.single_scrape_region, self.single_scrape_identity)
+        try:
+            client = ScreenScraperClient(self.screenscraper_username(), self.screenscraper_password())
+            self.scrape_match_items = client.search_game_suggestions(self.single_scrape_system_id, search_name, preferred_region)
+        except Exception as exc:
+            self.show_message("Scrape", str(exc), scrollable=True)
+            return
+        if not self.scrape_match_items:
+            self.show_message("Scrape", "No ScreenScraper matches found for this scrape name.")
+            return
+        self.mode = "scrape_match_picker"
+        self.selected_index = 0
+        self.view.scroll_offset = 0
+        self.view.update()
+
+    def activate_scrape_match_picker_item(self):
+        if self.selected_index >= len(self.scrape_match_items):
+            self.mode = "single_scrape"
+            self.selected_index = 3
+            self.view.scroll_offset = 0
+            self.view.update()
+            return
+        item = self.scrape_match_items[self.selected_index]
+        title = str(item.get("title", self.single_scrape_custom_name)).strip() or self.single_scrape_custom_name
+        game_id = str(item.get("game_id", "")).strip()
+        search_name = self.single_scrape_custom_name.strip() or title
+        self.start_single_scrape_job(search_name, game_id, search_name)
+
+    def start_single_scrape_job(self, search_name: str, game_id: str = "", manual_name: str = ""):
+        if self.single_scrape_identity is None or self.single_scrape_system_id <= 0:
+            self.show_message("Scrape", "This game cannot be scraped.")
+            return
+        job = {
+            "identity": self.single_scrape_identity,
+            "system_id": self.single_scrape_system_id,
+            "search_name": search_name,
+            "manual_scrape_name": manual_name,
+            "preferred_region": region_from_option(self.single_scrape_region, self.single_scrape_identity),
+            "game_id": game_id,
+        }
+        return_mode = self.scrape_return_mode or "roms"
+        self.start_scrape_worker([job], "All Games", return_mode)
+        self.mode = return_mode
+        self.view.update()
+
     def activate_settings_item(self, item: str):
         if self.settings_category is None:
             if item in self.settings_categories():
@@ -4187,6 +5278,14 @@ class GentlemanWindow(QMainWindow):
             self.selected_index = 0
             self.view.scroll_offset = 0
             self.view.update()
+        elif item.startswith("Game View:"):
+            self.settings["game_view"] = "classic" if self.modern_mode_enabled() else "modern"
+            self.invalidate_rom_folder_cache()
+            if self.current_launcher and self.current_rom_folder:
+                self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
+            self.refresh_settings_menu()
+        elif item == "Scrape Artwork & Metadata":
+            self.open_scrape_settings()
         elif item.startswith("Systems Menu:"):
             self.settings["show_systems_menu"] = not self.systems_menu_enabled()
             self.refresh_settings_menu()
@@ -4385,7 +5484,8 @@ class GentlemanWindow(QMainWindow):
             normalized = self.arcade_name_database.display_name(rom.name)
             if normalized:
                 return normalized
-        return rom.stem
+        fallback = rom.stem
+        return self.display_name_for_identity(fallback, self.game_metadata_identity(config, rom))
 
     def begin_active_session(self, process, session_type: str, name: str, emulator: str = ""):
         with self.active_session_lock:
@@ -4749,7 +5849,11 @@ class GentlemanWindow(QMainWindow):
     def controller_activate(self):
         self.active_input = "controller"
         self.note_user_activity()
-        self.activate_selected(); self.view.update()
+        if self.overlay:
+            self.activate_overlay()
+        else:
+            self.activate_selected()
+        self.view.update()
 
     def controller_back(self):
         self.active_input = "controller"
@@ -4778,7 +5882,11 @@ class GentlemanWindow(QMainWindow):
     def controller_caps(self):
         self.active_input='controller'
         self.note_user_activity()
-        if self.mode=='text_input': self.text_input_caps=not self.text_input_caps; self.view.update()
+        if self.mode=='text_input':
+            self.text_input_caps=not self.text_input_caps
+            self.view.update()
+        else:
+            self.open_selected_summary_overlay()
 
     def controller_search(self):
         self.active_input = 'controller'
@@ -4805,7 +5913,7 @@ class GentlemanWindow(QMainWindow):
         self.active_input = "controller"
         self.note_user_activity()
         if self.overlay:
-            if self.overlay.get("type") == "choice" and action in ("left", "right"):
+            if self.overlay.get("type") in ("choice", "scrape_progress") and action in ("left", "right"):
                 count=len(self.overlay.get("buttons", []))
                 if count: self.overlay["selected"]=(self.overlay.get("selected",0)+(-1 if action=="left" else 1))%count; self.view.update()
             elif self.overlay.get("scrollable") and action in ("up", "down"):
@@ -5097,6 +6205,8 @@ class GentlemanWindow(QMainWindow):
     def is_current_selection_selectable(self) -> bool:
         if self.mode == "folder_picker" and 0 <= self.selected_index < len(self.folder_picker_items):
             return self.folder_picker_items[self.selected_index].get("type") != "separator"
+        if self.mode == "scrape_settings" and self.selected_index in (0, 1, 4):
+            return False
         return True
 
     def move_selection(self, delta: int):
@@ -5132,8 +6242,11 @@ class GentlemanWindow(QMainWindow):
             direction = 1 if delta >= 0 else -1
             for _ in range(count):
                 self.selected_index = max(0, min(count - 1, self.selected_index + direction))
-                if self.is_current_selection_selectable() or self.selected_index in (0, count - 1):
+                if self.is_current_selection_selectable():
                     break
+                if self.selected_index in (0, count - 1):
+                    self.move_selection(direction)
+                    return
         self.view.ensure_visible()
         self.view.update()
 
@@ -5151,7 +6264,7 @@ class GentlemanWindow(QMainWindow):
         if self.note_user_activity():
             return
         if self.overlay:
-            if self.overlay.get("type") == "choice" and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
+            if self.overlay.get("type") in ("choice", "scrape_progress") and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_A, Qt.Key.Key_D):
                 count=len(self.overlay.get("buttons", [])); delta=-1 if key in (Qt.Key.Key_Left,Qt.Key.Key_A) else 1
                 if count: self.overlay["selected"]=(self.overlay.get("selected",0)+delta)%count
             elif self.overlay.get("scrollable") and key in (Qt.Key.Key_Up, Qt.Key.Key_W, Qt.Key.Key_Down, Qt.Key.Key_S):
@@ -5185,6 +6298,10 @@ class GentlemanWindow(QMainWindow):
         elif key in (Qt.Key.Key_Right, Qt.Key.Key_D):
             if not (self.mode == "launcher_form" and self.cycle_launcher_form_value(1)):
                 self.jump_selection(10)
+        elif key == Qt.Key.Key_PageUp:
+            self.jump_selection(-10)
+        elif key == Qt.Key.Key_PageDown:
+            self.jump_selection(10)
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space): self.activate_selected()
         elif key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace): self.go_back()
         elif key == Qt.Key.Key_F5: self.refresh_menu()
@@ -5193,6 +6310,8 @@ class GentlemanWindow(QMainWindow):
             else: self.toggle_current_favorite()
         elif key == Qt.Key.Key_Y:
             self.open_current_item_options()
+        elif key == Qt.Key.Key_I:
+            self.open_selected_summary_overlay()
         elif key == Qt.Key.Key_F11: self.toggle_fullscreen()
         self.view.update()
 
@@ -5201,7 +6320,10 @@ class GentlemanWindow(QMainWindow):
             self.update_check_worker.quit()
             self.update_check_worker.wait(1000)
             self.update_check_worker = None
-
+        if self.scrape_quota_worker is not None and self.scrape_quota_worker.isRunning():
+            self.scrape_quota_worker.quit()
+            self.scrape_quota_worker.wait(1000)
+            self.scrape_quota_worker = None
         if self.remote_api_server:
             self.remote_api_server.stop()
             self.remote_api_server = None
@@ -5238,6 +6360,7 @@ class GentlemanView(QWidget):
         self.wallpaper_preview_current_path = None
         self.wallpaper_preview_pixmap = QPixmap()
         self.wallpaper_preview_cache = {}
+        self.metadata_pixmap_cache = {}
 
         self.logo = QPixmap(str(self.window.assets_dir / "logo.png"))
 
@@ -5319,6 +6442,18 @@ class GentlemanView(QWidget):
 
     def menu_panel_size(self) -> tuple[int, int]:
         scale = self.effective_menu_scale()
+        if self.window.mode in {"item_options", "single_scrape", "scrape_settings"}:
+            panel_w = min(round(760 * scale), max(700, self.width() - 80))
+            panel_h = min(round(430 * scale), max(430, self.height() - 120))
+            panel_w = min(panel_w, self.width() - 40)
+            panel_h = min(panel_h, self.height() - 100)
+            return max(620, panel_w), max(320, panel_h)
+        if self.window.modern_game_list_active():
+            available_w = max(720, self.width() - 60)
+            available_h = max(480, self.height() - 170)
+            panel_w = min(available_w, max(1040, round(self.width() * 0.78)))
+            panel_h = min(available_h, max(560, round(self.height() * 0.66)))
+            return max(900, panel_w), max(500, panel_h)
         panel_w = min(round(620 * scale), max(620, self.width() - 80))
         panel_h = min(round(430 * scale), max(430, self.height() - 120))
         panel_w = min(panel_w, self.width() - 40)
@@ -5514,9 +6649,33 @@ class GentlemanView(QWidget):
         if not self.window.idle_menu_hidden:
             self.draw_top_bar(painter)
             self.draw_panel(painter)
+            self.draw_background_scrape_status(painter)
             self.draw_wallpaper_preview(painter)
         if self.window.mode == "text_input": self.draw_text_input(painter)
         if self.window.overlay: self.draw_overlay(painter)
+
+
+    def draw_background_scrape_status(self, painter):
+        text = ""
+        if self.window.bulk_scrape_active() and not self.window.progress_overlay_open():
+            text = self.window.active_scrape_label()
+        elif self.window.scrape_status_text and time.monotonic() < self.window.scrape_status_complete_until:
+            text = self.window.scrape_status_text
+        if not text:
+            return
+        painter.setFont(self.font)
+        fm = painter.fontMetrics()
+        margin = 28
+        w = min(self.width() - (margin * 2), max(340, fm.horizontalAdvance(text) + 64))
+        h = max(54, fm.height() + 24)
+        x = self.width() - margin - w
+        y = margin
+        rect = QRect(x, y, w, h)
+        painter.fillRect(rect, self.dialog)
+        painter.setPen(self.light)
+        painter.drawRect(rect)
+        painter.setPen(self.text)
+        painter.drawText(rect.adjusted(16, 0, -16, 0), Qt.AlignmentFlag.AlignCenter, text)
 
     def draw_overlay(self, painter):
         ov = self.window.overlay
@@ -5621,7 +6780,9 @@ class GentlemanView(QWidget):
 
         painter.setPen(self.text)
         guide = "D-pad Select   A Confirm   B Back"
-        if ov.get("scrollable"):
+        if ov.get("type") == "scrape_progress":
+            guide = "Up/Down Scroll   A Stop Scraper   B Background"
+        elif ov.get("scrollable"):
             guide = "Up/Down Scroll   A Close   B Back"
         painter.drawText(guide_rect, Qt.AlignmentFlag.AlignCenter, guide)
 
@@ -5760,6 +6921,179 @@ class GentlemanView(QWidget):
         renderer.render(painter, QRectF(rect))
         painter.restore()
 
+    def selected_metadata(self) -> tuple[GameMetadataIdentity | None, dict | None]:
+        identity = self.window.selected_game_identity()
+        return identity, self.window.metadata_cache.load(identity) if identity else None
+
+    def draw_modern_metadata_panel(self, painter: QPainter, panel_rect: QRect, side_w: int):
+        meta_x = panel_rect.x() + side_w + int((panel_rect.width() - side_w) * 0.54)
+        meta_w = panel_rect.right() - meta_x - 18
+        if meta_w < 260:
+            return
+
+        rect = QRect(meta_x, panel_rect.y() + 18, meta_w, panel_rect.height() - 72)
+        painter.fillRect(rect, self.dialog_alt)
+        painter.setPen(self.light)
+        painter.drawRect(rect)
+        inner = rect.adjusted(14, 12, -14, -12)
+
+        identity, data = self.selected_metadata()
+        title = "No metadata available"
+        if data:
+            title = str(data.get("scrape_name", "")).strip() or title
+
+        title_font = QFont(self.title_font)
+        title_font.setPointSize(max(12, min(17, int(panel_rect.height() / 38))))
+        meta_font = QFont(self.font)
+        meta_font.setPointSize(max(10, min(13, int(panel_rect.height() / 52))))
+        desc_font = QFont(self.font)
+        desc_font.setPointSize(max(9, min(12, int(panel_rect.height() / 58))))
+
+        art_h = min(max(320, int(inner.height() * 0.56)), int(inner.height() * 0.66))
+        art_rect = QRect(inner.x(), inner.y(), inner.width(), art_h)
+
+        pixmap = QPixmap()
+        if identity and data:
+            box = str(data.get("box2d", "")).strip()
+            if box:
+                art_path = self.window.metadata_cache.resolve_box2d_path(identity, box)
+                key = str(art_path) if art_path else ""
+                pixmap = self.metadata_pixmap_cache.get(key, QPixmap()) if key else QPixmap()
+                if key and pixmap.isNull() and art_path.exists():
+                    pixmap = QPixmap(key)
+                    self.metadata_pixmap_cache[key] = pixmap
+                    while len(self.metadata_pixmap_cache) > 24:
+                        self.metadata_pixmap_cache.pop(next(iter(self.metadata_pixmap_cache)))
+
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                art_rect.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            painter.drawPixmap(
+                art_rect.x() + (art_rect.width() - scaled.width()) // 2,
+                art_rect.y() + (art_rect.height() - scaled.height()) // 2,
+                scaled,
+            )
+        else:
+            painter.setFont(meta_font)
+            painter.setPen(self.text)
+            painter.drawText(art_rect, Qt.AlignmentFlag.AlignCenter, "No Boxart")
+
+        metadata_lines = []
+        if data:
+            for label, key in (("System", "system"), ("Year", "year"), ("Developer", "developer"), ("Publisher", "publisher"), ("Genre", "genre"), ("Players", "players")):
+                value = str(data.get(key, "")).strip()
+                if key in {"developer", "publisher"} and re.fullmatch(r"\d+", value):
+                    value = ""
+                if key == "players":
+                    match = re.search(r"['\"]text['\"]\s*:\s*['\"]([^'\"]+)['\"]", value)
+                    if match:
+                        value = match.group(1).strip()
+                if value:
+                    metadata_lines.append(f"{label}: {value}")
+            description = str(data.get("description", "")).strip()
+        else:
+            metadata_lines.append("Use Scrape from the game menu")
+            metadata_lines.append("or bulk scrape from Settings.")
+            description = ""
+
+        lower_top = art_rect.bottom() + 16
+        lower_h = inner.bottom() - lower_top
+        if lower_h <= 22:
+            return
+
+        gap = 18
+        summary_w = max(180, int((inner.width() - gap) * 0.56))
+        summary_rect = QRect(inner.x(), lower_top, summary_w, lower_h)
+        info_rect = QRect(summary_rect.right() + gap, lower_top, inner.right() - summary_rect.right() - gap, lower_h)
+
+        if info_rect.width() < 170:
+            summary_w = max(160, int((inner.width() - gap) * 0.50))
+            summary_rect = QRect(inner.x(), lower_top, summary_w, lower_h)
+            info_rect = QRect(summary_rect.right() + gap, lower_top, inner.right() - summary_rect.right() - gap, lower_h)
+
+        painter.save()
+        painter.setClipRect(summary_rect)
+        painter.setFont(desc_font)
+        painter.setPen(self.text)
+
+        if not description and data:
+            description = "No summary available."
+
+        if description:
+            desc_lines = self.wrapped_text_lines(painter, description, summary_rect.width())
+            metrics = painter.fontMetrics()
+            desc_step = max(14, metrics.height() + 3)
+            content_h = len(desc_lines) * desc_step
+            x = summary_rect.x()
+            if content_h <= summary_rect.height():
+                y = summary_rect.y() + metrics.ascent()
+                for line in desc_lines:
+                    painter.drawText(x, y, line)
+                    y += desc_step
+            else:
+                gap_h = desc_step * 2
+                cycle = content_h + gap_h
+                offset = int((time.monotonic() * 22) % cycle)
+                start_y = summary_rect.y() + metrics.ascent() - offset
+                for repeat in range(2):
+                    y = start_y + repeat * cycle
+                    for line in desc_lines:
+                        if y >= summary_rect.y() - desc_step and y <= summary_rect.bottom() + desc_step:
+                            painter.drawText(x, y, line)
+                        y += desc_step
+        painter.restore()
+
+        if info_rect.width() <= 20:
+            return
+
+        painter.setFont(title_font)
+        title_metrics = painter.fontMetrics()
+        title_h = max(26, title_metrics.height() + 4)
+
+        painter.setFont(meta_font)
+        meta_metrics = painter.fontMetrics()
+        line_step = max(15, meta_metrics.height() + 2)
+        max_lines = max(0, int((info_rect.height() - title_h - line_step) / line_step))
+        visible_lines = metadata_lines[:max_lines] if max_lines else []
+        block_h = title_h + (line_step if visible_lines else 0) + len(visible_lines) * line_step
+        block_y = info_rect.y() + max(0, (info_rect.height() - block_h) // 2)
+
+        painter.setFont(title_font)
+        painter.setPen(self.text)
+        title_rect = QRect(info_rect.x(), block_y, info_rect.width(), title_h)
+        painter.drawText(
+            title_rect,
+            Qt.TextFlag.TextSingleLine,
+            title_metrics.elidedText(title, Qt.TextElideMode.ElideRight, title_rect.width()),
+        )
+
+        painter.setFont(meta_font)
+        painter.setPen(self.text)
+        text_y = title_rect.bottom() + line_step
+        for line in visible_lines:
+            painter.drawText(
+                info_rect.x(),
+                text_y,
+                meta_metrics.elidedText(line, Qt.TextElideMode.ElideRight, info_rect.width()),
+            )
+            text_y += line_step
+
+    def draw_modern_help_bar(self, painter: QPainter, panel_rect: QRect):
+        rect = QRect(panel_rect.x(), panel_rect.bottom() + 12, panel_rect.width(), 36)
+        if rect.bottom() > self.height() - 12:
+            rect.moveTop(panel_rect.bottom() - 42)
+        painter.fillRect(rect, self.light)
+        painter.setFont(self.font)
+        painter.setPen(self.dark_text)
+        if self.window.active_input == "controller":
+            text = "A Launch   B Back   X Favorite   Y Menu   L Summary   R Search   Left/Right Page"
+        else:
+            text = "Enter Launch   Esc Back   F Favorite   Y Menu   I Summary   Ctrl+F Search   PgUp/PgDn Page"
+        painter.drawText(rect.adjusted(12, 0, -12, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter, text)
+
     def draw_top_bar(self, painter: QPainter):
         bar_rect = self.top_bar_rect()
         bar_w = bar_rect.width()
@@ -5829,6 +7163,7 @@ class GentlemanView(QWidget):
         painter.drawText(0, 0, title)
         painter.restore()
 
+        modern = self.window.modern_game_list_active()
         labels = self.window.current_labels()
         rows = self.visible_rows()
         self.ensure_visible()
@@ -5837,7 +7172,10 @@ class GentlemanView(QWidget):
         end = min(len(labels), start + rows)
 
         text_x = x + side_w + 22
-        marker_x = x + panel_w - 118
+        list_right = x + panel_w - 32
+        if modern:
+            list_right = x + side_w + int((panel_w - side_w) * 0.55) - 12
+        marker_x = list_right - 92
         row_y = y + 28
 
         painter.setFont(self.font)
@@ -5891,7 +7229,7 @@ class GentlemanView(QWidget):
             row_left_x = text_x - 6
 
             marker_w = painter.fontMetrics().horizontalAdvance("<DIR>")
-            marker_end_x = x + panel_w - 72
+            marker_end_x = list_right - 8
             marker_x = marker_end_x - marker_w
             row_right_x = marker_end_x + 8
 
@@ -5953,9 +7291,13 @@ class GentlemanView(QWidget):
                 if marker:
                     painter.drawText(marker_x, yy, marker)
 
+        arrow_x = list_right - 18 if modern else x + panel_w - 38
         if start > 0:
             painter.setPen(self.text)
-            painter.drawText(x + panel_w - 38, y + title_h + 20, "^")
+            painter.drawText(arrow_x, y + title_h + 20, "^")
         if end < len(labels):
             painter.setPen(self.text)
-            painter.drawText(x + panel_w - 38, y + panel_h - 8, "v")
+            painter.drawText(arrow_x, y + panel_h - 8, "v")
+        if modern:
+            self.draw_modern_metadata_panel(painter, panel_rect, side_w)
+            self.draw_modern_help_bar(painter, panel_rect)

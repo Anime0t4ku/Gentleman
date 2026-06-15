@@ -5,6 +5,7 @@ __pycache__/
 config/
 menu/
 themes/
+metadata/
 
 # C extensions
 *.so
