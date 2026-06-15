@@ -594,6 +594,8 @@ class GentlemanWindow(QMainWindow):
         self.single_scrape_use_custom = False
         self.single_scrape_custom_name = ""
         self.single_scrape_region = "Same as Game"
+        self.single_scrape_restore_key: tuple[str, str] | None = None
+        self.pending_rom_selection_key: tuple[str, str] | None = None
         self.scrape_match_items: list[dict] = []
         self.scrape_match_worker: ScreenScraperSuggestionWorker | None = None
         self.scrape_match_loading = False
@@ -804,6 +806,7 @@ class GentlemanWindow(QMainWindow):
             "theme": DEFAULT_THEME_ID,
             "game_view": "classic",
             "modern_view": "detailed",
+            "group_multi_disc_games": False,
             "screenscraper_username": "",
             "screenscraper_password": "",
             "scrape_region": "Same as Game",
@@ -891,10 +894,53 @@ class GentlemanWindow(QMainWindow):
         )
 
     def set_rom_items(self, items: list[RomBrowserItem]):
+        if self.current_launcher:
+            items = self.grouped_multi_disc_items(self.current_launcher, items, self.current_rom_folder.name if self.current_rom_folder else "")
+            items = self.sort_rom_items_for_current_view(items)
         self.rom_items = items
         self.rom_has_game_entries = any(not item.is_dir for item in items)
         self.refresh_rom_labels()
         self.rom_loading = False
+
+    def rom_item_selection_key(self, launcher: LauncherConfig, item: RomBrowserItem) -> tuple[str, str]:
+        try:
+            launcher_key = str(launcher.path.relative_to(self.menu_root)).replace(chr(92), "/").lower()
+        except Exception:
+            launcher_key = str(launcher.path).replace(chr(92), "/").lower()
+
+        try:
+            rom_key = str(item.path.resolve()).replace(chr(92), "/").lower()
+        except Exception:
+            rom_key = str(item.path).replace(chr(92), "/").lower()
+
+        return launcher_key, rom_key
+
+    def sort_name_for_rom_item(self, item: RomBrowserItem) -> str:
+        if not self.current_launcher:
+            return item.display_name.lower()
+        return self.metadata_display_name_for_rom_item(self.current_launcher, item).lower()
+
+    def sort_rom_items_for_current_view(self, items: list[RomBrowserItem]) -> list[RomBrowserItem]:
+        if not self.modern_mode_enabled():
+            return items
+
+        normal_folders = [item for item in items if item.is_dir and not item.is_multi_disc_group]
+        games = [item for item in items if not (item.is_dir and not item.is_multi_disc_group)]
+        normal_folders.sort(key=lambda item: item.display_name.lower())
+        games.sort(key=lambda item: self.sort_name_for_rom_item(item))
+        return normal_folders + games
+
+    def restore_pending_rom_selection(self) -> bool:
+        if not self.current_launcher or not self.pending_rom_selection_key:
+            return False
+        for index, item in enumerate(self.rom_items):
+            if self.rom_item_selection_key(self.current_launcher, item) == self.pending_rom_selection_key:
+                self.selected_index = index + 1
+                self.view.ensure_visible()
+                self.pending_rom_selection_key = None
+                return True
+        self.pending_rom_selection_key = None
+        return False
 
     def refresh_rom_labels(self):
         labels = [("...", "<DIR>")]
@@ -942,7 +988,7 @@ class GentlemanWindow(QMainWindow):
 
         if cached and cached.get("signature") == signature:
             self.set_rom_items(cached.get("items", []))
-            if reset_selection:
+            if not self.restore_pending_rom_selection() and reset_selection:
                 self.reset_selection_to_first_real_entry()
             self.view.update()
             return
@@ -1007,7 +1053,8 @@ class GentlemanWindow(QMainWindow):
                 self.rom_folder_cache.pop(next(iter(self.rom_folder_cache)))
 
         self.set_rom_items(items)
-        self.reset_selection_to_first_real_entry()
+        if not self.restore_pending_rom_selection():
+            self.reset_selection_to_first_real_entry()
         self.view.update()
 
         error = str(result.get("error", "")).strip()
@@ -1067,6 +1114,194 @@ class GentlemanWindow(QMainWindow):
 
     def modern_grid_active(self) -> bool:
         return self.modern_game_list_active() and self.modern_grid_enabled()
+
+    def multi_disc_grouping_enabled(self) -> bool:
+        return bool(self.settings.get("group_multi_disc_games", False))
+
+    def multi_disc_grouping_label(self) -> str:
+        return self.setting_state_label("Group Multi-Disc Games", self.multi_disc_grouping_enabled())
+
+    def multi_disc_marker_info(self, name: str) -> tuple[str, int] | None:
+        stem = Path(str(name)).stem
+        patterns = (
+            r"(?i)(?P<base>.*?)(?:[\s._-]*[\(\[]?\s*(?:disc|disk|cd)\s*0?(?P<num>\d+)\s*[\)\]]?)(?P<tail>.*)$",
+            r"(?i)(?P<base>.*?)(?:[\s._-]+(?:d)0?(?P<num>\d+)(?:[\s._-]|$))(?P<tail>.*)$",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, stem)
+            if not match:
+                continue
+            try:
+                disc_number = int(match.group("num"))
+            except Exception:
+                continue
+            base = str(match.group("base") or "").strip()
+            tail = str(match.group("tail") or "").strip()
+            base = re.sub(r"[\s._-]+$", "", base).strip()
+            tail = re.sub(r"^[\s._-]+", "", tail).strip()
+            cleaned = f"{base} {tail}".strip() if tail else base
+            cleaned = re.sub(r"\s+", " ", cleaned.replace("_", " ")).strip()
+            cleaned = re.sub(r"\s*\(\s*\)\s*", " ", cleaned).strip()
+            if cleaned:
+                return cleaned, disc_number
+        return None
+
+    def multi_disc_group_key(self, display_name: str, fallback_folder: str = "") -> str:
+        name = str(display_name or "").strip() or str(fallback_folder or "").strip()
+        scrape_name = cleaned_scrape_name(name)
+        key = re.sub(r"[^a-z0-9]+", "", scrape_name.lower())
+        if not key and fallback_folder:
+            key = re.sub(r"[^a-z0-9]+", "", cleaned_scrape_name(fallback_folder).lower())
+        return key
+
+    def disc_display_label(self, path: Path, fallback_index: int) -> str:
+        info = self.multi_disc_marker_info(path.name)
+        if info:
+            return f"Disc {info[1]}"
+        return f"Disc {fallback_index}"
+
+    def make_multi_disc_item(self, display_name: str, scrape_name: str, members: list[tuple[int, RomBrowserItem]]) -> RomBrowserItem | None:
+        if len(members) < 2:
+            return None
+        members = sorted(members, key=lambda pair: (pair[0], pair[1].name.lower()))
+        primary = members[0][1]
+        paths = [item.path for _, item in members]
+        labels = [self.disc_display_label(item.path, index + 1) for index, (_, item) in enumerate(members)]
+        return RomBrowserItem(
+            display_name,
+            primary.path,
+            False,
+            display_name,
+            paths,
+            labels,
+            scrape_name or cleaned_scrape_name(display_name),
+        )
+
+    def grouped_multi_disc_items(self, launcher: LauncherConfig, items: list[RomBrowserItem], folder_name: str = "", force: bool = False) -> list[RomBrowserItem]:
+        if not self.multi_disc_grouping_enabled() or (not force and not self.modern_mode_enabled()):
+            return items
+
+        result: list[RomBrowserItem] = []
+        loose_groups: dict[str, dict] = {}
+
+        for item in items:
+            if item.is_dir:
+                grouped_folder = self.multi_disc_item_for_folder(launcher, item)
+                result.append(grouped_folder or item)
+                continue
+
+            result.append(item)
+            info = self.multi_disc_marker_info(item.name)
+            if not info:
+                continue
+            base_name, disc_number = info
+            key = self.multi_disc_group_key(base_name, folder_name)
+            if not key:
+                continue
+            group = loose_groups.setdefault(key, {"display": base_name, "members": []})
+            group["members"].append((disc_number, item))
+
+        emitted_groups: set[str] = set()
+        final: list[RomBrowserItem] = []
+        for item in result:
+            if item.is_dir or item.is_multi_disc_group:
+                final.append(item)
+                continue
+            info = self.multi_disc_marker_info(item.name)
+            key = self.multi_disc_group_key(info[0], folder_name) if info else ""
+            group = loose_groups.get(key) if key else None
+            if group and len(group.get("members", [])) >= 2:
+                if key not in emitted_groups:
+                    display = str(group.get("display") or item.display_name).strip()
+                    grouped = self.make_multi_disc_item(display, cleaned_scrape_name(display), group.get("members", []))
+                    if grouped:
+                        final.append(grouped)
+                    else:
+                        final.append(item)
+                    emitted_groups.add(key)
+                continue
+            final.append(item)
+
+        return final
+
+    def multi_disc_item_for_folder(self, launcher: LauncherConfig, folder_item: RomBrowserItem) -> RomBrowserItem | None:
+        try:
+            child_items = self.scan_launcher_folder(launcher, folder_item.path)
+        except Exception:
+            return None
+
+        groups: dict[str, list[tuple[int, RomBrowserItem]]] = {}
+        non_disc_files = 0
+        for child in child_items:
+            if child.is_dir:
+                continue
+            info = self.multi_disc_marker_info(child.name)
+            if not info:
+                non_disc_files += 1
+                continue
+            base_name, disc_number = info
+            key = self.multi_disc_group_key(base_name, folder_item.name)
+            if not key:
+                continue
+            groups.setdefault(key, []).append((disc_number, child))
+
+        valid_groups = [(key, members) for key, members in groups.items() if len(members) >= 2]
+        if len(valid_groups) != 1 or non_disc_files > 0:
+            return None
+
+        _, members = valid_groups[0]
+        display_name = folder_item.display_name or folder_item.name
+        return self.make_multi_disc_item(display_name, cleaned_scrape_name(display_name), members)
+
+    def grouped_multi_disc_game_dicts(self, games: list[dict]) -> list[dict]:
+        if not self.modern_mode_enabled() or not self.multi_disc_grouping_enabled():
+            return games
+
+        groups: dict[tuple[str, str, str], dict] = {}
+        for item in games:
+            rom = item.get("rom")
+            launcher = item.get("launcher")
+            if rom is None or not isinstance(launcher, LauncherConfig):
+                continue
+            path = Path(rom)
+            info = self.multi_disc_marker_info(path.name)
+            if not info:
+                continue
+            base_name, disc_number = info
+            key = (str(launcher.path).replace(chr(92), "/").lower(), str(path.parent).replace(chr(92), "/").lower(), self.multi_disc_group_key(base_name, path.parent.name))
+            if not key[2]:
+                continue
+            group = groups.setdefault(key, {"display": base_name, "members": []})
+            group["members"].append((disc_number, item))
+
+        emitted: set[tuple[str, str, str]] = set()
+        output: list[dict] = []
+        for item in games:
+            rom = item.get("rom")
+            launcher = item.get("launcher")
+            if rom is None or not isinstance(launcher, LauncherConfig):
+                output.append(item)
+                continue
+            path = Path(rom)
+            info = self.multi_disc_marker_info(path.name)
+            key = (str(launcher.path).replace(chr(92), "/").lower(), str(path.parent).replace(chr(92), "/").lower(), self.multi_disc_group_key(info[0], path.parent.name)) if info else ("", "", "")
+            group = groups.get(key)
+            if group and len(group.get("members", [])) >= 2:
+                if key not in emitted:
+                    members = sorted(group.get("members", []), key=lambda pair: (pair[0], str(pair[1].get("name", "")).lower()))
+                    primary = dict(members[0][1])
+                    paths = [Path(member.get("rom")) for _, member in members if member.get("rom") is not None]
+                    display = str(group.get("display") or primary.get("name") or Path(primary.get("rom", "")).stem).strip()
+                    primary["name"] = display
+                    primary["rom"] = paths[0] if paths else primary.get("rom")
+                    primary["multi_disc_paths"] = paths
+                    primary["multi_disc_names"] = [self.disc_display_label(path, index + 1) for index, path in enumerate(paths)]
+                    primary["scrape_name"] = cleaned_scrape_name(display)
+                    output.append(primary)
+                    emitted.add(key)
+                continue
+            output.append(item)
+        return output
 
     def screenscraper_username(self) -> str:
         return str(self.settings.get("screenscraper_username", "")).strip()
@@ -1252,8 +1487,9 @@ class GentlemanWindow(QMainWindow):
             launcher_rel = str(launcher.path.relative_to(self.menu_root)).replace(chr(92), "/")
         except Exception:
             launcher_rel = str(launcher.path).replace(chr(92), "/")
+        name = str(data.get("scrape_name") or "").strip() or self.display_name_for_rom(launcher, Path(rom))
         return {
-            "name": self.display_name_for_rom(launcher, Path(rom)),
+            "name": name,
             "launcher": launcher_rel,
             "rom": str(Path(rom)).replace(chr(92), "/"),
         }
@@ -1289,7 +1525,12 @@ class GentlemanWindow(QMainWindow):
             if 0 <= idx < len(self.rom_items):
                 item = self.rom_items[idx]
                 if not item.is_dir:
-                    return {"launcher": self.current_launcher, "rom": item.path, "name": item.display_name}
+                    data = {"launcher": self.current_launcher, "rom": item.path, "name": item.display_name}
+                    if item.is_multi_disc_group:
+                        data["multi_disc_paths"] = item.multi_disc_paths or []
+                        data["multi_disc_names"] = item.multi_disc_names or []
+                        data["scrape_name"] = item.multi_disc_scrape_name or cleaned_scrape_name(item.display_name)
+                    return data
         if self.mode == "favorites":
             idx = index - 1
             if 0 <= idx < len(self.favorite_items):
@@ -1437,8 +1678,9 @@ class GentlemanWindow(QMainWindow):
         except ValueError:
             launcher_rel = str(self.current_launcher.path).replace(chr(92), "/")
 
+        name = selected.multi_disc_scrape_name if selected.is_multi_disc_group else self.display_name_for_rom(self.current_launcher, selected.path)
         return {
-            "name": self.display_name_for_rom(self.current_launcher, selected.path),
+            "name": name,
             "launcher": launcher_rel,
             "rom": str(selected.path).replace(chr(92), "/"),
         }
@@ -1616,7 +1858,7 @@ class GentlemanWindow(QMainWindow):
                     "rom": rom_item.path,
                 })
 
-        return games
+        return self.grouped_multi_disc_game_dicts(games)
 
     def update_current_system_game_items(self):
         system_name = self.current_game_system or ""
@@ -1641,7 +1883,7 @@ class GentlemanWindow(QMainWindow):
             seen.add(key)
             deduped.append(game)
 
-        deduped.sort(key=lambda item: str(item.get("name", "")).lower())
+        deduped.sort(key=lambda item: self.display_name_for_game_dict(item).lower())
         self.game_system_games[system_name] = deduped
 
     def update_emulator_items(self):
@@ -2343,6 +2585,7 @@ class GentlemanWindow(QMainWindow):
         theme_label = f"Theme: {self.current_theme.name}"
         game_view_label = self.game_view_label()
         modern_view_label = self.modern_view_label()
+        multi_disc_grouping_label = self.multi_disc_grouping_label()
 
         menu_size_label = f"Menu Size: {int(self.settings.get('fullscreen_menu_size', 100))}%"
         idle_menu_hide_label = self.idle_menu_hide_label()
@@ -2359,6 +2602,7 @@ class GentlemanWindow(QMainWindow):
             ]
             if self.modern_mode_enabled():
                 self.settings_items.append(modern_view_label)
+                self.settings_items.append(multi_disc_grouping_label)
         elif self.settings_category == "Menu Items":
             self.settings_items = [
                 systems_menu_label,
@@ -4348,21 +4592,15 @@ class GentlemanWindow(QMainWindow):
                 return
 
             try:
-                if self.current_launcher.launcher_type == "shortcut_folder":
-                    process = self.launch_shortcut_path(selected.path)
-                    emulator_name = self.current_launcher.system or self.current_launcher.path.stem
+                if selected.is_multi_disc_group:
+                    self.show_multi_disc_picker(
+                        self.current_launcher,
+                        selected.display_name,
+                        selected.multi_disc_paths or [selected.path],
+                        selected.multi_disc_names or [],
+                    )
                 else:
-                    process = launch_rom(self.current_launcher, selected.path)
-                    emulator_name = self.current_launcher.emulator_name or self.current_launcher.path.stem
-
-                self.begin_active_session(
-                    process,
-                    "game",
-                    selected.display_name,
-                    emulator_name,
-                )
-                self.add_recent_game(self.current_launcher.path, selected.path)
-                self.update_recent_items()
+                    self.launch_game_path(self.current_launcher, selected.path, selected.display_name)
             except Exception as exc:
                 self.resume_frontend_input_after_launch()
                 self.show_message("Launch failed", str(exc))
@@ -4573,7 +4811,7 @@ class GentlemanWindow(QMainWindow):
                     "launcher": launcher,
                     "rom": rom_item.path,
                 })
-        return games
+        return self.grouped_multi_disc_game_dicts(games)
 
     def build_context_search_items(self, query: str) -> list[dict]:
         state = self.search_return_state or {}
@@ -4634,7 +4872,7 @@ class GentlemanWindow(QMainWindow):
                 item["marker"] = self.search_result_marker(item.get("launcher"))
             filtered.append(item)
 
-        filtered.sort(key=lambda item: str(item.get("name", "")).lower())
+        filtered.sort(key=lambda item: self.display_name_for_game_dict(item).lower() if item.get("type") != "saved" else str(item.get("name", "")).lower())
         return filtered
 
     def run_context_search(self, value: str):
@@ -4673,6 +4911,36 @@ class GentlemanWindow(QMainWindow):
             return
         self.launch_system_game_item(item)
 
+    def launch_game_path(self, launcher: LauncherConfig, rom_path: Path, display_name: str):
+        if launcher.launcher_type == "shortcut_folder":
+            process = self.launch_shortcut_path(rom_path)
+            emulator_name = launcher.system or launcher.path.stem
+        else:
+            process = launch_rom(launcher, rom_path)
+            emulator_name = launcher.emulator_name or launcher.path.stem
+
+        self.begin_active_session(process, "game", display_name, emulator_name)
+        self.add_recent_game(launcher.path, rom_path)
+        self.update_recent_items()
+        self.view.update()
+
+    def show_multi_disc_picker(self, launcher: LauncherConfig, title: str, paths: list[Path], labels: list[str] | None = None):
+        clean_paths = [Path(path) for path in paths if Path(path).exists()]
+        if not clean_paths:
+            self.show_message("Launch failed", "No disc files were found for this game.")
+            return
+        if len(clean_paths) == 1:
+            self.launch_game_path(launcher, clean_paths[0], title)
+            return
+
+        labels = labels or []
+        buttons = []
+        for index, path in enumerate(clean_paths):
+            label = labels[index] if index < len(labels) and labels[index] else self.disc_display_label(path, index + 1)
+            buttons.append((label, lambda p=path: self.launch_game_path(launcher, p, title)))
+        buttons.append(("Back", None))
+        self.show_choice(title, "Select which disc to launch.", buttons)
+
     def launch_system_game_item(self, item: dict):
         launcher = item.get("launcher")
         launcher_item = item.get("launcher_item")
@@ -4702,22 +4970,15 @@ class GentlemanWindow(QMainWindow):
                 return
 
             rom_path = Path(rom)
-            if launcher.launcher_type == "shortcut_folder":
-                process = self.launch_shortcut_path(rom_path)
-                emulator_name = launcher.system or launcher.path.stem
+            if item.get("multi_disc_paths"):
+                self.show_multi_disc_picker(
+                    launcher,
+                    str(item.get("name", rom_path.stem)),
+                    [Path(path) for path in item.get("multi_disc_paths", [])],
+                    [str(label) for label in item.get("multi_disc_names", [])],
+                )
             else:
-                process = launch_rom(launcher, rom_path)
-                emulator_name = launcher.emulator_name or launcher.path.stem
-
-            self.begin_active_session(
-                process,
-                "game",
-                str(item.get("name", rom_path.stem)),
-                emulator_name,
-            )
-            self.add_recent_game(launcher.path, rom_path)
-            self.update_recent_items()
-            self.view.update()
+                self.launch_game_path(launcher, rom_path, str(item.get("name", rom_path.stem)))
         except Exception as exc:
             self.resume_frontend_input_after_launch()
             self.show_message("Launch failed", str(exc))
@@ -4798,6 +5059,13 @@ class GentlemanWindow(QMainWindow):
             self.view.update()
         elif item.startswith("Game View:"):
             self.settings["game_view"] = "classic" if self.modern_mode_enabled() else "modern"
+            self.invalidate_rom_folder_cache()
+            if self.current_launcher and self.current_rom_folder:
+                self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
+            self.refresh_settings_menu()
+        elif item.startswith("Group Multi-Disc Games:"):
+            self.settings["group_multi_disc_games"] = not self.multi_disc_grouping_enabled()
+            self.save_settings()
             self.invalidate_rom_folder_cache()
             if self.current_launcher and self.current_rom_folder:
                 self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
@@ -5016,7 +5284,7 @@ class GentlemanWindow(QMainWindow):
                 if folder_key in visited:
                     continue
                 visited.add(folder_key)
-                for rom_item in self.scan_cached_rom_folder_sync(launcher, folder):
+                for rom_item in self.grouped_multi_disc_items(launcher, self.scan_cached_rom_folder_sync(launcher, folder), folder.name, force=True):
                     if rom_item.is_dir:
                         if launcher.recursive:
                             folders.append(rom_item.path)
@@ -5033,7 +5301,7 @@ class GentlemanWindow(QMainWindow):
                     jobs.append({
                         "identity": identity,
                         "system_id": SCREENSCRAPER_SYSTEM_IDS[system],
-                        "search_name": cleaned_scrape_name(rom_item.name),
+                        "search_name": rom_item.multi_disc_scrape_name or cleaned_scrape_name(rom_item.name),
                         "preferred_region": region_from_option(self.scrape_region, identity),
                     })
         return jobs
@@ -5321,12 +5589,17 @@ class GentlemanWindow(QMainWindow):
             self.show_message("Scrape", "This game is not tied to a supported internal system.")
             return
         self.scrape_return_mode = self.mode
+        self.single_scrape_restore_key = None
+        if self.mode == "roms" and self.current_launcher and self.selected_index > 0:
+            index = self.selected_index - 1
+            if 0 <= index < len(self.rom_items):
+                self.single_scrape_restore_key = self.rom_item_selection_key(self.current_launcher, self.rom_items[index])
         self.single_scrape_identity = identity
         self.single_scrape_system_id = SCREENSCRAPER_SYSTEM_IDS.get(identity.system, 0)
         existing = self.metadata_cache.load(identity) or {}
         self.single_scrape_action = "Rescrape" if existing else "Scrape"
         self.single_scrape_use_custom = False
-        self.single_scrape_custom_name = str(existing.get("manual_scrape_name") or existing.get("scrape_name") or cleaned_scrape_name(identity.rom_name))
+        self.single_scrape_custom_name = str(existing.get("manual_scrape_name") or existing.get("scrape_name") or data.get("scrape_name") or cleaned_scrape_name(identity.rom_name))
         self.single_scrape_region = str(self.settings.get("scrape_region", "Same as Game"))
         if self.single_scrape_region not in SCRAPE_REGIONS:
             self.single_scrape_region = "Same as Game"
@@ -5377,7 +5650,7 @@ class GentlemanWindow(QMainWindow):
             return
         if not self.validate_screenscraper_login_now(show_error=True):
             return
-        search_name = cleaned_scrape_name(self.single_scrape_identity.rom_name)
+        search_name = self.single_scrape_custom_name.strip() or cleaned_scrape_name(self.single_scrape_identity.rom_name)
         self.start_single_scrape_job(search_name, "", "")
 
     def open_scrape_match_picker(self):
@@ -5472,6 +5745,8 @@ class GentlemanWindow(QMainWindow):
             "game_id": game_id,
         }
         return_mode = self.scrape_return_mode or "roms"
+        if return_mode == "roms" and self.single_scrape_restore_key:
+            self.pending_rom_selection_key = self.single_scrape_restore_key
         self.start_scrape_worker([job], "All Games", return_mode)
         self.mode = return_mode
         self.view.update()
@@ -5519,6 +5794,13 @@ class GentlemanWindow(QMainWindow):
             self.view.update()
         elif item.startswith("Game View:"):
             self.settings["game_view"] = "classic" if self.modern_mode_enabled() else "modern"
+            self.invalidate_rom_folder_cache()
+            if self.current_launcher and self.current_rom_folder:
+                self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
+            self.refresh_settings_menu()
+        elif item.startswith("Group Multi-Disc Games:"):
+            self.settings["group_multi_disc_games"] = not self.multi_disc_grouping_enabled()
+            self.save_settings()
             self.invalidate_rom_folder_cache()
             if self.current_launcher and self.current_rom_folder:
                 self.open_rom_folder(self.current_launcher, self.current_rom_folder, reset_selection=False)
@@ -6675,7 +6957,7 @@ class GentlemanView(QWidget):
         self.icon_dir = self.window.assets_dir / "icons"
         self.icon_svgs = {}
         self.icon_renderer_cache = {}
-        for icon_name in ("lan", "wifi", "bluetooth", "keyboard", "controller", "favorite", "api"):
+        for icon_name in ("lan", "wifi", "bluetooth", "keyboard", "controller", "favorite", "api", "folder"):
             icon_path = self.icon_dir / f"{icon_name}.svg"
             if icon_path.exists():
                 try:
@@ -7325,6 +7607,34 @@ class GentlemanView(QWidget):
         renderer.render(painter, QRectF(rect))
         painter.restore()
 
+    def modern_rom_folder_item_at_index(self, index: int) -> RomBrowserItem | None:
+        if not (self.window.mode == "roms" and self.window.modern_mode_enabled()):
+            return None
+        if not self.window.rom_has_game_entries:
+            return None
+        rom_index = index - 1
+        if rom_index < 0 or rom_index >= len(self.window.rom_items):
+            return None
+        item = self.window.rom_items[rom_index]
+        if item.is_dir and not item.is_multi_disc_group:
+            return item
+        return None
+
+    def selected_modern_rom_folder_item(self) -> RomBrowserItem | None:
+        return self.modern_rom_folder_item_at_index(self.window.selected_index)
+
+    def draw_modern_folder_boxart_icon(self, painter: QPainter, rect: QRect):
+        icon_size = min(rect.width() - 48, rect.height() - 48, 180)
+        if icon_size <= 0:
+            return
+        icon_rect = QRect(
+            rect.x() + (rect.width() - icon_size) // 2,
+            rect.y() + (rect.height() - icon_size) // 2,
+            icon_size,
+            icon_size,
+        )
+        self.draw_svg_icon(painter, "folder", icon_rect, self.light)
+
     def selected_metadata(self) -> tuple[GameMetadataIdentity | None, dict | None]:
         identity = self.window.selected_game_identity()
         return identity, self.window.metadata_cache.load(identity) if identity else None
@@ -7468,10 +7778,21 @@ class GentlemanView(QWidget):
                 scaled = pixmap.scaled(box_rect.adjusted(8, 8, -8, -8).size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 painter.drawPixmap(box_rect.x() + (box_rect.width() - scaled.width()) // 2, box_rect.y() + (box_rect.height() - scaled.height()) // 2, scaled)
             else:
-                painter.setFont(font)
-                painter.setPen(self.dark_text if selected else self.text)
-                placeholder = "Loading Boxart" if key in self.grid_boxart_pending_keys else "No Boxart"
-                painter.drawText(box_rect.adjusted(8, 8, -8, -8), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, placeholder)
+                folder_item = self.modern_rom_folder_item_at_index(index)
+                if folder_item is not None:
+                    icon_size = min(box_rect.width() - 36, box_rect.height() - 36, 96)
+                    icon_rect = QRect(
+                        box_rect.x() + (box_rect.width() - icon_size) // 2,
+                        box_rect.y() + (box_rect.height() - icon_size) // 2,
+                        icon_size,
+                        icon_size,
+                    )
+                    self.draw_svg_icon(painter, "folder", icon_rect, self.dark_text if selected else self.light)
+                else:
+                    painter.setFont(font)
+                    painter.setPen(self.dark_text if selected else self.text)
+                    placeholder = "Loading Boxart" if key in self.grid_boxart_pending_keys else "No Boxart"
+                    painter.drawText(box_rect.adjusted(8, 8, -8, -8), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, placeholder)
 
             painter.setPen(self.dark_text if selected else self.text)
             painter.setFont(font)
@@ -7538,9 +7859,12 @@ class GentlemanView(QWidget):
                 scaled,
             )
         else:
-            painter.setFont(meta_font)
-            painter.setPen(self.text)
-            painter.drawText(art_rect, Qt.AlignmentFlag.AlignCenter, "No Boxart")
+            if self.selected_modern_rom_folder_item() is not None:
+                self.draw_modern_folder_boxart_icon(painter, art_rect)
+            else:
+                painter.setFont(meta_font)
+                painter.setPen(self.text)
+                painter.drawText(art_rect, Qt.AlignmentFlag.AlignCenter, "No Boxart")
 
         metadata_lines = []
         if data:
@@ -7680,9 +8004,12 @@ class GentlemanView(QWidget):
                 scaled,
             )
         else:
-            painter.setFont(self.font)
-            painter.setPen(self.text)
-            painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, "No Boxart")
+            if self.selected_modern_rom_folder_item() is not None:
+                self.draw_modern_folder_boxart_icon(painter, inner)
+            else:
+                painter.setFont(self.font)
+                painter.setPen(self.text)
+                painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, "No Boxart")
 
     def draw_modern_help_bar(self, painter: QPainter, panel_rect: QRect):
         rect = QRect(panel_rect.x(), panel_rect.bottom() + 12, panel_rect.width(), 36)
@@ -7869,6 +8196,19 @@ class GentlemanView(QWidget):
                 draw_text_x = text_x
                 draw_text_area_w = text_area_w
 
+                show_folder_icon = self.modern_rom_folder_item_at_index(idx) is not None
+                if show_folder_icon:
+                    icon_size = 20
+                    icon_y = yy - 21
+                    self.draw_svg_icon(
+                        painter,
+                        "folder",
+                        QRect(text_x, icon_y, icon_size, icon_size),
+                        self.dark_text if idx == self.window.selected_index else self.light,
+                    )
+                    draw_text_x = text_x + 28
+                    draw_text_area_w = max(0, text_area_w - 28)
+
                 show_favorite_icon = (
                     self.window.mode == "roms"
                     and idx == self.window.selected_index
@@ -7881,11 +8221,11 @@ class GentlemanView(QWidget):
                     self.draw_svg_icon(
                         painter,
                         "favorite",
-                        QRect(text_x, icon_y, icon_size, icon_size),
+                        QRect(draw_text_x, icon_y, icon_size, icon_size),
                         painter.pen().color(),
                     )
-                    draw_text_x = text_x + 24
-                    draw_text_area_w = max(0, text_area_w - 24)
+                    draw_text_x += 24
+                    draw_text_area_w = max(0, draw_text_area_w - 24)
 
                 label_width = painter.fontMetrics().horizontalAdvance(label)
 

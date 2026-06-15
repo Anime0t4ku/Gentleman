@@ -33,6 +33,9 @@ class RomBrowserItem:
     path: Path
     is_dir: bool
     normalized_name: str = ""
+    multi_disc_paths: list[Path] | None = None
+    multi_disc_names: list[str] | None = None
+    multi_disc_scrape_name: str = ""
 
     @property
     def display_name(self) -> str:
@@ -40,7 +43,15 @@ class RomBrowserItem:
 
     @property
     def marker(self) -> str:
-        return "<DIR>" if self.is_dir else ""
+        if self.is_dir:
+            return "<DIR>"
+        if self.multi_disc_paths:
+            return "<DISC>"
+        return ""
+
+    @property
+    def is_multi_disc_group(self) -> bool:
+        return bool(self.multi_disc_paths and len(self.multi_disc_paths) > 1)
 
 
 def load_launcher(path: Path) -> LauncherConfig:
