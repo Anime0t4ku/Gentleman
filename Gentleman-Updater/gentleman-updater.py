@@ -3,6 +3,7 @@ import json
 import math
 import os
 import platform
+import plistlib
 import re
 import shutil
 import stat
@@ -36,9 +37,12 @@ UPDATE_NOW_FILE = "updatenow.txt"
 
 WINDOWS_TARGET_EXE = "Gentleman.exe"
 LINUX_TARGET_EXE = "Gentleman"
+MACOS_TARGET_APP = "Gentleman.app"
+MACOS_TARGET_EXE = "Gentleman"
 
 WINDOWS_ZIP_KEYWORDS = ["Windows", ".zip"]
 LINUX_TAR_KEYWORDS = ["Linux", ".tar.gz"]
+MACOS_ZIP_KEYWORDS = ["macOS", ".zip"]
 
 INCLUDE_PRERELEASES = False
 
@@ -50,11 +54,48 @@ class UpdateState:
     FAILED = "failed"
 
 
+def macos_current_app_bundle():
+    if platform.system().lower() != "darwin":
+        return None
+
+    executable_path = Path(sys.executable).resolve() if getattr(sys, "frozen", False) else Path(__file__).resolve()
+    for parent in [executable_path] + list(executable_path.parents):
+        if parent.suffix.lower() == ".app":
+            return parent
+    return None
+
+
 def app_folder():
+    bundle = macos_current_app_bundle()
+    if bundle is not None:
+        return bundle.parent
+
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
 
     return Path(__file__).resolve().parent
+
+
+def macos_application_support_dir():
+    support_dir = Path.home() / "Library" / "Application Support" / "Gentleman"
+    support_dir.mkdir(parents=True, exist_ok=True)
+    return support_dir
+
+
+def runtime_folder():
+    if platform.system().lower() == "darwin" and getattr(sys, "frozen", False):
+        return macos_application_support_dir()
+    return app_folder()
+
+
+def updater_work_folder():
+    work_dir = runtime_folder() / "updater"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    return work_dir
+
+
+def update_now_path():
+    return runtime_folder() / UPDATE_NOW_FILE
 
 
 def current_platform():
@@ -64,6 +105,7 @@ def current_platform():
         return {
             "name": "Windows",
             "target_exe": WINDOWS_TARGET_EXE,
+            "target_app": None,
             "asset_keywords": WINDOWS_ZIP_KEYWORDS,
             "archive_type": "zip",
         }
@@ -72,8 +114,18 @@ def current_platform():
         return {
             "name": "Linux",
             "target_exe": LINUX_TARGET_EXE,
+            "target_app": None,
             "asset_keywords": LINUX_TAR_KEYWORDS,
             "archive_type": "tar.gz",
+        }
+
+    if system == "darwin":
+        return {
+            "name": "macOS",
+            "target_exe": MACOS_TARGET_EXE,
+            "target_app": MACOS_TARGET_APP,
+            "asset_keywords": MACOS_ZIP_KEYWORDS,
+            "archive_type": "zip",
         }
 
     raise RuntimeError(f"Unsupported operating system: {platform.system()}")
@@ -97,27 +149,52 @@ def version_to_text(version):
 
 
 def read_current_version(base_path):
-    settings_path = base_path / SETTINGS_FILE
-    version_txt_path = base_path / "version.txt"
-    app_info_path = base_path / "app" / "app_info.py"
+    mac_app_path = base_path / MACOS_TARGET_APP
+    settings_paths = [
+        runtime_folder() / SETTINGS_FILE,
+        base_path / SETTINGS_FILE,
+        mac_app_path / "Contents" / "MacOS" / SETTINGS_FILE,
+    ]
+    version_txt_paths = [
+        base_path / "version.txt",
+        mac_app_path / "Contents" / "MacOS" / "version.txt",
+    ]
+    app_info_paths = [
+        base_path / "app" / "app_info.py",
+        mac_app_path / "Contents" / "MacOS" / "app" / "app_info.py",
+        mac_app_path / "Contents" / "Resources" / "app" / "app_info.py",
+    ]
+    plist_paths = [
+        mac_app_path / "Contents" / "Info.plist",
+    ]
 
     version_text = None
 
-    if settings_path.exists():
+    for settings_path in settings_paths:
+        if version_text or not settings_path.exists():
+            continue
         with open(settings_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
         if isinstance(data, dict):
             version_text = data.get("app_version") or data.get("version")
 
-    if not version_text and version_txt_path.exists():
-        version_text = version_txt_path.read_text(encoding="utf-8").strip()
+    for version_txt_path in version_txt_paths:
+        if not version_text and version_txt_path.exists():
+            version_text = version_txt_path.read_text(encoding="utf-8").strip()
 
-    if not version_text and app_info_path.exists():
-        app_info_text = app_info_path.read_text(encoding="utf-8", errors="ignore")
-        match = re.search(r"APP_VERSION\s*=\s*[\"\']([^\"\']+)[\"\']", app_info_text)
-        if match:
-            version_text = match.group(1)
+    for app_info_path in app_info_paths:
+        if not version_text and app_info_path.exists():
+            app_info_text = app_info_path.read_text(encoding="utf-8", errors="ignore")
+            match = re.search(r"APP_VERSION\s*=\s*[\"\']([^\"\']+)[\"\']", app_info_text)
+            if match:
+                version_text = match.group(1)
+
+    for plist_path in plist_paths:
+        if not version_text and plist_path.exists():
+            with open(plist_path, "rb") as f:
+                plist_data = plistlib.load(f)
+            if isinstance(plist_data, dict):
+                version_text = plist_data.get("CFBundleShortVersionString") or plist_data.get("CFBundleVersion")
 
     version = normalize_version(version_text)
 
@@ -154,6 +231,8 @@ def asset_matches_platform(asset_name, platform_info):
             return False
         if not lowered.startswith("gentleman"):
             return False
+        if platform_info["name"] == "macOS":
+            return "macos" in lowered or "mac" in lowered or "darwin" in lowered
         return "windows" in lowered or "win" in lowered
 
     if platform_info["archive_type"] == "tar.gz":
@@ -311,6 +390,11 @@ def bring_process_to_front(pid, timeout_ms=1800):
 
 
 def launch_gentleman(base_path, platform_info):
+    if platform_info["name"] == "macOS":
+        target_app = base_path / platform_info.get("target_app", MACOS_TARGET_APP)
+        if target_app.exists():
+            return subprocess.Popen(["open", str(target_app)], cwd=str(base_path))
+
     target_path = base_path / platform_info["target_exe"]
 
     if not target_path.exists():
@@ -334,6 +418,7 @@ class UpdateWorker(QThread):
     def __init__(self):
         super().__init__()
         self.base_path = app_folder()
+        self.work_path = updater_work_folder()
         self.platform_info = current_platform()
 
     def log(self, message):
@@ -364,25 +449,32 @@ class UpdateWorker(QThread):
             if not download_url:
                 raise RuntimeError("The release asset does not have a download URL.")
 
-            archive_path = self.base_path / asset_name
-            target_name = self.platform_info["target_exe"]
+            archive_path = self.work_path / asset_name
+            target_name = self.platform_info.get("target_app") or self.platform_info["target_exe"]
             target_path = self.base_path / target_name
-            temp_target_path = self.base_path / f"{target_name}.new"
+            temp_target_path = self.work_path / f"{target_name}.new"
 
+            self.work_path.mkdir(parents=True, exist_ok=True)
             self.log(f"Downloading {asset_name}...")
             self.download_file(download_url, archive_path)
             self.progress_changed.emit(45)
 
             if temp_target_path.exists():
                 try:
-                    temp_target_path.unlink()
+                    if temp_target_path.is_dir():
+                        shutil.rmtree(temp_target_path)
+                    else:
+                        temp_target_path.unlink()
                 except Exception:
                     pass
 
             self.log(f"Extracting {target_name} from update archive...")
 
             if self.platform_info["archive_type"] == "zip":
-                self.extract_zip_target(archive_path, target_name, temp_target_path)
+                if self.platform_info["name"] == "macOS" and str(target_name).endswith(".app"):
+                    self.extract_zip_app_bundle(archive_path, target_name, temp_target_path)
+                else:
+                    self.extract_zip_target(archive_path, target_name, temp_target_path)
             elif self.platform_info["archive_type"] == "tar.gz":
                 self.extract_tar_gz_target(archive_path, target_name, temp_target_path)
             else:
@@ -395,10 +487,16 @@ class UpdateWorker(QThread):
             if target_path.exists():
                 self.log(f"Removing old {target_name}...")
                 try:
-                    target_path.unlink()
+                    if target_path.is_dir():
+                        shutil.rmtree(target_path)
+                    else:
+                        target_path.unlink()
                 except PermissionError:
                     try:
-                        temp_target_path.unlink()
+                        if temp_target_path.is_dir():
+                            shutil.rmtree(temp_target_path)
+                        else:
+                            temp_target_path.unlink()
                     except Exception:
                         pass
                     raise PermissionError(
@@ -414,6 +512,11 @@ class UpdateWorker(QThread):
             if self.platform_info["name"] == "Linux":
                 self.log("Making Linux executable runnable...")
                 make_executable(target_path)
+            elif self.platform_info["name"] == "macOS":
+                mac_executable = target_path / "Contents" / "MacOS" / self.platform_info["target_exe"]
+                if mac_executable.exists():
+                    self.log("Making macOS app executable runnable...")
+                    make_executable(mac_executable)
 
             self.log("Removing downloaded archive file...")
             try:
@@ -471,6 +574,47 @@ class UpdateWorker(QThread):
             with zip_file.open(member, "r") as source:
                 with open(destination_path, "wb") as target:
                     shutil.copyfileobj(source, target)
+
+    def extract_zip_app_bundle(self, zip_path, target_name, destination_path):
+        target_marker = "/" + target_name.rstrip("/").lower() + "/"
+
+        with zipfile.ZipFile(zip_path, "r") as zip_file:
+            members = []
+            prefix = None
+
+            for member in zip_file.infolist():
+                normalized = member.filename.replace("\\", "/")
+                lowered = normalized.lower()
+
+                if lowered.startswith(target_name.lower().rstrip("/") + "/"):
+                    current_prefix = normalized[:len(target_name.rstrip("/") + "/")]
+                elif target_marker in "/" + lowered:
+                    marker_index = ("/" + lowered).index(target_marker)
+                    current_prefix = normalized[:marker_index + len(target_name.rstrip("/")) + 1]
+                else:
+                    continue
+
+                if prefix is None:
+                    prefix = current_prefix
+                if current_prefix == prefix:
+                    members.append(member)
+
+            if not members or prefix is None:
+                raise RuntimeError(f"{target_name} was not found in the downloaded update ZIP.")
+
+            for member in members:
+                normalized = member.filename.replace("\\", "/")
+                rel = normalized[len(prefix):]
+                if not rel:
+                    continue
+                target = destination_path / rel
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zip_file.open(member, "r") as source:
+                    with open(target, "wb") as output:
+                        shutil.copyfileobj(source, output)
 
     def extract_tar_gz_target(self, tar_path, target_name, destination_path):
         target_name_lower = target_name.lower()
@@ -543,7 +687,8 @@ class UpdaterWindow(QWidget):
 
         self.worker = None
         self.base_path = app_folder()
-        self.update_now_path = self.base_path / UPDATE_NOW_FILE
+        self.runtime_path = runtime_folder()
+        self.update_now_path = update_now_path()
         self.auto_update_mode = self.update_now_path.exists()
         self.update_state = UpdateState.IDLE
         self.update_message = ""
@@ -573,7 +718,8 @@ class UpdaterWindow(QWidget):
         except Exception:
             self.platform_info = {
                 "name": platform.system() or "Unknown",
-                "target_exe": WINDOWS_TARGET_EXE if platform.system().lower() == "windows" else LINUX_TARGET_EXE,
+                "target_exe": WINDOWS_TARGET_EXE if platform.system().lower() == "windows" else (MACOS_TARGET_EXE if platform.system().lower() == "darwin" else LINUX_TARGET_EXE),
+                "target_app": MACOS_TARGET_APP if platform.system().lower() == "darwin" else None,
             }
             self.platform_name = self.platform_info["name"]
 

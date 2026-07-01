@@ -30,7 +30,7 @@ from app.app_info import APP_NAME, APP_VERSION, ABOUT_LINES
 from app.zaparoo_systems import ZAPAROO_SYSTEM_NAMES
 from app.theme_manager import ThemeManager, DEFAULT_THEME_ID
 from core.arcade_names import ArcadeNameDatabase
-from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_external_process, launch_link_shortcut, LauncherConfig, RomBrowserItem
+from core.launcher import load_launcher, scan_rom_folder, launch_rom, launch_application, launch_external_process, launch_link_shortcut, LauncherConfig, RomBrowserItem
 from core.menu_scanner import MenuItem, scan_menu_folder
 from core.metadata import (
     MetadataCache,
@@ -2293,8 +2293,7 @@ class GentlemanWindow(QMainWindow):
         }
 
     def launch_application_config(self, config: LauncherConfig):
-        command = f'"{config.emulator}" {config.arguments}'.strip()
-        return launch_external_process(command, str(Path(config.emulator).parent))
+        return launch_application(config)
 
     def launch_shortcut_path(self, path: Path):
         return launch_link_shortcut(path)
@@ -2627,6 +2626,41 @@ class GentlemanWindow(QMainWindow):
         else:
             self.settings_category = None
             self.settings_items = self.settings_categories()
+
+    def is_macos(self) -> bool:
+        return platform.system().lower() == "darwin"
+
+    def executable_extensions_for_platform(self) -> list[str]:
+        system = platform.system().lower()
+        if system == "windows":
+            return [".exe", ".bat", ".cmd"]
+        if system == "darwin":
+            return [".app", ".command", ".sh"]
+        return [".appimage", ".sh", ".desktop", ""]
+
+    def shortcut_extensions_for_platform(self) -> list[str]:
+        system = platform.system().lower()
+        if system == "windows":
+            return [".lnk", ".url"]
+        if system == "darwin":
+            return [".app", ".command", ".sh", ".webloc"]
+        return [".desktop", ".sh", ".appimage", ""]
+
+    def retroarch_core_extensions_for_platform(self) -> list[str]:
+        system = platform.system().lower()
+        if system == "windows":
+            return [".dll"]
+        if system == "darwin":
+            return [".dylib"]
+        return [".so"]
+
+    def shortcut_folder_default_extensions(self) -> list[str]:
+        system = platform.system().lower()
+        if system == "windows":
+            return [".lnk"]
+        if system == "darwin":
+            return [".app", ".command", ".sh", ".webloc"]
+        return [".desktop", ".sh", ".appimage"]
 
     def launcher_type_values(self) -> list[str]:
         return ["Standalone Emulator", "RetroArch", "Application", "PC Game", "Shortcut", "Shortcut Folder"]
@@ -3143,25 +3177,26 @@ class GentlemanWindow(QMainWindow):
             self.open_text_input(field, prompt, self.launcher_form_data.get(key, ""), lambda value, k=key: self.launcher_form_data.__setitem__(k, value.strip()))
             return
         if field in ("Emulator Path", "App Path", "Game Path", "Shortcut Path"):
+            executable_extensions = self.executable_extensions_for_platform()
             if field == "App Path":
                 title = "Select application"
-                extensions = ['.exe']
+                extensions = executable_extensions
             elif field == "Game Path":
-                title = "Select PC game"
-                extensions = ['.exe']
+                title = "Select game application"
+                extensions = executable_extensions
             elif field == "Shortcut Path":
-                title = "Select Windows shortcut"
-                extensions = ['.lnk']
+                title = "Select shortcut"
+                extensions = self.shortcut_extensions_for_platform()
             elif self.launcher_form_data.get("type") == "RetroArch":
                 title = "Select RetroArch executable"
-                extensions = ['.exe']
+                extensions = executable_extensions
             else:
                 title = "Select emulator executable"
-                extensions = ['.exe']
+                extensions = executable_extensions
             self.open_file_browser(title, self.base_dir, extensions, False, lambda value: self.launcher_form_data.__setitem__('emulator', value))
             return
         if field == "RetroArch Core":
-            self.open_file_browser("Select RetroArch core", self.base_dir, ['.dll'], False, lambda value: self.launcher_form_data.__setitem__('core', value))
+            self.open_file_browser("Select RetroArch core", self.base_dir, self.retroarch_core_extensions_for_platform(), False, lambda value: self.launcher_form_data.__setitem__('core', value))
             return
         if field == "ROM Path":
             self.open_file_browser("Select ROM folder", self.base_dir, [], True, lambda value: self.launcher_form_data.__setitem__('rom_directory', value))
@@ -3208,7 +3243,7 @@ class GentlemanWindow(QMainWindow):
                 return
         elif launcher_type == "Shortcut":
             if not emulator:
-                self.show_message("Missing shortcut", "Select a Windows shortcut.")
+                self.show_message("Missing shortcut", "Select a shortcut.")
                 return
         elif launcher_type == "Shortcut Folder":
             if not rom_directory:
@@ -3274,7 +3309,7 @@ class GentlemanWindow(QMainWindow):
                 "type": json_type,
                 "system": data.get("system", ""),
                 "shortcut_directory": rom_directory,
-                "extensions": [".lnk"],
+                "extensions": self.shortcut_folder_default_extensions(),
                 "recursive": True,
             }
         else:
@@ -3530,12 +3565,19 @@ class GentlemanWindow(QMainWindow):
                     key=lambda p: (not p.is_dir(), p.name.lower()),
                 ):
                     try:
-                        if child.is_dir():
-                            items.append((child.name, child, True))
-                        elif not self.file_browser_select_folder and (
+                        suffix = child.suffix.lower()
+                        mac_app_bundle = self.is_macos() and suffix == ".app" and child.is_dir()
+                        extension_allowed = (
                             not self.file_browser_extensions
-                            or child.suffix.lower() in self.file_browser_extensions
-                        ):
+                            or suffix in self.file_browser_extensions
+                            or ("" in self.file_browser_extensions and child.is_file())
+                        )
+
+                        if mac_app_bundle and not self.file_browser_select_folder and extension_allowed:
+                            items.append((child.name, child, False))
+                        elif child.is_dir():
+                            items.append((child.name, child, True))
+                        elif not self.file_browser_select_folder and extension_allowed:
                             items.append((child.name, child, False))
                     except OSError:
                         pass

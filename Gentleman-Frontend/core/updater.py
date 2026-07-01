@@ -77,8 +77,12 @@ def is_linux() -> bool:
     return current_platform_name() == "linux"
 
 
+def is_macos() -> bool:
+    return current_platform_name() == "darwin"
+
+
 def updater_supported() -> bool:
-    return is_windows() or is_linux()
+    return is_windows() or is_linux() or is_macos()
 
 
 def get_app_folder() -> Path:
@@ -88,29 +92,67 @@ def get_app_folder() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def get_macos_app_bundle() -> Path | None:
+    if not is_macos():
+        return None
+
+    executable_path = Path(sys.executable).resolve() if getattr(sys, "frozen", False) else Path(__file__).resolve()
+    for parent in [executable_path] + list(executable_path.parents):
+        if parent.suffix.lower() == ".app":
+            return parent
+    return None
+
+
+def get_install_folder() -> Path:
+    bundle = get_macos_app_bundle()
+    if bundle is not None:
+        return bundle.parent
+    return get_app_folder()
+
+
 def get_gentleman_updater_filename() -> str:
     if is_windows():
         return "Gentleman-Updater.exe"
-
-    if is_linux():
-        return "Gentleman-Updater"
 
     return "Gentleman-Updater"
 
 
 def get_gentleman_updater_path() -> Path:
-    return get_app_folder() / get_gentleman_updater_filename()
+    if is_macos():
+        install_folder = get_install_folder()
+        candidates = [
+            install_folder / "Gentleman-Updater.app",
+            install_folder / "Gentleman-Updater",
+            install_folder / "Gentleman-Updater.app" / "Contents" / "MacOS" / "Gentleman-Updater",
+            get_app_folder() / get_gentleman_updater_filename(),
+        ]
+    else:
+        candidates = [get_app_folder() / get_gentleman_updater_filename()]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return candidates[0]
+
+
+def get_macos_application_support_folder() -> Path:
+    support_dir = Path.home() / "Library" / "Application Support" / "Gentleman"
+    support_dir.mkdir(parents=True, exist_ok=True)
+    return support_dir
 
 
 def get_update_now_path() -> Path:
-    return get_app_folder() / "updatenow.txt"
+    if is_macos() and getattr(sys, "frozen", False):
+        return get_macos_application_support_folder() / "updatenow.txt"
+    return get_install_folder() / "updatenow.txt"
 
 
 def make_executable(path: Path):
     if not path.exists():
         return
 
-    if not is_linux():
+    if not (is_linux() or is_macos()):
         return
 
     current_mode = os.stat(path).st_mode
@@ -126,7 +168,7 @@ def gentleman_updater_available() -> bool:
     if not updater_path.exists():
         return False
 
-    if is_linux():
+    if is_linux() or is_macos():
         make_executable(updater_path)
 
     return True
@@ -141,10 +183,16 @@ def launch_gentleman_updater() -> bool:
     if not updater_path.exists():
         return False
 
-    if is_linux():
+    if is_linux() or is_macos():
         make_executable(updater_path)
 
-    get_update_now_path().write_text("", encoding="utf-8")
+    update_now_path = get_update_now_path()
+    update_now_path.parent.mkdir(parents=True, exist_ok=True)
+    update_now_path.write_text("", encoding="utf-8")
+
+    if is_macos() and updater_path.suffix.lower() == ".app":
+        subprocess.Popen(["open", str(updater_path)], cwd=str(updater_path.parent), shell=False)
+        return True
 
     subprocess.Popen(
         [str(updater_path)],

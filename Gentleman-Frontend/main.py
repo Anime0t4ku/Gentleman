@@ -5,8 +5,16 @@ from app.app_info import APP_NAME
 from app.main_window import GentlemanWindow
 
 
+def macos_application_support_dir() -> Path:
+    support_dir = Path.home() / "Library" / "Application Support" / APP_NAME
+    support_dir.mkdir(parents=True, exist_ok=True)
+    return support_dir
+
+
 def app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            return macos_application_support_dir()
         return Path(sys.executable).resolve().parent
 
     return Path(__file__).resolve().parent
