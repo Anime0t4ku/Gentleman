@@ -88,6 +88,36 @@ def runtime_folder():
     return app_folder()
 
 
+
+
+def crash_log_path():
+    if platform.system().lower() == "darwin" and getattr(sys, "frozen", False):
+        log_dir = macos_application_support_dir() / "logs"
+    else:
+        log_dir = runtime_folder() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "Gentleman-Updater-crash.log"
+
+
+def write_crash_log(exc_type, exc_value, exc_traceback):
+    try:
+        with crash_log_path().open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] Gentleman Updater failed to start\n")
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=handle)
+    except Exception:
+        pass
+
+
+def install_crash_logging():
+    original_hook = sys.excepthook
+
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        write_crash_log(exc_type, exc_value, exc_traceback)
+        original_hook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = handle_exception
+
+
 def updater_work_folder():
     work_dir = runtime_folder() / "updater"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1505,10 +1535,16 @@ class UpdaterWindow(QWidget):
 
 
 def main():
-    app = QApplication(sys.argv)
-    window = UpdaterWindow()
-    window.show()
-    sys.exit(app.exec())
+    install_crash_logging()
+    try:
+        app = QApplication(sys.argv)
+        window = UpdaterWindow()
+        window.show()
+        sys.exit(app.exec())
+    except Exception:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        write_crash_log(exc_type, exc_value, exc_traceback)
+        raise
 
 
 if __name__ == "__main__":

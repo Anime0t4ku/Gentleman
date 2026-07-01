@@ -237,7 +237,15 @@ jobs:
 
       - name: Build macOS App
         working-directory: Gentleman-Frontend
-        run: pyinstaller --clean --onefile --windowed --icon "build/Gentleman.icns" --add-data "assets:assets" --name Gentleman main.py
+        run: |
+          set -euo pipefail
+          pyinstaller --clean --onedir --windowed \
+            --icon "build/Gentleman.icns" \
+            --add-data "assets:assets" \
+            --collect-all PyQt6 \
+            --hidden-import pygame \
+            --hidden-import psutil \
+            --name Gentleman main.py
 
       - name: Import Apple Developer Certificate
         env:
@@ -396,7 +404,13 @@ jobs:
 
       - name: Build macOS Updater App
         working-directory: Gentleman-Updater
-        run: pyinstaller --clean --onefile --windowed --icon "build/Gentleman-Updater.icns" --name Gentleman-Updater gentleman-updater.py
+        run: |
+          set -euo pipefail
+          pyinstaller --clean --onedir --windowed \
+            --icon "build/Gentleman-Updater.icns" \
+            --collect-all PyQt6 \
+            --hidden-import pygame \
+            --name Gentleman-Updater gentleman-updater.py
 
       - name: Import Apple Developer Certificate
         env:
