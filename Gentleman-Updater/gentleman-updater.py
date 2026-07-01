@@ -6,6 +6,7 @@ import platform
 import plistlib
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
@@ -26,6 +27,19 @@ try:
     import pygame
 except Exception:
     pygame = None
+
+
+def get_ssl_context():
+    """Return a CA-aware SSL context for bundled macOS builds.
+
+    The updater runs as its own PyInstaller .app on macOS, so it needs the same
+    explicit CA bundle handling as the frontend when using urllib over HTTPS.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 APP_NAME = "Gentleman-Updater"
@@ -246,7 +260,7 @@ def github_api_json(url):
         },
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=30, context=get_ssl_context()) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -569,7 +583,7 @@ class UpdateWorker(QThread):
             },
         )
 
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=60, context=get_ssl_context()) as response:
             total_size = int(response.headers.get("Content-Length", 0))
             downloaded = 0
 

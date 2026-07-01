@@ -1,3 +1,4 @@
 PyQt6>=6.6
 pygame
 psutil>=5.9
+certifi

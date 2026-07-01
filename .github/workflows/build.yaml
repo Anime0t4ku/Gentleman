@@ -243,8 +243,10 @@ jobs:
             --icon "build/Gentleman.icns" \
             --add-data "assets:assets" \
             --collect-all PyQt6 \
+            --collect-all certifi \
             --hidden-import pygame \
             --hidden-import psutil \
+            --hidden-import certifi \
             --name Gentleman main.py
 
       - name: Import Apple Developer Certificate
@@ -409,7 +411,9 @@ jobs:
           pyinstaller --clean --onedir --windowed \
             --icon "build/Gentleman-Updater.icns" \
             --collect-all PyQt6 \
+            --collect-all certifi \
             --hidden-import pygame \
+            --hidden-import certifi \
             --name Gentleman-Updater gentleman-updater.py
 
       - name: Import Apple Developer Certificate

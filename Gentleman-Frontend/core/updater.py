@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import re
+import ssl
 import subprocess
 import sys
 import urllib.request
@@ -11,6 +12,20 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.app_info import APP_VERSION, GITHUB_OWNER, GITHUB_REPO
+
+
+def get_ssl_context():
+    """Return a CA-aware SSL context for bundled macOS builds.
+
+    PyInstaller macOS bundles can miss the system CA lookup path that urllib
+    expects. certifi ships a known CA bundle with the app, so GitHub HTTPS
+    checks keep working inside the .app without disabling certificate checks.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 @dataclass
@@ -44,7 +59,7 @@ def check_for_update(timeout: int = 10) -> UpdateInfo:
         },
     )
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=get_ssl_context()) as response:
         data = json.loads(response.read().decode("utf-8"))
 
     latest_version = data.get("tag_name", "") or data.get("name", "")
