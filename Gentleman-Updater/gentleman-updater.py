@@ -42,7 +42,7 @@ MACOS_TARGET_EXE = "Gentleman"
 
 WINDOWS_ZIP_KEYWORDS = ["Windows", ".zip"]
 LINUX_TAR_KEYWORDS = ["Linux", ".tar.gz"]
-MACOS_ZIP_KEYWORDS = ["macOS", ".zip"]
+MACOS_DMG_ASSET_NAME = "Gentleman-macOS-Apple-Silicon.dmg"
 
 INCLUDE_PRERELEASES = False
 
@@ -124,8 +124,8 @@ def current_platform():
             "name": "macOS",
             "target_exe": MACOS_TARGET_EXE,
             "target_app": MACOS_TARGET_APP,
-            "asset_keywords": MACOS_ZIP_KEYWORDS,
-            "archive_type": "zip",
+            "asset_name": MACOS_DMG_ASSET_NAME,
+            "archive_type": "dmg",
         }
 
     raise RuntimeError(f"Unsupported operating system: {platform.system()}")
@@ -226,13 +226,14 @@ def asset_matches_platform(asset_name, platform_info):
     if "updater" in lowered:
         return False
 
+    if platform_info["name"] == "macOS":
+        return lowered == platform_info.get("asset_name", MACOS_DMG_ASSET_NAME).lower()
+
     if platform_info["archive_type"] == "zip":
         if not lowered.endswith(".zip"):
             return False
         if not lowered.startswith("gentleman"):
             return False
-        if platform_info["name"] == "macOS":
-            return "macos" in lowered or "mac" in lowered or "darwin" in lowered
         return "windows" in lowered or "win" in lowered
 
     if platform_info["archive_type"] == "tar.gz":
@@ -471,12 +472,11 @@ class UpdateWorker(QThread):
             self.log(f"Extracting {target_name} from update archive...")
 
             if self.platform_info["archive_type"] == "zip":
-                if self.platform_info["name"] == "macOS" and str(target_name).endswith(".app"):
-                    self.extract_zip_app_bundle(archive_path, target_name, temp_target_path)
-                else:
-                    self.extract_zip_target(archive_path, target_name, temp_target_path)
+                self.extract_zip_target(archive_path, target_name, temp_target_path)
             elif self.platform_info["archive_type"] == "tar.gz":
                 self.extract_tar_gz_target(archive_path, target_name, temp_target_path)
+            elif self.platform_info["archive_type"] == "dmg":
+                self.extract_dmg_app_bundle(archive_path, target_name, temp_target_path)
             else:
                 raise RuntimeError(
                     f"Unsupported archive type: {self.platform_info['archive_type']}"
@@ -615,6 +615,64 @@ class UpdateWorker(QThread):
                 with zip_file.open(member, "r") as source:
                     with open(target, "wb") as output:
                         shutil.copyfileobj(source, output)
+
+    def extract_dmg_app_bundle(self, dmg_path, target_name, destination_path):
+        if platform.system().lower() != "darwin":
+            raise RuntimeError("DMG updates can only be installed on macOS.")
+
+        mount_point = None
+
+        try:
+            self.log("Mounting macOS DMG...")
+            attach_result = subprocess.run(
+                ["hdiutil", "attach", str(dmg_path), "-nobrowse", "-readonly", "-plist"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            attach_data = plistlib.loads(attach_result.stdout)
+
+            for entity in attach_data.get("system-entities", []):
+                candidate = entity.get("mount-point")
+                if candidate:
+                    mount_point = Path(candidate)
+                    break
+
+            if mount_point is None or not mount_point.exists():
+                raise RuntimeError("The DMG mounted, but no mount point was found.")
+
+            source_app = mount_point / target_name
+            if not source_app.exists():
+                matches = [path for path in mount_point.rglob(target_name) if path.is_dir()]
+                if matches:
+                    source_app = matches[0]
+
+            if not source_app.exists() or not source_app.is_dir():
+                raise RuntimeError(f"{target_name} was not found inside the downloaded DMG.")
+
+            if destination_path.exists():
+                shutil.rmtree(destination_path)
+
+            self.log(f"Copying {target_name} from mounted DMG...")
+            shutil.copytree(source_app, destination_path, symlinks=True)
+
+        finally:
+            if mount_point is not None:
+                self.log("Unmounting macOS DMG...")
+                try:
+                    subprocess.run(
+                        ["hdiutil", "detach", str(mount_point)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=True,
+                    )
+                except Exception:
+                    subprocess.run(
+                        ["hdiutil", "detach", str(mount_point), "-force"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
 
     def extract_tar_gz_target(self, tar_path, target_name, destination_path):
         target_name_lower = target_name.lower()
