@@ -16,9 +16,11 @@ This project is experimental and not affiliated with the official MiSTer FPGA pr
 
 ## Platform Status
 
-Gentleman is currently focused on Windows.
+Gentleman is currently available for Windows and macOS.
 
-Linux support may be added later, but the current version should be treated as Windows-first. Some paths, file pickers, application handling, and packaging behavior are currently designed around Windows.
+Windows remains the main development platform, but macOS builds are now provided as well. Some behavior may still differ between platforms, especially around paths, file pickers, application handling, focus behavior, and packaging.
+
+Linux support may be added later, but it would require more work than a simple port. Linux setups can handle emulators in many different ways, including native packages, AppImages, Flatpaks, custom scripts, and different desktop environments. Because of that, emulator detection, launching behavior, paths, and focus handling would need extra testing and platform-specific work before Linux can be considered officially supported.
 
 ## Current Features
 
@@ -81,9 +83,15 @@ python main.py
 
 Gentleman can check GitHub for stable releases. The update check can be started manually from the Gentleman Menu, and the launch-time update check can be enabled or disabled from Settings.
 
-The updater is optional and is released as a separate download. To use it, download `Gentleman-Updater-Windows-x86_64.zip`, extract `Gentleman-Updater.exe`, and place it next to `Gentleman.exe`. When an update is found, Gentleman can then start the updater for you.
+The updater is optional and is released as a separate download for each supported platform. To use it, download the updater package that matches your system, extract it if needed, and place the updater next to the main Gentleman application.
 
-The normal Gentleman release ZIP only contains `Gentleman.exe`. User folders such as `config/`, `menu/`, `themes/`, and locally scraped metadata or artwork folders are created on first launch or when needed, and are not part of the release ZIP.
+On Windows, place `Gentleman-Updater.exe` next to `Gentleman.exe`.
+
+On macOS, place the Gentleman Updater application next to the main Gentleman application.
+
+When an update is found, Gentleman can then start the updater for you.
+
+The normal Gentleman release package only contains the main application. User folders such as `config/`, `menu/`, `themes/`, and locally scraped metadata or artwork folders are created on first launch or when needed, and are not part of the release package.
 
 ## Navigation
 
