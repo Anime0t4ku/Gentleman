@@ -148,6 +148,7 @@ SCREENSCRAPER_SYSTEM_IDS = {
     "NAOMI": 56,
     "Triforce": 68,
     "Pico8": 234,
+    "Switch": 225,
     "Amiga": 64,
     "Amiga500": 64,
     "Amiga1200": 64,
