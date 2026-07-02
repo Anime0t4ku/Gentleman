@@ -5265,6 +5265,7 @@ class GentlemanWindow(QMainWindow):
         self.screenscraper_login_error = ""
         self.scrape_quota_worker = ScreenScraperQuotaWorker(self.screenscraper_username(), self.screenscraper_password())
         self.scrape_quota_worker.result.connect(self.on_screenscraper_quota_result)
+        self.scrape_quota_worker.finished.connect(self.on_screenscraper_quota_finished)
         self.scrape_quota_worker.start()
         self.view.update()
 
@@ -5281,8 +5282,13 @@ class GentlemanWindow(QMainWindow):
                 self.screenscraper_quota_text = "User Quota: Login failed"
             else:
                 self.screenscraper_quota_text = self.format_quota_text(unavailable=True)
-        self.scrape_quota_worker = None
         self.view.update()
+
+    def on_screenscraper_quota_finished(self):
+        worker = self.scrape_quota_worker
+        self.scrape_quota_worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def open_scrape_settings(self):
         self.scrape_target_items = self.available_scrape_targets()
