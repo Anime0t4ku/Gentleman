@@ -1,5 +1,5 @@
 APP_NAME = "Gentleman"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 APP_DEVELOPER = "Anime0t4ku"
 APP_LICENSE = "GPL-3.0"
 GITHUB_OWNER = "Anime0t4ku"

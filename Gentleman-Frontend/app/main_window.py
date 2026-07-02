@@ -709,8 +709,8 @@ class GentlemanWindow(QMainWindow):
         self.ingame_osd = InGameOsd(self)
         self.suspended_session_processes = []
         self.dolphin_osd_fullscreen_toggled = False
-        self.local_ip_address = self.resolve_local_ip_address()
-        self.cached_network_icon = "lan" if self.local_ip_address != "Not connected" else "wifi"
+        self.local_ip_address, self.cached_network_icon = self.resolve_local_network_state()
+        self.cached_bluetooth_enabled = self.resolve_bluetooth_enabled()
 
         self.controller_available = False
         self.controller = None
@@ -774,12 +774,220 @@ class GentlemanWindow(QMainWindow):
         finally:
             sock.close()
 
-    def refresh_local_ip_address(self):
+    def resolve_local_network_state(self) -> tuple[str, str]:
         address = self.resolve_local_ip_address()
-        icon = "lan" if address != "Not connected" else "wifi"
-        if address != self.local_ip_address or icon != self.cached_network_icon:
+        if address == "Not connected":
+            return address, "wifi"
+
+        interface_name = self.interface_name_for_address(address)
+        icon = self.network_icon_for_interface(interface_name)
+        return address, icon
+
+    def interface_name_for_address(self, address: str) -> str:
+        if not address or address == "Not connected" or psutil is None:
+            return ""
+
+        try:
+            for interface_name, addresses in psutil.net_if_addrs().items():
+                for interface_address in addresses:
+                    if getattr(interface_address, "family", None) == socket.AF_INET and getattr(interface_address, "address", "") == address:
+                        return interface_name
+        except Exception:
+            return ""
+
+        return ""
+
+    def macos_hardware_port_devices(self) -> dict[str, str]:
+        if platform.system() != "Darwin":
+            return {}
+
+        try:
+            result = subprocess.run(
+                ["networksetup", "-listallhardwareports"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            return {}
+
+        devices: dict[str, str] = {}
+        port_name = ""
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Hardware Port:"):
+                port_name = line.split(":", 1)[1].strip().lower()
+            elif line.startswith("Device:") and port_name:
+                device_name = line.split(":", 1)[1].strip()
+                if device_name:
+                    devices[device_name] = port_name
+                port_name = ""
+
+        return devices
+
+    def network_icon_for_interface(self, interface_name: str) -> str:
+        interface_key = (interface_name or "").lower()
+        macos_ports = self.macos_hardware_port_devices()
+        hardware_port = macos_ports.get(interface_name, "").lower() if interface_name else ""
+        label = f"{interface_key} {hardware_port}".strip()
+
+        wifi_markers = ("wifi", "wi-fi", "wireless", "airport", "wlan", "wl")
+        ethernet_markers = ("ethernet", "lan", "gbe", "thunderbolt ethernet", "usb 10", "usb ethernet", "enx", "eth")
+
+        if any(marker in label for marker in wifi_markers):
+            return "wifi"
+        if any(marker in label for marker in ethernet_markers):
+            return "lan"
+
+        if platform.system() == "Darwin" and interface_name:
+            active_ethernet = any(
+                self.interface_is_active(device_name) and any(marker in port_name.lower() for marker in ethernet_markers)
+                for device_name, port_name in macos_ports.items()
+            )
+            if not active_ethernet:
+                return "wifi"
+
+        return "lan"
+
+    def interface_is_active(self, interface_name: str) -> bool:
+        if not interface_name or psutil is None:
+            return False
+
+        try:
+            stats = psutil.net_if_stats().get(interface_name)
+            if stats is not None and not stats.isup:
+                return False
+            for interface_address in psutil.net_if_addrs().get(interface_name, []):
+                if getattr(interface_address, "family", None) == socket.AF_INET:
+                    address = getattr(interface_address, "address", "")
+                    if address and not address.startswith("127."):
+                        return True
+        except Exception:
+            return False
+
+        return False
+
+    def resolve_bluetooth_enabled(self) -> bool:
+        system_name = platform.system()
+        if system_name == "Darwin":
+            return self.macos_bluetooth_enabled()
+        if system_name == "Linux":
+            return self.linux_bluetooth_enabled()
+        if system_name == "Windows":
+            return self.windows_bluetooth_enabled()
+        return True
+
+    def macos_bluetooth_enabled(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["ioreg", "-r", "-c", "IOBluetoothHCIController", "-d", "1"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            output = result.stdout or ""
+            power_match = re.search(r'"(?:BluetoothPowerState|ControllerPowerState)"\s*=\s*(\d+)', output)
+            if power_match:
+                return power_match.group(1) != "0"
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["system_profiler", "SPBluetoothDataType"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+            output = result.stdout or ""
+            power_match = re.search(r"Bluetooth Power:\s*(On|Off)", output, re.IGNORECASE)
+            if power_match:
+                return power_match.group(1).lower() == "on"
+            state_match = re.search(r"State:\s*(On|Off)", output, re.IGNORECASE)
+            if state_match:
+                return state_match.group(1).lower() == "on"
+        except Exception:
+            pass
+
+        return True
+
+    def linux_bluetooth_enabled(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["rfkill", "-J"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            data = json.loads(result.stdout or "{}")
+            bluetooth_devices = [
+                device
+                for device in data.get("rfkilldevices", [])
+                if str(device.get("type", "")).lower() == "bluetooth"
+            ]
+            if bluetooth_devices:
+                return any(
+                    not bool(device.get("soft")) and not bool(device.get("hard"))
+                    for device in bluetooth_devices
+                )
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["hciconfig"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            output = result.stdout or ""
+            if "UP RUNNING" in output:
+                return True
+            if "DOWN" in output:
+                return False
+        except Exception:
+            pass
+
+        return True
+
+    def windows_bluetooth_enabled(self) -> bool:
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-PnpDevice -Class Bluetooth | Select-Object -ExpandProperty Status",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            statuses = [line.strip().lower() for line in result.stdout.splitlines() if line.strip()]
+            if statuses:
+                return any(status == "ok" for status in statuses)
+        except Exception:
+            pass
+
+        return True
+
+    def refresh_local_ip_address(self):
+        address, icon = self.resolve_local_network_state()
+        bluetooth_enabled = self.resolve_bluetooth_enabled()
+        if (
+            address != self.local_ip_address
+            or icon != self.cached_network_icon
+            or bluetooth_enabled != self.cached_bluetooth_enabled
+        ):
             self.local_ip_address = address
             self.cached_network_icon = icon
+            self.cached_bluetooth_enabled = bluetooth_enabled
             self.view.update()
 
     def default_settings(self) -> dict:
@@ -7656,6 +7864,9 @@ class GentlemanView(QWidget):
     def bluetooth_icon(self) -> str:
         return "bluetooth"
 
+    def bluetooth_icon_visible(self) -> bool:
+        return bool(self.window.cached_bluetooth_enabled)
+
     def input_icon(self) -> str:
         return "keyboard" if self.window.active_input == "keyboard" else "controller"
 
@@ -8132,8 +8343,9 @@ class GentlemanView(QWidget):
 
         self.draw_svg_icon(painter, self.network_icon(), QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
         icon_x += icon_gap
-        self.draw_svg_icon(painter, self.bluetooth_icon(), QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
-        icon_x += icon_gap
+        if self.bluetooth_icon_visible():
+            self.draw_svg_icon(painter, self.bluetooth_icon(), QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
+            icon_x += icon_gap
         self.draw_svg_icon(painter, self.input_icon(), QRect(icon_x, icon_y, icon_size, icon_size), self.dark_text)
 
         if self.window.remote_api_server and self.window.remote_api_server.is_running():
