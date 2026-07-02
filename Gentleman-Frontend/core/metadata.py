@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import ssl
 import time
 from datetime import datetime
 import urllib.error
@@ -11,6 +12,20 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+def get_ssl_context():
+    """Return a CA-aware SSL context for bundled macOS builds.
+
+    PyInstaller macOS bundles can miss the system CA lookup path used by
+    urllib. certifi ships a known CA bundle with the app, so ScreenScraper
+    HTTPS requests keep working without disabling certificate verification.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
 
 SCREENSCRAPER_DEV_ID = ""
 SCREENSCRAPER_DEV_PASSWORD = ""
@@ -841,7 +856,7 @@ class ScreenScraperClient:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout, context=get_ssl_context()) as response:
                 status_code = int(getattr(response, "status", 200) or 200)
                 payload = response.read()
         except urllib.error.HTTPError as exc:
@@ -1499,7 +1514,7 @@ class ScreenScraperClient:
         self.wait_for_limit()
         request = urllib.request.Request(url, headers={"User-Agent": SCREENSCRAPER_SOFTNAME})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=30, context=get_ssl_context()) as response:
                 return response.read()
         except Exception:
             return None

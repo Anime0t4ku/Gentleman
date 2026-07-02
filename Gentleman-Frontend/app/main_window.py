@@ -6089,6 +6089,39 @@ class GentlemanWindow(QMainWindow):
             self.active_process = None
             self.active_session = {"running": False, "type": None, "name": None, "emulator": None}
         self.resume_frontend_input_after_launch()
+        self.request_frontend_focus_after_session()
+
+    def request_frontend_focus_after_session(self):
+        if sys.platform != "darwin":
+            return
+        QTimer.singleShot(150, self.activate_frontend_window)
+        QTimer.singleShot(500, self.activate_frontend_window)
+
+    def activate_frontend_window(self):
+        if sys.platform != "darwin" or self.active_session_snapshot().get("running"):
+            return
+
+        try:
+            self.show()
+            if self.isMinimized():
+                self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
+        try:
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e",
+                    f'tell application "System Events" to set frontmost of the first process whose unix id is {os.getpid()} to true',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
     def check_active_process(self):
         self.poll_keyboard_osd_shortcut()

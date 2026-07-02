@@ -206,8 +206,8 @@ def macos_open_bundle_command(bundle_path: Path, args: str = "") -> str:
     quoted_bundle = quote_command_part(str(bundle_path))
     args = str(args or "").strip()
     if args:
-        return f"open -n {quoted_bundle} --args {args}"
-    return f"open -n {quoted_bundle}"
+        return f"open -W -n {quoted_bundle} --args {args}"
+    return f"open -W -n {quoted_bundle}"
 
 
 def launch_link_shortcut(shortcut: Path) -> subprocess.Popen:
@@ -217,7 +217,10 @@ def launch_link_shortcut(shortcut: Path) -> subprocess.Popen:
     if os.name == "nt":
         command = f'start "" "{shortcut_path}"'
     elif sys.platform == "darwin":
-        command = ["open", shortcut_path]
+        if is_macos_app_bundle(shortcut):
+            command = ["open", "-W", "-n", shortcut_path]
+        else:
+            command = ["open", shortcut_path]
     else:
         command = ["xdg-open", shortcut_path]
 
